@@ -17,13 +17,13 @@ public class UserController {
         this.userRepository = userRepository;
     }
 
-    @PostMapping("/register")
-    public User register(@RequestBody User user) {
-        return userRepository.save(user);
-    }
-
     @GetMapping
     public List<User> getAllUsers() {
         return userRepository.findAll();
+    }
+
+    @PostMapping("/register")
+    public User register(@RequestBody User user) {
+        return userRepository.save(user);
     }
 }
