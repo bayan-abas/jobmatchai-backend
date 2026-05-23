@@ -99,4 +99,100 @@ public class UserController {
             return response;
         }
     }
+    @GetMapping("/{id}")
+public Map<String, Object> getUserById(@PathVariable Long id) {
+    Map<String, Object> response = new HashMap<>();
+
+    return userRepository.findById(id)
+            .map(user -> {
+                response.put("success", true);
+                response.put("user", user);
+                return response;
+            })
+            .orElseGet(() -> {
+                response.put("success", false);
+                response.put("message", "User not found");
+                return response;
+            });
+}
+
+@PutMapping("/{id}")
+public Map<String, Object> updateUser(
+        @PathVariable Long id,
+        @RequestBody User updatedUser
+) {
+    Map<String, Object> response = new HashMap<>();
+
+    try {
+
+        return userRepository.findById(id)
+                .map(user -> {
+
+                    user.setName(updatedUser.getName());
+                    user.setEmail(updatedUser.getEmail());
+                    user.setRole(updatedUser.getRole());
+
+                    if (updatedUser.getPassword() != null &&
+                            !updatedUser.getPassword().isEmpty()) {
+
+                        String encryptedPassword =
+                                passwordEncoder.encode(updatedUser.getPassword());
+
+                        user.setPassword(encryptedPassword);
+                    }
+
+                    User savedUser = userRepository.save(user);
+
+                    response.put("success", true);
+                    response.put("message", "User updated successfully");
+                    response.put("user", savedUser);
+
+                    return response;
+                })
+
+                .orElseGet(() -> {
+                    response.put("success", false);
+                    response.put("message", "User not found");
+                    return response;
+                });
+
+    } catch (Exception e) {
+
+        response.put("success", false);
+        response.put("message", e.getMessage());
+
+        return response;
+    }
+}
+
+@DeleteMapping("/{id}")
+public Map<String, Object> deleteUser(@PathVariable Long id) {
+
+    Map<String, Object> response = new HashMap<>();
+
+    try {
+
+        if (!userRepository.existsById(id)) {
+
+            response.put("success", false);
+            response.put("message", "User not found");
+
+            return response;
+        }
+
+        userRepository.deleteById(id);
+
+        response.put("success", true);
+        response.put("message", "User deleted successfully");
+
+        return response;
+
+    } catch (Exception e) {
+
+        response.put("success", false);
+        response.put("message", e.getMessage());
+
+        return response;
+    }
+}
 }
