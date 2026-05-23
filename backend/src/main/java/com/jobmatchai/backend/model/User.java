@@ -19,6 +19,8 @@ public class User {
 
     private String role;
 
+    private String cvFileName;
+
     public User() {}
 
     public User(String name, String email, String password, String role) {
@@ -62,5 +64,13 @@ public class User {
 
     public void setRole(String role) {
         this.role = role;
+    }
+    
+    public String getCvFileName() {
+        return cvFileName;
+    }
+
+    public void setCvFileName(String cvFileName) {
+        this.cvFileName = cvFileName;
     }
 }
