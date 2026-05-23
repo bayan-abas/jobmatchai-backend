@@ -27,6 +27,11 @@ public class JobController {
         return jobRepository.findAll();
     }
 
+    @GetMapping("/company/{companyEmail}")
+    public List<Job> getJobsByCompanyEmail(@PathVariable String companyEmail) {
+        return jobRepository.findByCompanyEmail(companyEmail);
+    }
+
     @PostMapping("/add")
     public Map<String, Object> addJob(@RequestBody Job job) {
         Map<String, Object> response = new HashMap<>();
@@ -72,6 +77,7 @@ public class JobController {
                     .map(job -> {
                         job.setTitle(updatedJob.getTitle());
                         job.setCompanyName(updatedJob.getCompanyName());
+                        job.setCompanyEmail(updatedJob.getCompanyEmail());
                         job.setLocation(updatedJob.getLocation());
                         job.setType(updatedJob.getType());
                         job.setSalary(updatedJob.getSalary());

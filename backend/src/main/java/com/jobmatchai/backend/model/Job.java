@@ -12,6 +12,8 @@ public class Job {
 
     private String title;
     private String companyName;
+    private String companyEmail;
+
     private String location;
     private String type;
     private String salary;
@@ -24,9 +26,13 @@ public class Job {
 
     public Job() {}
 
-    public Job(String title, String companyName, String location, String type, String salary, String description, String requirements, String skills) {
+    public Job(String title, String companyName, String companyEmail,
+               String location, String type, String salary,
+               String description, String requirements, String skills) {
+
         this.title = title;
         this.companyName = companyName;
+        this.companyEmail = companyEmail;
         this.location = location;
         this.type = type;
         this.salary = salary;
@@ -53,6 +59,14 @@ public class Job {
 
     public void setCompanyName(String companyName) {
         this.companyName = companyName;
+    }
+
+    public String getCompanyEmail() {
+        return companyEmail;
+    }
+
+    public void setCompanyEmail(String companyEmail) {
+        this.companyEmail = companyEmail;
     }
 
     public String getLocation() {
