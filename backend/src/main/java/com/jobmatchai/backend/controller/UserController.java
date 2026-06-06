@@ -100,7 +100,7 @@ public class UserController {
         }
     }
     @GetMapping("/{id}")
-public Map<String, Object> getUserById(@PathVariable Long id) {
+public Map<String, Object> getUserById(@PathVariable long id) {
     Map<String, Object> response = new HashMap<>();
 
     return userRepository.findById(id)
@@ -118,7 +118,7 @@ public Map<String, Object> getUserById(@PathVariable Long id) {
 
 @PutMapping("/{id}")
 public Map<String, Object> updateUser(
-        @PathVariable Long id,
+        @PathVariable long id,
         @RequestBody User updatedUser
 ) {
     Map<String, Object> response = new HashMap<>();
@@ -166,7 +166,7 @@ public Map<String, Object> updateUser(
 }
 
 @DeleteMapping("/{id}")
-public Map<String, Object> deleteUser(@PathVariable Long id) {
+public Map<String, Object> deleteUser(@PathVariable long id) {
 
     Map<String, Object> response = new HashMap<>();
 

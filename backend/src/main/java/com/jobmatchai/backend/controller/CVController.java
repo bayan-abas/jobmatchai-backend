@@ -6,6 +6,8 @@ import com.jobmatchai.backend.repository.CVAnalysisRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.CVTextExtractorService;
 import com.jobmatchai.backend.service.OpenAICVAnalysisService;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.Resource;
@@ -39,6 +41,7 @@ public class CVController {
     private CVAnalysisRepository cvAnalysisRepository;
 
     private final String uploadDir = "uploads/cvs/";
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @GetMapping("/test")
     public String test() {
@@ -112,6 +115,7 @@ public class CVController {
         return ResponseEntity.ok(user.getCvFileName());
     }
 
+    @SuppressWarnings("null")
     @GetMapping("/download/{fileName}")
     public ResponseEntity<?> downloadCV(@PathVariable String fileName) {
 
@@ -127,9 +131,8 @@ public class CVController {
                 return ResponseEntity.notFound().build();
             }
 
-            String lowerFileName = resource.getFilename() == null
-                    ? ""
-                    : resource.getFilename().toLowerCase();
+            String resourceFilename = resource.getFilename();
+            String lowerFileName = resourceFilename == null ? "" : resourceFilename.toLowerCase();
 
             MediaType mediaType = MediaType.APPLICATION_OCTET_STREAM;
 
@@ -146,7 +149,7 @@ public class CVController {
                     .contentType(mediaType)
                     .header(
                             HttpHeaders.CONTENT_DISPOSITION,
-                            "inline; filename=\"" + resource.getFilename() + "\"")
+                            "inline; filename=\"" + (resourceFilename != null ? resourceFilename : fileName) + "\"")
                     .body(resource);
 
         } catch (Exception e) {
@@ -156,6 +159,7 @@ public class CVController {
         }
     }
 
+    @SuppressWarnings("null")
     @GetMapping({ "/extract", "/extract-text" })
     public ResponseEntity<?> extractCVText(@RequestParam("email") String email) {
 
@@ -199,48 +203,69 @@ public class CVController {
         }
     }
 
-    @PostMapping("/analyze")
+    @PostMapping({"/analyze", "/analyze/"})
     public ResponseEntity<?> analyzeCV(@RequestParam("email") String email) {
 
         try {
-            User user = userRepository.findByEmail(email);
+           System.out.println("STEP 1");
+User user = userRepository.findByEmail(email);
 
-            if (user == null) {
-                return ResponseEntity.badRequest().body("User not found");
-            }
+if (user == null) {
+    return ResponseEntity.badRequest().body("User not found");
+}
 
-            String fileName = user.getCvFileName();
+System.out.println("STEP 2");
+String fileName = user.getCvFileName();
 
-            if (fileName == null || fileName.isEmpty()) {
-                return ResponseEntity.badRequest().body("No CV uploaded for user");
-            }
+System.out.println("STEP 3");
 
-            File cvFile = Paths.get(System.getProperty("user.dir"))
-                    .resolve(uploadDir)
-                    .resolve(fileName)
-                    .normalize()
-                    .toFile();
+File cvFile = Paths.get(System.getProperty("user.dir"))
+        .resolve(uploadDir)
+        .resolve(fileName)
+        .normalize()
+        .toFile();
 
-            if (!cvFile.exists()) {
-                return ResponseEntity.notFound().build();
-            }
+System.out.println("FILE PATH = " + cvFile.getAbsolutePath());
+System.out.println("FILE EXISTS = " + cvFile.exists());
 
-            String text = cvTextExtractorService.extractText(cvFile);
+if (!cvFile.exists()) {
+    return ResponseEntity.notFound().build();
+    
+}
 
-            if (text == null || text.isBlank()) {
-                return ResponseEntity.badRequest().body("Could not extract text from this CV");
-            }
+String aiResult = "";
 
-            String aiResult = openAICVAnalysisService.analyzeCV(text);
+try {
+    System.out.println("STEP 4");
+    String text = cvTextExtractorService.extractText(cvFile);
 
-            CVAnalysis analysis = new CVAnalysis();
-            analysis.setUserEmail(email);
-            analysis.setSummary(aiResult);
+    System.out.println("STEP 5");
+    aiResult = openAICVAnalysisService.analyzeCV(text);
 
-            cvAnalysisRepository.save(analysis);
+} catch (Exception ex) {
+    ex.printStackTrace();
+}
 
-            return ResponseEntity.ok(aiResult);
+System.out.println("STEP 6");
+JsonNode json = objectMapper.readTree(aiResult);
 
+CVAnalysis analysis = cvAnalysisRepository
+        .findByUserEmail(email)
+        .orElse(new CVAnalysis());
+
+analysis.setUserEmail(email);
+analysis.setSkills(json.path("skills").asText(""));
+analysis.setSummary(json.path("summary").asText(""));
+analysis.setStrengths(json.path("strengths").asText(""));
+analysis.setMissingSkills(json.path("missingSkills").asText(""));
+analysis.setRecommendedRoles(json.path("recommendedRoles").asText(""));
+
+System.out.println("STEP 7");
+cvAnalysisRepository.save(analysis);
+
+System.out.println("STEP 8");
+
+return ResponseEntity.ok(analysis);
         } catch (Exception e) {
             e.printStackTrace();
             return ResponseEntity.internalServerError()
@@ -248,8 +273,14 @@ public class CVController {
         }
     }
 
-    @GetMapping("/hello")
-    public String hello() {
-        return "hello from cv controller";
-    }
+    @PostMapping("/analyze-test")
+public ResponseEntity<?> analyzeTest(@RequestParam("email") String email) {
+    return ResponseEntity.ok("Analyze endpoint works for: " + email);
+}
+@GetMapping("/analysis")
+public ResponseEntity<?> getCVAnalysis(@RequestParam("email") String email) {
+    return cvAnalysisRepository.findByUserEmail(email)
+            .<ResponseEntity<?>>map(ResponseEntity::ok)
+            .orElseGet(() -> ResponseEntity.notFound().build());
+}
 }

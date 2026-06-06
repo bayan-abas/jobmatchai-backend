@@ -32,6 +32,7 @@ public class JobController {
         return jobRepository.findByCompanyEmail(companyEmail);
     }
 
+    @SuppressWarnings("null")
     @PostMapping("/add")
     public Map<String, Object> addJob(@RequestBody Job job) {
         Map<String, Object> response = new HashMap<>();
@@ -52,7 +53,7 @@ public class JobController {
     }
 
     @GetMapping("/{id}")
-    public Map<String, Object> getJobById(@PathVariable Long id) {
+    public Map<String, Object> getJobById(@PathVariable long id) {
         Map<String, Object> response = new HashMap<>();
 
         return jobRepository.findById(id)
@@ -69,7 +70,7 @@ public class JobController {
     }
 
     @PutMapping("/{id}")
-    public Map<String, Object> updateJob(@PathVariable Long id, @RequestBody Job updatedJob) {
+    public Map<String, Object> updateJob(@PathVariable long id, @RequestBody Job updatedJob) {
         Map<String, Object> response = new HashMap<>();
 
         try {
@@ -107,7 +108,7 @@ public class JobController {
     }
 
     @DeleteMapping("/{id}")
-    public Map<String, Object> deleteJob(@PathVariable Long id) {
+    public Map<String, Object> deleteJob(@PathVariable long id) {
         Map<String, Object> response = new HashMap<>();
 
         try {
