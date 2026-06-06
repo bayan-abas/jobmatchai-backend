@@ -1,7 +1,12 @@
 package com.jobmatchai.backend.controller;
 
+import com.jobmatchai.backend.model.CVAnalysis;
 import com.jobmatchai.backend.model.User;
+import com.jobmatchai.backend.repository.CVAnalysisRepository;
 import com.jobmatchai.backend.repository.UserRepository;
+import com.jobmatchai.backend.service.CVTextExtractorService;
+import com.jobmatchai.backend.service.OpenAICVAnalysisService;
+
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.UrlResource;
@@ -12,6 +17,7 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.File;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 
@@ -23,6 +29,15 @@ public class CVController {
     @Autowired
     private UserRepository userRepository;
 
+    @Autowired
+    private CVTextExtractorService cvTextExtractorService;
+
+    @Autowired
+    private OpenAICVAnalysisService openAICVAnalysisService;
+
+    @Autowired
+    private CVAnalysisRepository cvAnalysisRepository;
+
     private final String uploadDir = "uploads/cvs/";
 
     @GetMapping("/test")
@@ -33,8 +48,8 @@ public class CVController {
     @PostMapping("/upload")
     public ResponseEntity<?> uploadCV(
             @RequestParam("file") MultipartFile file,
-            @RequestParam("email") String email
-    ) {
+            @RequestParam("email") String email) {
+
         try {
             User user = userRepository.findByEmail(email);
 
@@ -48,8 +63,22 @@ public class CVController {
                 folder.mkdirs();
             }
 
-            String fileName =
-                    System.currentTimeMillis() + "_" + file.getOriginalFilename();
+            String originalFileName = file.getOriginalFilename();
+
+            if (originalFileName == null || originalFileName.isBlank()) {
+                return ResponseEntity.badRequest().body("Invalid file name");
+            }
+
+            String lowerFileName = originalFileName.toLowerCase();
+
+            if (!lowerFileName.endsWith(".pdf")
+                    && !lowerFileName.endsWith(".doc")
+                    && !lowerFileName.endsWith(".docx")) {
+                return ResponseEntity.badRequest().body("Only PDF, DOC, and DOCX files are allowed");
+            }
+
+            String safeFileName = originalFileName.replaceAll("[^a-zA-Z0-9._-]", "_");
+            String fileName = System.currentTimeMillis() + "_" + safeFileName;
 
             File destination = new File(folder, fileName);
 
@@ -69,6 +98,7 @@ public class CVController {
 
     @GetMapping("/current")
     public ResponseEntity<?> getCurrentCV(@RequestParam("email") String email) {
+
         User user = userRepository.findByEmail(email);
 
         if (user == null) {
@@ -84,6 +114,7 @@ public class CVController {
 
     @GetMapping("/download/{fileName}")
     public ResponseEntity<?> downloadCV(@PathVariable String fileName) {
+
         try {
             Path filePath = Paths.get(System.getProperty("user.dir"))
                     .resolve(uploadDir)
@@ -108,16 +139,14 @@ public class CVController {
                 mediaType = MediaType.parseMediaType("application/msword");
             } else if (lowerFileName.endsWith(".docx")) {
                 mediaType = MediaType.parseMediaType(
-                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                );
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
             }
 
             return ResponseEntity.ok()
                     .contentType(mediaType)
                     .header(
                             HttpHeaders.CONTENT_DISPOSITION,
-                            "inline; filename=\"" + resource.getFilename() + "\""
-                    )
+                            "inline; filename=\"" + resource.getFilename() + "\"")
                     .body(resource);
 
         } catch (Exception e) {
@@ -125,5 +154,102 @@ public class CVController {
             return ResponseEntity.internalServerError()
                     .body("Failed to download CV: " + e.getMessage());
         }
+    }
+
+    @GetMapping({ "/extract", "/extract-text" })
+    public ResponseEntity<?> extractCVText(@RequestParam("email") String email) {
+
+        try {
+            User user = userRepository.findByEmail(email);
+
+            if (user == null) {
+                return ResponseEntity.badRequest().body("User not found");
+            }
+
+            String fileName = user.getCvFileName();
+
+            if (fileName == null || fileName.isEmpty()) {
+                return ResponseEntity.badRequest().body("No CV uploaded for user");
+            }
+
+            File cvFile = Paths.get(System.getProperty("user.dir"))
+                    .resolve(uploadDir)
+                    .resolve(fileName)
+                    .normalize()
+                    .toFile();
+
+            if (!cvFile.exists()) {
+                return ResponseEntity.notFound().build();
+            }
+
+            String text = cvTextExtractorService.extractText(cvFile);
+
+            if (text == null || text.isBlank()) {
+                return ResponseEntity.badRequest().body("Could not extract text from this CV");
+            }
+
+            return ResponseEntity.ok()
+                    .contentType(new MediaType(MediaType.TEXT_PLAIN, StandardCharsets.UTF_8))
+                    .body(text);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return ResponseEntity.internalServerError()
+                    .body("Failed to extract CV text: " + e.getMessage());
+        }
+    }
+
+    @PostMapping("/analyze")
+    public ResponseEntity<?> analyzeCV(@RequestParam("email") String email) {
+
+        try {
+            User user = userRepository.findByEmail(email);
+
+            if (user == null) {
+                return ResponseEntity.badRequest().body("User not found");
+            }
+
+            String fileName = user.getCvFileName();
+
+            if (fileName == null || fileName.isEmpty()) {
+                return ResponseEntity.badRequest().body("No CV uploaded for user");
+            }
+
+            File cvFile = Paths.get(System.getProperty("user.dir"))
+                    .resolve(uploadDir)
+                    .resolve(fileName)
+                    .normalize()
+                    .toFile();
+
+            if (!cvFile.exists()) {
+                return ResponseEntity.notFound().build();
+            }
+
+            String text = cvTextExtractorService.extractText(cvFile);
+
+            if (text == null || text.isBlank()) {
+                return ResponseEntity.badRequest().body("Could not extract text from this CV");
+            }
+
+            String aiResult = openAICVAnalysisService.analyzeCV(text);
+
+            CVAnalysis analysis = new CVAnalysis();
+            analysis.setUserEmail(email);
+            analysis.setSummary(aiResult);
+
+            cvAnalysisRepository.save(analysis);
+
+            return ResponseEntity.ok(aiResult);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return ResponseEntity.internalServerError()
+                    .body("Failed to analyze CV: " + e.getMessage());
+        }
+    }
+
+    @GetMapping("/hello")
+    public String hello() {
+        return "hello from cv controller";
     }
 }
