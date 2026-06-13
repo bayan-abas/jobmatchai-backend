@@ -10,7 +10,11 @@ public class CVAnalysis {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    @Column(name = "user_email")
     private String userEmail;
+
+    @Column(name = "candidate_field", columnDefinition = "TEXT")
+    private String candidateField;
 
     @Column(columnDefinition = "TEXT")
     private String skills;
@@ -21,17 +25,26 @@ public class CVAnalysis {
     @Column(columnDefinition = "TEXT")
     private String strengths;
 
-    @Column(columnDefinition = "TEXT")
+    @Column(name = "missing_skills", columnDefinition = "TEXT")
     private String missingSkills;
 
-    @Column(columnDefinition = "TEXT")
+    @Column(name = "recommended_roles", columnDefinition = "TEXT")
     private String recommendedRoles;
 
-    // Constructors
+    @Column(name = "overall_score", columnDefinition = "TEXT")
+    private String overallScore;
+
+    @Column(name = "score_level", columnDefinition = "TEXT")
+    private String scoreLevel;
+
+    @Column(name = "evaluation_reason", columnDefinition = "TEXT")
+    private String evaluationReason;
+
+    @Column(name = "missing_information", columnDefinition = "TEXT")
+    private String missingInformation;
+
     public CVAnalysis() {
     }
-
-    // Getters & Setters
 
     public Long getId() {
         return id;
@@ -47,6 +60,14 @@ public class CVAnalysis {
 
     public void setUserEmail(String userEmail) {
         this.userEmail = userEmail;
+    }
+
+    public String getCandidateField() {
+        return candidateField;
+    }
+
+    public void setCandidateField(String candidateField) {
+        this.candidateField = candidateField;
     }
 
     public String getSkills() {
@@ -88,4 +109,38 @@ public class CVAnalysis {
     public void setRecommendedRoles(String recommendedRoles) {
         this.recommendedRoles = recommendedRoles;
     }
+
+    public String getOverallScore() {
+        return overallScore;
+    }
+
+    public void setOverallScore(String overallScore) {
+        this.overallScore = overallScore;
+    }
+
+    public String getScoreLevel() {
+        return scoreLevel;
+    }
+
+    public void setScoreLevel(String scoreLevel) {
+        this.scoreLevel = scoreLevel;
+    }
+
+    public String getEvaluationReason() {
+        return evaluationReason;
+    }
+
+    public void setEvaluationReason(String evaluationReason) {
+        this.evaluationReason = evaluationReason;
+    }
+
+    public String getMissingInformation() {
+        return missingInformation;
+    }
+
+    public void setMissingInformation(String missingInformation) {
+        this.missingInformation = missingInformation;
+    }
 }
+
+
