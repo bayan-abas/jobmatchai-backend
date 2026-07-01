@@ -6,11 +6,23 @@ import org.springframework.web.util.HtmlUtils;
 
 import java.io.File;
 import java.nio.file.Files;
+import java.util.regex.Pattern;
 
 @Service
 public class CVTextExtractorService {
 
     private final Tika tika = new Tika();
+
+    private static final Pattern HTML_COMMENT_PATTERN = Pattern.compile("(?is)<!--.*?-->");
+    private static final Pattern HTML_SCRIPT_STYLE_PATTERN = Pattern.compile("(?is)<(script|style|head|xml)[^>]*>.*?</\\1>");
+    private static final Pattern HTML_ANY_TAG_PATTERN = Pattern.compile("(?is)<[^>]+>");
+    private static final Pattern CSS_LIKE_PATTERN = Pattern.compile("(?m)^\\s*(mso-|font-|margin|padding|border|style=|class=|span\\b|td\\b|tr\\b).*");
+    private static final Pattern WHITESPACE_PATTERN = Pattern.compile("[ \\t\\x0B\\f\\r]+");
+    private static final Pattern NEWLINE_PATTERN = Pattern.compile("\\n{3,}");
+
+    private static final Pattern LETTERS_PATTERN = Pattern.compile("[\\p{IsHebrew}\\p{IsArabic}A-Za-z]");
+    private static final Pattern YEAR_PATTERN = Pattern.compile("\\b(19|20)\\d{2}\\b");
+    private static final Pattern NUMBER_ONLY_PATTERN = Pattern.compile("(?m)^\\s*\\d+(\\.\\d+)?\\s*$");
 
     public String extractText(File file) {
         try {
@@ -43,18 +55,17 @@ public class CVTextExtractorService {
                 .replace('\u00A0', ' ');
 
         if (looksLikeHtml(cleaned)) {
-            cleaned = cleaned
-                    .replaceAll("(?is)<!--.*?-->", " ")
-                    .replaceAll("(?is)<(script|style|head|xml)[^>]*>.*?</\\1>", " ")
-                    .replaceAll("(?is)<[^>]+>", " ");
-            cleaned = HtmlUtils.htmlUnescape(cleaned);
+            cleaned = HTML_COMMENT_PATTERN.matcher(cleaned).replaceAll(" ");
+            cleaned = HTML_SCRIPT_STYLE_PATTERN.matcher(cleaned).replaceAll(" ");
+            cleaned = HTML_ANY_TAG_PATTERN.matcher(cleaned).replaceAll(" ");
+            cleaned = HtmlUtils.htmlUnescape(cleaned != null ? cleaned : "");
         }
 
-        return cleaned
-                .replaceAll("(?m)^\\s*(mso-|font-|margin|padding|border|style=|class=|span\\b|td\\b|tr\\b).*", " ")
-                .replaceAll("[ \\t\\x0B\\f\\r]+", " ")
-                .replaceAll("\\n{3,}", "\n\n")
-                .trim();
+        cleaned = CSS_LIKE_PATTERN.matcher(cleaned).replaceAll(" ");
+        cleaned = WHITESPACE_PATTERN.matcher(cleaned).replaceAll(" ");
+        cleaned = NEWLINE_PATTERN.matcher(cleaned).replaceAll("\n\n");
+        
+        return cleaned.trim();
     }
 
     private boolean looksLikeHtml(String text) {
@@ -85,13 +96,13 @@ public class CVTextExtractorService {
         String lower = text.toLowerCase();
         int score = 0;
 
-        score += Math.min(countMatches(text, "[\\p{IsHebrew}\\p{IsArabic}A-Za-z]"), 300);
+        score += Math.min(countMatches(text, LETTERS_PATTERN), 300);
         score += countContains(lower, "\u05e7\u05d5\u05e8\u05d5\u05ea", "\u05d7\u05d9\u05d9\u05dd", "\u05e0\u05d9\u05e1\u05d9\u05d5\u05df", "\u05ea\u05e2\u05e1\u05d5\u05e7\u05ea\u05d9", "\u05d4\u05e9\u05db\u05dc\u05d4", "\u05de\u05e0\u05d4\u05dc", "\u05e2\u05d1\u05d5\u05d3\u05d4", "\u05d1\u05e0\u05d9\u05d9\u05df") * 25;
         score += countContains(lower, "resume", "experience", "education", "skills", "work", "employment") * 20;
-        score += countMatches(text, "\\b(19|20)\\d{2}\\b") * 8;
+        score += countMatches(text, YEAR_PATTERN) * 8;
 
         score -= countContains(lower, "mso-", "font-family", "stylesheet", "normal.dot", "times new roman") * 25;
-        score -= Math.min(countMatches(text, "(?m)^\\s*\\d+(\\.\\d+)?\\s*$"), 80);
+        score -= Math.min(countMatches(text, NUMBER_ONLY_PATTERN), 80);
 
         return score;
     }
@@ -106,9 +117,8 @@ public class CVTextExtractorService {
         return count;
     }
 
-    private int countMatches(String text, String pattern) {
-        return (int) java.util.regex.Pattern.compile(pattern)
-                .matcher(text)
+    private int countMatches(String text, Pattern pattern) {
+        return (int) pattern.matcher(text)
                 .results()
                 .count();
     }

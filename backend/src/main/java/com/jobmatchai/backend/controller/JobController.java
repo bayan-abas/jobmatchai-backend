@@ -2,7 +2,11 @@ package com.jobmatchai.backend.controller;
 
 import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.repository.JobRepository;
+import com.jobmatchai.backend.service.JobMatchService;
+import com.jobmatchai.backend.service.NotificationService;
+
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -16,6 +20,14 @@ public class JobController {
 
     @Autowired
     private JobRepository jobRepository;
+
+    @Autowired
+    private JobMatchService jobMatchService;
+
+    @Autowired
+    private NotificationService notificationService;
+
+    public record MatchScoreRequest(String email, List<Long> jobIds, String language) {}
 
     @GetMapping("/test")
     public String test() {
@@ -32,13 +44,21 @@ public class JobController {
         return jobRepository.findByCompanyEmail(companyEmail);
     }
 
-    @SuppressWarnings("null")
     @PostMapping("/add")
     public Map<String, Object> addJob(@RequestBody Job job) {
         Map<String, Object> response = new HashMap<>();
 
         try {
             Job savedJob = jobRepository.save(job);
+
+            if (savedJob.getCompanyEmail() != null && !savedJob.getCompanyEmail().isBlank()) {
+                notificationService.createNotification(
+                        savedJob.getCompanyEmail(),
+                        "Job Posted Successfully",
+                        "Your job posting '" + savedJob.getTitle() + "' has been created.",
+                        "JOB_POSTED"
+                );
+            }
 
             response.put("success", true);
             response.put("message", "Job added successfully");
@@ -88,6 +108,15 @@ public class JobController {
 
                         Job savedJob = jobRepository.save(job);
 
+                        if (savedJob.getCompanyEmail() != null && !savedJob.getCompanyEmail().isBlank()) {
+                            notificationService.createNotification(
+                                    savedJob.getCompanyEmail(),
+                                    "Job Updated",
+                                    "Your job posting '" + savedJob.getTitle() + "' has been updated.",
+                                    "JOB_UPDATED"
+                            );
+                        }
+
                         response.put("success", true);
                         response.put("message", "Job updated successfully");
                         response.put("job", savedJob);
@@ -112,23 +141,59 @@ public class JobController {
         Map<String, Object> response = new HashMap<>();
 
         try {
-            if (!jobRepository.existsById(id)) {
-                response.put("success", false);
-                response.put("message", "Job not found");
-                return response;
-            }
+            return jobRepository.findById(id)
+                    .map(job -> {
+                        jobRepository.deleteById(id);
 
-            jobRepository.deleteById(id);
+                        if (job.getCompanyEmail() != null && !job.getCompanyEmail().isBlank()) {
+                            notificationService.createNotification(
+                                    job.getCompanyEmail(),
+                                    "Job Deleted",
+                                    "Your job posting '" + job.getTitle() + "' has been deleted.",
+                                    "JOB_DELETED"
+                            );
+                        }
 
-            response.put("success", true);
-            response.put("message", "Job deleted successfully");
+                        response.put("success", true);
+                        response.put("message", "Job deleted successfully");
 
-            return response;
+                        return response;
+                    })
+                    .orElseGet(() -> {
+                        response.put("success", false);
+                        response.put("message", "Job not found");
+                        return response;
+                    });
 
         } catch (Exception e) {
             response.put("success", false);
             response.put("message", e.getMessage());
             return response;
+        }
+    }
+
+    @PostMapping("/match-scores")
+    public ResponseEntity<?> getMatchScores(@RequestBody MatchScoreRequest request) {
+        try {
+            if (request.email() == null || request.email().isBlank()) {
+                return ResponseEntity.badRequest().body("Email is required");
+            }
+
+            List<Long> jobIds = request.jobIds() == null ? List.of() : request.jobIds();
+            List<Job> jobs = jobIds.isEmpty() ? List.of() : jobRepository.findAllById(jobIds);
+
+            JobMatchService.MatchScoresResult result =
+                    jobMatchService.getMatchScores(request.email(), jobs, request.language());
+
+            Map<String, Object> response = new HashMap<>();
+            response.put("hasAnalysis", result.hasAnalysis());
+            response.put("matches", result.matches());
+
+            return ResponseEntity.ok(response);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return ResponseEntity.internalServerError().body("Failed to compute match scores: " + e.getMessage());
         }
     }
 }

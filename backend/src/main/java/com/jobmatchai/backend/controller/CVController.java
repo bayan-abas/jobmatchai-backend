@@ -5,7 +5,9 @@ import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.CVTextExtractorService;
+import com.jobmatchai.backend.service.NotificationService;
 import com.jobmatchai.backend.service.OpenAICVAnalysisService;
+import com.jobmatchai.backend.util.HashUtil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -40,6 +42,9 @@ public class CVController {
     @Autowired
     private CVAnalysisRepository cvAnalysisRepository;
 
+    @Autowired
+    private NotificationService notificationService;
+
     private final String uploadDir = "uploads/cvs/";
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -48,10 +53,19 @@ public class CVController {
         return "CV API is working";
     }
 
+    private String pickByLanguage(String language, String en, String ar, String he) {
+        return switch (language == null ? "en" : language) {
+            case "ar" -> ar;
+            case "he" -> he;
+            default -> en;
+        };
+    }
+
     @PostMapping("/upload")
     public ResponseEntity<?> uploadCV(
             @RequestParam("file") MultipartFile file,
-            @RequestParam("email") String email) {
+            @RequestParam("email") String email,
+            @RequestParam(value = "language", defaultValue = "en") String language) {
 
         try {
             User user = userRepository.findByEmail(email);
@@ -91,24 +105,40 @@ public class CVController {
             if (extractedText == null || extractedText.isBlank()) {
                 destination.delete();
                 return ResponseEntity.badRequest()
-                        .body("The uploaded file does not contain readable CV text.");
+                        .body(pickByLanguage(language,
+                                "The uploaded file does not contain readable CV text.",
+                                "الملف الذي تم رفعه لا يحتوي على نص سيرة ذاتية قابل للقراءة.",
+                                "הקובץ שהועלה אינו מכיל טקסט קורות חיים קריא."));
             }
 
-            String validationResult = openAICVAnalysisService.validateCV(extractedText);
+            String validationResult = openAICVAnalysisService.validateCV(extractedText, language);
             JsonNode validationJson = objectMapper.readTree(validationResult);
 
             boolean isCV = validationJson.path("isCV").asBoolean(false);
             int confidence = validationJson.path("confidence").asInt(0);
-            String reason = validationJson.path("reason").asText("The uploaded file is not a valid CV.");
+            String reason = validationJson.path("reason").asText(pickByLanguage(language,
+                    "The uploaded file is not a valid CV.",
+                    "الملف الذي تم رفعه ليس سيرة ذاتية صالحة.",
+                    "הקובץ שהועלה אינו קורות חיים תקינים."));
 
             if (!isCV || confidence < 75) {
                 destination.delete();
                 return ResponseEntity.badRequest()
-                        .body("Invalid CV file: " + reason);
+                        .body(pickByLanguage(language,
+                                "Invalid CV file: ",
+                                "ملف السيرة الذاتية غير صالح: ",
+                                "קובץ קורות החיים אינו תקין: ") + reason);
             }
 
             user.setCvFileName(fileName);
             userRepository.save(user);
+
+            notificationService.createNotification(
+                    user.getEmail(),
+                    "CV Uploaded Successfully",
+                    "Your CV has been uploaded and saved.",
+                    "CV_UPLOADED"
+            );
 
             return ResponseEntity.ok(fileName);
 
@@ -155,6 +185,13 @@ public class CVController {
             cvAnalysisRepository.findByUserEmail(email)
                     .ifPresent(cvAnalysisRepository::delete);
 
+            notificationService.createNotification(
+                    user.getEmail(),
+                    "CV Deleted",
+                    "Your uploaded CV has been deleted.",
+                    "CV_DELETED"
+            );
+
             return ResponseEntity.ok("CV deleted successfully");
 
         } catch (Exception e) {
@@ -180,7 +217,6 @@ public class CVController {
         return ResponseEntity.ok(user.getCvFileName());
     }
 
-    @SuppressWarnings("null")
     @GetMapping("/download/{fileName}")
     public ResponseEntity<?> downloadCV(@PathVariable String fileName) {
 
@@ -230,7 +266,6 @@ public class CVController {
         }
     }
 
-    @SuppressWarnings("null")
     @GetMapping({"/extract", "/extract-text"})
     public ResponseEntity<?> extractCVText(@RequestParam("email") String email) {
 
@@ -326,8 +361,16 @@ public class CVController {
             analysis.setScoreLevel(json.path("scoreLevel").asText(""));
             analysis.setEvaluationReason(json.path("evaluationReason").asText(""));
             analysis.setMissingInformation(json.path("missingInformation").asText(""));
+            analysis.setCvTextHash(HashUtil.sha256(text));
 
             cvAnalysisRepository.save(analysis);
+
+            notificationService.createNotification(
+                    email,
+                    "CV Analysis Complete",
+                    "Your CV analysis is ready and saved.",
+                    "CV_ANALYZED"
+            );
 
             return ResponseEntity.ok(analysis);
 

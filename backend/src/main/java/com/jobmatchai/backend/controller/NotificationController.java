@@ -1,0 +1,56 @@
+package com.jobmatchai.backend.controller;
+
+import com.jobmatchai.backend.model.Notification;
+import com.jobmatchai.backend.service.NotificationService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/notifications")
+@CrossOrigin(origins = "http://localhost:5173")
+public class NotificationController {
+
+    @Autowired
+    private NotificationService notificationService;
+
+    @GetMapping("/test")
+    public String test() {
+        return "Notifications API is working";
+    }
+
+    @GetMapping("/{email}")
+    public ResponseEntity<List<Notification>> getNotifications(@PathVariable String email) {
+        List<Notification> notifications = notificationService.getNotifications(email);
+        return ResponseEntity.ok(notifications);
+    }
+
+    @GetMapping("/{email}/unread-count")
+    public ResponseEntity<Map<String, Object>> getUnreadCount(@PathVariable String email) {
+        long count = notificationService.getUnreadCount(email);
+        Map<String, Object> response = new HashMap<>();
+        response.put("unreadCount", count);
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/{id}/read")
+    public ResponseEntity<Map<String, Object>> markAsRead(@PathVariable Long id) {
+        Notification updated = notificationService.markAsRead(id);
+        Map<String, Object> response = new HashMap<>();
+
+        if (updated == null) {
+            response.put("success", false);
+            response.put("message", "Notification not found");
+            return ResponseEntity.badRequest().body(response);
+        }
+
+        response.put("success", true);
+        response.put("message", "Notification marked as read");
+        response.put("notification", updated);
+        return ResponseEntity.ok(response);
+    }
+}

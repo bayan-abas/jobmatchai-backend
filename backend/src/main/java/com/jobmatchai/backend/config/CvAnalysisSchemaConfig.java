@@ -21,19 +21,21 @@ public class CvAnalysisSchemaConfig {
                 )
                 """);
 
-        jdbcTemplate.execute("""
-                ALTER TABLE cv_analysis
-                    ADD COLUMN IF NOT EXISTS user_email VARCHAR(255),
-                    ADD COLUMN IF NOT EXISTS candidate_field TEXT,
-                    ADD COLUMN IF NOT EXISTS skills TEXT,
-                    ADD COLUMN IF NOT EXISTS summary TEXT,
-                    ADD COLUMN IF NOT EXISTS strengths TEXT,
-                    ADD COLUMN IF NOT EXISTS missing_skills TEXT,
-                    ADD COLUMN IF NOT EXISTS recommended_roles TEXT,
-                    ADD COLUMN IF NOT EXISTS overall_score TEXT,
-                    ADD COLUMN IF NOT EXISTS score_level TEXT,
-                    ADD COLUMN IF NOT EXISTS evaluation_reason TEXT,
-                    ADD COLUMN IF NOT EXISTS missing_information TEXT
-                """);
+        String[] columns = {
+                "user_email VARCHAR(255)",
+                "candidate_field TEXT",
+                "skills TEXT",
+                "summary TEXT",
+                "strengths TEXT",
+                "missing_skills TEXT",
+                "recommended_roles TEXT",
+                "overall_score TEXT",
+                "score_level TEXT",
+                "evaluation_reason TEXT",
+                "missing_information TEXT"
+        };
+        for (String column : columns) {
+            jdbcTemplate.execute("ALTER TABLE cv_analysis ADD COLUMN IF NOT EXISTS " + column);
+        }
     }
 }

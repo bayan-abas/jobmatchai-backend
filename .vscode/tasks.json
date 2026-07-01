@@ -1,0 +1,65 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Backend",
+            "type": "shell",
+            "command": ".\\backend\\mvnw.cmd",
+            "args": ["-f", "backend\\pom.xml", "-DskipTests", "compile"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": ["$msCompile"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "Run Backend (H2)",
+            "type": "shell",
+            "command": ".\\backend\\mvnw.cmd",
+            "args": ["-f", "backend\\pom.xml", "spring-boot:run"],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "SPRING_DATASOURCE_URL": "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE",
+                    "SPRING_DATASOURCE_USERNAME": "sa",
+                    "SPRING_DATASOURCE_PASSWORD": "",
+                    "SPRING_JPA_HIBERNATE_DDL_AUTO": "update"
+                }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Test Backend",
+            "type": "shell",
+            "command": ".\\backend\\mvnw.cmd",
+            "args": ["-f", "backend\\pom.xml", "test"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Clean Backend",
+            "type": "shell",
+            "command": ".\\backend\\mvnw.cmd",
+            "args": ["-f", "backend\\pom.xml", "clean"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        }
+        {
+            "label": "Clean Backend",
+            "type": "shell",
+            "command": ".\\backend\\mvnw.cmd",
+            "args": ["-f", "backend\\pom.xml", "clean"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

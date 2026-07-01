@@ -43,6 +43,9 @@ public class CVAnalysis {
     @Column(name = "missing_information", columnDefinition = "TEXT")
     private String missingInformation;
 
+    @Column(name = "cv_text_hash")
+    private String cvTextHash;
+
     public CVAnalysis() {
     }
 
@@ -140,6 +143,14 @@ public class CVAnalysis {
 
     public void setMissingInformation(String missingInformation) {
         this.missingInformation = missingInformation;
+    }
+
+    public String getCvTextHash() {
+        return cvTextHash;
+    }
+
+    public void setCvTextHash(String cvTextHash) {
+        this.cvTextHash = cvTextHash;
     }
 }
 

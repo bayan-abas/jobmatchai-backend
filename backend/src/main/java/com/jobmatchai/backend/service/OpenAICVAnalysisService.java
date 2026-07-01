@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import com.jobmatchai.backend.model.CVAnalysis;
+import com.jobmatchai.backend.model.Job;
+
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.stereotype.Service;
@@ -184,7 +187,10 @@ CV Text:
             String result = extractTextFromOpenAIResponse(response);
 
             if (result == null || result.isBlank()) {
-                return emptyAnalysisJson("I could not read the AI analysis clearly. Please try again.");
+                return emptyAnalysisJson(pickByLanguage(language,
+                        "I could not read the AI analysis clearly. Please try again.",
+                        "تعذّر قراءة نتيجة التحليل بوضوح. يرجى المحاولة مرة أخرى.",
+                        "לא ניתן היה לקרוא את תוצאת הניתוח בבירור. אנא נסה שוב."));
             }
 
             JsonNode json = objectMapper.readTree(result);
@@ -220,10 +226,10 @@ CV Text:
             String filteredMissingStr = String.join(", ", filteredMissing);
 
             int score = calculateRealisticScore(json);
-            String scoreLevel = getScoreLevel(score);
+            String scoreLevel = getScoreLevel(score, language);
             String evaluationReason = json.path("scoreRationale").asText("");
             if (evaluationReason.isBlank()) {
-                evaluationReason = buildEvaluationReason(json, score);
+                evaluationReason = buildEvaluationReason(json, score, language);
             }
 
             ObjectNode finalJson = objectMapper.createObjectNode();
@@ -242,28 +248,44 @@ CV Text:
             return objectMapper.writeValueAsString(finalJson);
 
         } catch (HttpClientErrorException e) {
-            return emptyAnalysisJson("OpenAI API Error: " + e.getStatusCode());
+            return emptyAnalysisJson(pickByLanguage(language,
+                    "OpenAI API Error: " + e.getStatusCode(),
+                    "خطأ في واجهة OpenAI: " + e.getStatusCode(),
+                    "שגיאת API של OpenAI: " + e.getStatusCode()));
         } catch (Exception e) {
-            return emptyAnalysisJson("Error analyzing CV: " + e.getMessage());
+            return emptyAnalysisJson(pickByLanguage(language,
+                    "Error analyzing CV: " + e.getMessage(),
+                    "حدث خطأ أثناء تحليل السيرة الذاتية: " + e.getMessage(),
+                    "אירעה שגיאה בניתוח קורות החיים: " + e.getMessage()));
         }
     }
 
-    public String validateCV(String cvText) {
+    public String validateCV(String cvText, String language) {
         try {
             String safeCvText = cvText;
 
             if (safeCvText == null || safeCvText.isBlank()) {
-                return invalidCVJson("The file does not contain readable text.", 0);
+                return invalidCVJson(pickByLanguage(language,
+                        "The file does not contain readable text.",
+                        "لا يحتوي الملف على نص قابل للقراءة.",
+                        "הקובץ אינו מכיל טקסט קריא."), 0);
             }
 
             if (safeCvText.length() > 6000) {
                 safeCvText = safeCvText.substring(0, 6000);
             }
 
+            String reasonLanguageInstruction = switch (language == null ? "en" : language) {
+                case "ar" -> "Write the \"reason\" field entirely in Arabic.";
+                case "he" -> "Write the \"reason\" field entirely in Hebrew.";
+                default -> "Write the \"reason\" field in English.";
+            };
+
             String prompt = """
 Return ONLY a raw valid JSON object. No markdown. No titles. No explanations.
 
 You are a document classifier for a recruitment system.
+""" + reasonLanguageInstruction + "\n" + """
 
 Decide if the uploaded document is a real candidate CV / resume.
 
@@ -316,7 +338,10 @@ Document text:
             String result = extractTextFromOpenAIResponse(response);
 
             if (result == null || result.isBlank()) {
-                return invalidCVJson("Unable to validate document.", 0);
+                return invalidCVJson(pickByLanguage(language,
+                        "Unable to validate document.",
+                        "تعذّر التحقق من صحة المستند.",
+                        "לא ניתן היה לאמת את המסמך."), 0);
             }
 
             JsonNode json = objectMapper.readTree(result);
@@ -333,10 +358,137 @@ Document text:
             return objectMapper.writeValueAsString(fixedJson);
 
         } catch (HttpClientErrorException e) {
-            return invalidCVJson("OpenAI API Error: " + e.getStatusCode(), 0);
+            return invalidCVJson(pickByLanguage(language,
+                    "OpenAI API Error: " + e.getStatusCode(),
+                    "خطأ في واجهة OpenAI: " + e.getStatusCode(),
+                    "שגיאת API של OpenAI: " + e.getStatusCode()), 0);
         } catch (Exception e) {
-            return invalidCVJson("Error validating CV: " + e.getMessage(), 0);
+            return invalidCVJson(pickByLanguage(language,
+                    "Error validating CV: " + e.getMessage(),
+                    "حدث خطأ أثناء التحقق من السيرة الذاتية: " + e.getMessage(),
+                    "אירעה שגיאה באימות קורות החיים: " + e.getMessage()), 0);
         }
+    }
+
+    private String pickByLanguage(String language, String en, String ar, String he) {
+        return switch (language == null ? "en" : language) {
+            case "ar" -> ar;
+            case "he" -> he;
+            default -> en;
+        };
+    }
+
+    public String computeJobMatches(CVAnalysis analysis, List<Job> jobs, String language) {
+        try {
+            if (jobs == null || jobs.isEmpty()) {
+                return "{\"matches\":[]}";
+            }
+
+            List<Job> cappedJobs = jobs.size() > 50 ? jobs.subList(0, 50) : jobs;
+
+            String languageInstruction = switch (language == null ? "en" : language) {
+                case "ar" -> "Write every \"matchReason\" value entirely in Arabic. Keep skill names in \"matchedSkills\"/\"missingSkills\" as-is (do not translate skill/technology names).";
+                case "he" -> "Write every \"matchReason\" value entirely in Hebrew. Keep skill names in \"matchedSkills\"/\"missingSkills\" as-is (do not translate skill/technology names).";
+                default -> "Write every \"matchReason\" value in English.";
+            };
+
+            String prompt = """
+Return ONLY a raw valid JSON object. No markdown. No explanations outside the JSON.
+""" + languageInstruction + """
+
+You are an expert technical recruiter. Compare ONE candidate against MULTIPLE job postings and score how well the candidate fits EACH job independently.
+
+CANDIDATE PROFILE:
+""" + buildCandidateProfileBlock(analysis) + """
+
+JOB POSTINGS TO SCORE (score each one independently, based only on its own requirements/skills/description):
+""" + buildJobsBlock(cappedJobs) + """
+
+For EACH job listed above, evaluate fit based on: skills overlap, relevant experience/seniority match, field/domain match, and overall qualification for that specific job's requirements. Do not give every job a similar score — scores must vary meaningfully based on actual fit. A job requiring skills the candidate doesn't have should score low; a job matching the candidate's strongest skills and experience should score high.
+
+Also classify EACH skill listed in that job's "Required skills" line into either matchedSkills or missingSkills:
+- Treat a job skill as MATCHED if the candidate's skills/summary/strengths show they clearly have that skill OR a reasonable equivalent — even if worded, abbreviated, or formatted differently (e.g. "JS" = "JavaScript", "React.js" = "React", "Postgres" = "PostgreSQL", "Node" = "Node.js", translated/synonymous terms, common abbreviations, or a broader skill that clearly implies it).
+- Treat a job skill as MISSING only if the candidate shows no reasonable evidence of that skill or an equivalent.
+- Every skill from that job's "Required skills" line must appear in exactly one of matchedSkills or missingSkills, using the EXACT wording from the job's "Required skills" line (do not rewrite/rename it).
+- If a job has no listed skills, both arrays should be empty for that job.
+
+Return exactly this JSON structure:
+{
+  "matches": [
+    { "jobId": 0, "matchPercent": 0, "matchReason": "", "matchedSkills": [], "missingSkills": [] }
+  ]
+}
+
+Rules:
+- matchPercent: integer 0-100.
+- matchReason: ONE concise sentence (max ~20 words) explaining the score, written directly to the candidate ("you").
+- matchedSkills / missingSkills: arrays of strings, exact wording from the job's skill list, no duplicates between the two arrays.
+- Include exactly one entry per job listed above, using the exact jobId given.
+""";
+
+            Map<String, Object> body = Map.of(
+                    "model", model,
+                    "input", prompt,
+                    "store", false,
+                    "text", Map.of("format", Map.of("type", "json_object"))
+            );
+
+            Map<String, Object> response = callOpenAI(body);
+            String result = extractTextFromOpenAIResponse(response);
+
+            if (result == null || result.isBlank()) {
+                return "{\"matches\":[]}";
+            }
+
+            return result;
+
+        } catch (Exception e) {
+            return "{\"matches\":[]}";
+        }
+    }
+
+    private String buildCandidateProfileBlock(CVAnalysis analysis) {
+        return """
+Field: %s
+Skills: %s
+Experience summary: %s
+Strengths: %s
+Missing skills: %s
+Overall CV score: %s
+""".formatted(
+                nullToNA(analysis.getCandidateField()),
+                nullToNA(analysis.getSkills()),
+                nullToNA(analysis.getSummary()),
+                nullToNA(analysis.getStrengths()),
+                nullToNA(analysis.getMissingSkills()),
+                nullToNA(analysis.getOverallScore())
+        );
+    }
+
+    private String buildJobsBlock(List<Job> jobs) {
+        StringBuilder sb = new StringBuilder();
+
+        for (Job job : jobs) {
+            String description = job.getDescription();
+            if (description != null && description.length() > 500) {
+                description = description.substring(0, 500);
+            }
+
+            sb.append("---\n")
+                    .append("jobId: ").append(job.getId()).append("\n")
+                    .append("Title: ").append(nullToNA(job.getTitle())).append("\n")
+                    .append("Type: ").append(nullToNA(job.getType())).append("\n")
+                    .append("Location: ").append(nullToNA(job.getLocation())).append("\n")
+                    .append("Required skills: ").append(nullToNA(job.getSkills())).append("\n")
+                    .append("Requirements: ").append(nullToNA(job.getRequirements())).append("\n")
+                    .append("Description: ").append(nullToNA(description)).append("\n");
+        }
+
+        return sb.toString();
+    }
+
+    private String nullToNA(String value) {
+        return (value == null || value.isBlank()) ? "N/A" : value;
     }
 
     private int parseConfidence(JsonNode confidenceNode) {
@@ -472,23 +624,27 @@ Document text:
         return count;
     }
 
-    private String getScoreLevel(int score) {
+    private String getScoreLevel(int score, String language) {
         if (score <= 20) {
-            return "Very weak CV";
+            return pickByLanguage(language, "Very weak CV", "سيرة ذاتية ضعيفة جدًا", "קורות חיים חלשים מאוד");
         } else if (score <= 40) {
-            return "Beginner level";
+            return pickByLanguage(language, "Beginner level", "مستوى مبتدئ", "רמת מתחיל");
         } else if (score <= 60) {
-            return "Junior potential";
+            return pickByLanguage(language, "Junior potential", "إمكانات لمرشح مبتدئ", "פוטנציאל ג'וניור");
         } else if (score <= 75) {
-            return "Good junior candidate";
+            return pickByLanguage(language, "Good junior candidate", "مرشح مبتدئ جيد", "מועמד ג'וניור טוב");
         } else if (score <= 90) {
-            return "Strong candidate";
+            return pickByLanguage(language, "Strong candidate", "مرشح قوي", "מועמד חזק");
         } else {
-            return "Excellent candidate";
+            return pickByLanguage(language, "Excellent candidate", "مرشح ممتاز", "מועמד מצוין");
         }
     }
 
-    private String buildEvaluationReason(JsonNode json, int score) {
+    private String buildEvaluationReason(JsonNode json, int score, String language) {
+        if (!"en".equals(language == null ? "en" : language)) {
+            return buildEvaluationReasonLocalized(json, language);
+        }
+
         String candidateField = json.path("candidateField").asText("other").toLowerCase().trim();
         String experience = json.path("professionalExperienceEvidence").asText("none").toLowerCase().trim();
         String portfolio = json.path("portfolioEvidence").asText("none").toLowerCase().trim();
@@ -562,6 +718,71 @@ Document text:
             reason.append("Try to add numbers or outcomes to your achievements where possible — even rough figures make a real difference.");
         } else {
             reason.append("Look for any results, wins, or numbers you can add to your CV — even small measurable outcomes help you stand out.");
+        }
+
+        return reason.toString().trim();
+    }
+
+    private String buildEvaluationReasonLocalized(JsonNode json, String language) {
+        String experience = json.path("professionalExperienceEvidence").asText("none").toLowerCase().trim();
+        String portfolio = json.path("portfolioEvidence").asText("none").toLowerCase().trim();
+        String education = json.path("educationEvidence").asText("none").toLowerCase().trim();
+        String achievements = json.path("achievementEvidence").asText("none").toLowerCase().trim();
+
+        StringBuilder reason = new StringBuilder();
+
+        if (education.equals("relevant_degree")) {
+            reason.append(pickByLanguage(language,
+                    "", "خلفيتك التعليمية ذات الصلة تمنحك أساسًا أكاديميًا قويًا في مجالك. ",
+                    "הרקע האקדמי הרלוונטי שלך מעניק לך בסיס אקדמי חזק בתחומך. "));
+        } else if (education.equals("general")) {
+            reason.append(pickByLanguage(language,
+                    "", "خلفيتك التعليمية تعكس التزامًا بالتعلم. ",
+                    "הרקע ההשכלתי שלך משקף מחויבות ללמידה. "));
+        }
+
+        switch (experience) {
+            case "senior_level" -> reason.append(pickByLanguage(language,
+                    "", "خبرتك المهنية العليا تمثل ميزة كبيرة تميزك عن العديد من المرشحين في مجالك. ",
+                    "הניסיון המקצועי הבכיר שלך הוא יתרון משמעותי שמייחד אותך ממועמדים רבים אחרים בתחומך. "));
+            case "mid_level" -> reason.append(pickByLanguage(language,
+                    "", "خبرتك المهنية الجيدة تُظهر قدرتك على المساهمة الفعالة في بيئة عمل حقيقية. ",
+                    "הניסיון המקצועי המוצק שלך מראה שאתה יכול לתרום ביעילות בסביבת עבודה אמיתית. "));
+            case "entry_level" -> reason.append(pickByLanguage(language,
+                    "", "خبرتك المبكرة تُظهر مبادرة ورغبة في التطور، وهو ما يقدّره أصحاب العمل في مجالك. ",
+                    "הניסיון המוקדם שלך מראה יוזמה ורצון להתפתח, דבר שמעסיקים בתחומך מעריכים. "));
+            default -> reason.append(pickByLanguage(language,
+                    "", "إضافة خبرة عملية، حتى لو كانت دورًا بدوام جزئي أو تدريبًا، ستعزز ملفك الشخصي بشكل ملموس. ",
+                    "הוספת ניסיון תעסוקתי, אפילו תפקיד חלקי או התמחות, תחזק משמעותית את הפרופיל שלך. "));
+        }
+
+        switch (portfolio) {
+            case "strong" -> reason.append(pickByLanguage(language,
+                    "", "أعمالك الموثقة جيدًا تُعد نقطة قوة حقيقية وتُظهر قدرتك على تحقيق نتائج ملموسة. ",
+                    "העבודה המתועדת היטב שלך היא נקודת חוזק אמיתית ומדגימה שאתה יכול לספק תוצאות מוחשיות. "));
+            case "relevant" -> reason.append(pickByLanguage(language,
+                    "", "أعمالك تُظهر مبادرة ومهارات ذات صلة — إضافة تفاصيل حول النتائج ستجعلها أكثر تأثيرًا. ",
+                    "העבודה שלך מראה יוזמה וכישורים רלוונטיים — הוספת פרטים על התוצאות תגביר את ההשפעה שלה. "));
+            case "basic" -> reason.append(pickByLanguage(language,
+                    "", "لقد بدأت بتوثيق أعمالك، وهي خطوة صحيحة — إضافة تفاصيل حول ما حققته ستزيد من تأثيرها. ",
+                    "התחלת לתעד את העבודה שלך, וזו אינסטינקט נכון — הוספת פרטים על מה שהשגת תגביר את ההשפעה. "));
+            default -> reason.append(pickByLanguage(language,
+                    "", "إضافة أمثلة ملموسة على عملك ستعزز سيرتك الذاتية بشكل كبير. ",
+                    "הוספת דוגמאות מוחשיות לעבודה שלך תחזק משמעותית את קורות החיים שלך. "));
+        }
+
+        if (achievements.equals("measurable")) {
+            reason.append(pickByLanguage(language,
+                    "", "تضمين إنجازات قابلة للقياس يميز سيرتك الذاتية ويجعل مساهماتك ملموسة وموثوقة.",
+                    "כלילת הישגים מדידים בולטת בקורות החיים שלך והופכת את התרומות שלך למוחשיות ואמינות."));
+        } else if (achievements.equals("general")) {
+            reason.append(pickByLanguage(language,
+                    "", "حاول إضافة أرقام أو نتائج إلى إنجازاتك حيثما أمكن — حتى الأرقام التقريبية تُحدث فرقًا حقيقيًا.",
+                    "נסה להוסיף מספרים או תוצאות להישגים שלך במידת האפשר — אפילו נתונים משוערים עושים הבדל אמיתי."));
+        } else {
+            reason.append(pickByLanguage(language,
+                    "", "ابحث عن أي نتائج أو إنجازات أو أرقام يمكنك إضافتها إلى سيرتك الذاتية — حتى النتائج الصغيرة القابلة للقياس تساعدك على التميز.",
+                    "חפש כל תוצאה, הצלחה או מספר שתוכל להוסיף לקורות החיים שלך — אפילו תוצאות מדידות קטנות עוזרות לך לבלוט."));
         }
 
         return reason.toString().trim();

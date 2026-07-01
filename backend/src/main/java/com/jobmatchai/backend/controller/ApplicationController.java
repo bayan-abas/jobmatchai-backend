@@ -2,6 +2,7 @@ package com.jobmatchai.backend.controller;
 
 import com.jobmatchai.backend.model.Application;
 import com.jobmatchai.backend.repository.ApplicationRepository;
+import com.jobmatchai.backend.service.NotificationService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
@@ -17,6 +18,9 @@ public class ApplicationController {
 
     @Autowired
     private ApplicationRepository applicationRepository;
+
+    @Autowired
+    private NotificationService notificationService;
 
     @GetMapping("/test")
     public String test() {
@@ -59,11 +63,55 @@ public class ApplicationController {
 
             Application savedApplication = applicationRepository.save(application);
 
+            if (savedApplication.getCandidateEmail() != null && !savedApplication.getCandidateEmail().isBlank()) {
+                notificationService.createNotification(
+                        savedApplication.getCandidateEmail(),
+                        "Application Submitted",
+                        "Your application for job ID " + savedApplication.getJobId() + " has been submitted.",
+                        "APPLICATION_SUBMITTED"
+                );
+            }
+
             response.put("success", true);
             response.put("message", "Application submitted successfully");
             response.put("application", savedApplication);
 
             return response;
+
+        } catch (Exception e) {
+            response.put("success", false);
+            response.put("message", e.getMessage());
+            return response;
+        }
+    }
+
+    @DeleteMapping("/{id}")
+    public Map<String, Object> deleteApplication(@PathVariable long id) {
+        Map<String, Object> response = new HashMap<>();
+
+        try {
+            return applicationRepository.findById(id)
+                    .map(application -> {
+                        applicationRepository.deleteById(id);
+
+                        if (application.getCandidateEmail() != null && !application.getCandidateEmail().isBlank()) {
+                            notificationService.createNotification(
+                                    application.getCandidateEmail(),
+                                    "Application Removed",
+                                    "Your application for job ID " + application.getJobId() + " has been deleted.",
+                                    "APPLICATION_REMOVED"
+                            );
+                        }
+
+                        response.put("success", true);
+                        response.put("message", "Application deleted successfully");
+                        return response;
+                    })
+                    .orElseGet(() -> {
+                        response.put("success", false);
+                        response.put("message", "Application not found");
+                        return response;
+                    });
 
         } catch (Exception e) {
             response.put("success", false);
