@@ -404,7 +404,11 @@ CANDIDATE PROFILE:
 JOB POSTINGS TO SCORE (score each one independently, based only on its own requirements/skills/description):
 """ + buildJobsBlock(cappedJobs) + """
 
-For EACH job listed above, evaluate fit based on: skills overlap, relevant experience/seniority match, field/domain match, and overall qualification for that specific job's requirements. Do not give every job a similar score — scores must vary meaningfully based on actual fit. A job requiring skills the candidate doesn't have should score low; a job matching the candidate's strongest skills and experience should score high.
+For EACH job listed above, FIRST decide "fieldRelated": set it to false ONLY if the candidate's profession/field and this job's profession/field are fundamentally unrelated — completely different professions where no meaningful skill/experience comparison is possible (e.g. a chef candidate vs. a lawyer job, a nurse candidate vs. a software engineer job, an accountant candidate vs. an electrician job). Set it to true for anything else, including jobs that are a weak or partial match within a related or comparable field.
+
+If "fieldRelated" is false for a job: set its matchPercent to null, matchedSkills and missingSkills to empty arrays, and matchReason to ONE short sentence explaining the field mismatch (e.g. "This job belongs to a completely different professional field."). Skip the scoring/classification steps below for that job.
+
+If "fieldRelated" is true, evaluate fit based on: skills overlap, relevant experience/seniority match, field/domain match, and overall qualification for that specific job's requirements. Do not give every job a similar score — scores must vary meaningfully based on actual fit. A job requiring skills the candidate doesn't have should score low; a job matching the candidate's strongest skills and experience should score high.
 
 Also classify EACH skill listed in that job's "Required skills" line into either matchedSkills or missingSkills:
 - Treat a job skill as MATCHED if the candidate's skills/summary/strengths show they clearly have that skill OR a reasonable equivalent — even if worded, abbreviated, or formatted differently (e.g. "JS" = "JavaScript", "React.js" = "React", "Postgres" = "PostgreSQL", "Node" = "Node.js", translated/synonymous terms, common abbreviations, or a broader skill that clearly implies it).
@@ -415,14 +419,15 @@ Also classify EACH skill listed in that job's "Required skills" line into either
 Return exactly this JSON structure:
 {
   "matches": [
-    { "jobId": 0, "matchPercent": 0, "matchReason": "", "matchedSkills": [], "missingSkills": [] }
+    { "jobId": 0, "fieldRelated": true, "matchPercent": 0, "matchReason": "", "matchedSkills": [], "missingSkills": [] }
   ]
 }
 
 Rules:
-- matchPercent: integer 0-100.
-- matchReason: ONE concise sentence (max ~20 words) explaining the score, written directly to the candidate ("you").
-- matchedSkills / missingSkills: arrays of strings, exact wording from the job's skill list, no duplicates between the two arrays.
+- fieldRelated: boolean, per the rule above.
+- matchPercent: integer 0-100 when fieldRelated is true; null when fieldRelated is false.
+- matchReason: ONE concise sentence (max ~20 words) explaining the score (or the field mismatch), written directly to the candidate ("you").
+- matchedSkills / missingSkills: arrays of strings, exact wording from the job's skill list, no duplicates between the two arrays. Empty arrays when fieldRelated is false.
 - Include exactly one entry per job listed above, using the exact jobId given.
 """;
 
@@ -444,6 +449,167 @@ Rules:
 
         } catch (Exception e) {
             return "{\"matches\":[]}";
+        }
+    }
+
+    public String computeJobMatchDetail(CVAnalysis analysis, Job job, String language) {
+        try {
+            String languageInstruction = switch (language == null ? "en" : language) {
+                case "ar" -> "Write every text field (matchReason, whyGoodMatch, whyNotPerfectMatch, improvementSuggestions, recommendation) entirely in Arabic. Keep skill names in matchedSkills/missingSkills as-is (do not translate skill/technology names).";
+                case "he" -> "Write every text field (matchReason, whyGoodMatch, whyNotPerfectMatch, improvementSuggestions, recommendation) entirely in Hebrew. Keep skill names in matchedSkills/missingSkills as-is (do not translate skill/technology names).";
+                default -> "Write every text field in English.";
+            };
+
+            String prompt = """
+Return ONLY a raw valid JSON object. No markdown. No explanations outside the JSON.
+""" + languageInstruction + """
+
+You are an expert career coach giving one candidate a deep, personalized evaluation of ONE specific job posting.
+
+CANDIDATE PROFILE:
+""" + buildCandidateProfileBlock(analysis) + """
+
+JOB POSTING:
+""" + buildSingleJobBlock(job) + """
+
+FIRST decide "fieldRelated": set it to false ONLY if the candidate's profession/field and this job's profession/field are fundamentally unrelated — completely different professions where no meaningful skill/experience comparison is possible (e.g. a chef candidate vs. a lawyer job, a nurse candidate vs. a software engineer job, an accountant candidate vs. an electrician job). Set it to true for anything else, including a weak or partial match within a related or comparable field.
+
+If "fieldRelated" is false: set matchPercent and skillsMatchPercent/experienceMatchPercent/educationMatchPercent/languageMatchPercent all to null, matchedSkills/missingSkills/whyGoodMatch/improvementSuggestions to empty arrays, matchReason to ONE short sentence explaining the field mismatch (e.g. "This job belongs to a completely different professional field."), whyNotPerfectMatch to one or two bullet points briefly noting the field mismatch (not skill gaps), recommendation to a short note that a meaningful evaluation isn't possible for this job, and shouldApply to false. Skip everything below for that job.
+
+If "fieldRelated" is true, evaluate this candidate against this job thoroughly and honestly, the same way a senior recruiter would coach the candidate one-on-one.
+
+Classify EACH skill listed in the job's "Required skills" line into either matchedSkills or missingSkills:
+- Treat a job skill as MATCHED if the candidate's skills/summary/strengths show they clearly have that skill OR a reasonable equivalent — even if worded, abbreviated, or formatted differently (e.g. "JS" = "JavaScript", "React.js" = "React", "Postgres" = "PostgreSQL", "Node" = "Node.js", translated/synonymous terms, common abbreviations, or a broader skill that clearly implies it).
+- Treat a job skill as MISSING only if the candidate shows no reasonable evidence of that skill or an equivalent.
+- Every skill from the job's "Required skills" line must appear in exactly one of matchedSkills or missingSkills, using the EXACT wording from that line.
+- If the job has no listed skills, both arrays should be empty.
+
+Return exactly this JSON structure:
+{
+  "fieldRelated": true,
+  "matchPercent": 0,
+  "skillsMatchPercent": 0,
+  "experienceMatchPercent": 0,
+  "educationMatchPercent": 0,
+  "languageMatchPercent": 0,
+  "matchReason": "",
+  "matchedSkills": [],
+  "missingSkills": [],
+  "whyGoodMatch": ["", ""],
+  "whyNotPerfectMatch": ["", ""],
+  "improvementSuggestions": ["", ""],
+  "recommendation": "",
+  "shouldApply": true
+}
+
+Rules:
+- fieldRelated: boolean, per the rule above.
+- matchPercent: integer 0-100, your holistic overall score, consistent with the matchedSkills/missingSkills classification and broadly in line with the four breakdown scores below (does not need to be their exact average).
+- skillsMatchPercent: integer 0-100, how well the candidate's skills specifically cover this job's required skills.
+- experienceMatchPercent: integer 0-100, how well the candidate's years/seniority/type of experience matches what this job needs.
+- educationMatchPercent: integer 0-100, how well the candidate's education/certifications match what this job needs (if the job has no explicit education requirement, judge general adequacy for the role).
+- languageMatchPercent: integer 0-100, how well the candidate's language/communication skills match what this job needs (if no language requirement is evident, score based on general communication evidence in the profile, defaulting to a reasonable score rather than 0).
+- matchReason: ONE concise sentence (max ~20 words) explaining the score, written directly to the candidate ("you").
+- matchedSkills / missingSkills: arrays of strings, exact wording from the job's skill list, no duplicates between the two arrays.
+- whyGoodMatch: 2-4 short bullet points, each written directly to the candidate ("you"), citing concrete evidence from the candidate profile.
+- whyNotPerfectMatch: 2-4 short bullet points explaining honestly what keeps this from being a perfect match. If matchPercent is very high, it is fine for this to focus on minor gaps.
+- improvementSuggestions: 2-4 concrete, actionable bullet points on what the candidate could do to become a stronger fit for this exact job.
+- recommendation: 2-3 sentences giving a clear, personal apply-or-not recommendation with reasoning, written directly to the candidate ("you").
+- shouldApply: true if you would recommend applying despite any gaps, false only if the mismatch is severe.
+""";
+
+            Map<String, Object> body = Map.of(
+                    "model", model,
+                    "input", prompt,
+                    "store", false,
+                    "text", Map.of("format", Map.of("type", "json_object"))
+            );
+
+            Map<String, Object> response = callOpenAI(body);
+            String result = extractTextFromOpenAIResponse(response);
+
+            if (result == null || result.isBlank()) {
+                return "{}";
+            }
+
+            return result;
+
+        } catch (Exception e) {
+            return "{}";
+        }
+    }
+
+    private String buildSingleJobBlock(Job job) {
+        String description = job.getDescription();
+        if (description != null && description.length() > 1500) {
+            description = description.substring(0, 1500);
+        }
+
+        return """
+Title: %s
+Type: %s
+Location: %s
+Required skills: %s
+Requirements: %s
+Description: %s
+""".formatted(
+                nullToNA(job.getTitle()),
+                nullToNA(job.getType()),
+                nullToNA(job.getLocation()),
+                nullToNA(job.getSkills()),
+                nullToNA(job.getRequirements()),
+                nullToNA(description)
+        );
+    }
+
+    public String explainSkill(String skillName, String jobTitle, String language) {
+        try {
+            String languageInstruction = switch (language == null ? "en" : language) {
+                case "ar" -> "Write every text field entirely in Arabic.";
+                case "he" -> "Write every text field entirely in Hebrew.";
+                default -> "Write every text field in English.";
+            };
+
+            String contextLine = (jobTitle == null || jobTitle.isBlank())
+                    ? ""
+                    : "For context, a job seeker encountered this skill while looking at a \"" + jobTitle + "\" job posting, but keep your explanation broadly useful beyond this one job.\n";
+
+            String prompt = """
+Return ONLY a raw valid JSON object. No markdown. No explanations outside the JSON.
+""" + languageInstruction + """
+
+You are a career coach explaining a professional skill to a job seeker who is missing it from their profile.
+
+Skill: """ + skillName + "\n" + contextLine + """
+
+Return exactly this JSON structure:
+{
+  "whyImportant": "",
+  "whereUsed": ["", ""],
+  "recommendedResources": ["", ""],
+  "learningTips": ["", ""]
+}
+
+Rules:
+- whyImportant: 1-2 sentences explaining why this skill matters to employers, written directly to the reader ("you").
+- whereUsed: 2-4 short bullet points describing where/how this skill is typically used in real work.
+- recommendedResources: 3-5 short bullet points, each "Name — one line description", listing FREE or freemium learning resources only (official documentation, freeCodeCamp, MDN, Coursera/YouTube free courses, etc.). Do not invent resources or URLs that do not exist; prefer well-known official sources.
+- learningTips: 2-4 short, actionable bullet points on how to start learning this skill effectively.
+""";
+
+            Map<String, Object> body = Map.of(
+                    "model", model,
+                    "input", prompt,
+                    "store", false,
+                    "text", Map.of("format", Map.of("type", "json_object"))
+            );
+
+            Map<String, Object> response = callOpenAI(body);
+            String result = extractTextFromOpenAIResponse(response);
+
+            return (result == null || result.isBlank()) ? "{}" : result;
+        } catch (Exception e) {
+            return "{}";
         }
     }
 

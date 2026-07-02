@@ -18,6 +18,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 @Service
 public class JobMatchService {
@@ -35,9 +36,28 @@ public class JobMatchService {
 
     // Bump this whenever the AI prompt/response schema for computeJobMatches changes,
     // so previously cached rows (missing the new fields) are treated as stale and recomputed.
-    private static final String MATCH_SCHEMA_VERSION = "v2-skills";
+    private static final String MATCH_SCHEMA_VERSION = "v3-fieldrelated-breakdown";
 
     public record MatchScoresResult(boolean hasAnalysis, List<Map<String, Object>> matches) {}
+
+    public record MatchDetailResult(
+            boolean hasAnalysis,
+            Long jobId,
+            Integer matchPercent,
+            String matchReason,
+            List<String> matchedSkills,
+            List<String> missingSkills,
+            List<String> whyGoodMatch,
+            List<String> whyNotPerfectMatch,
+            List<String> improvementSuggestions,
+            String recommendation,
+            Boolean shouldApply,
+            Boolean fieldRelated,
+            Integer skillsMatchPercent,
+            Integer experienceMatchPercent,
+            Integer educationMatchPercent,
+            Integer languageMatchPercent
+    ) {}
 
     public MatchScoresResult getMatchScores(String email, List<Job> jobs, String language) {
         CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(email).orElse(null);
@@ -81,7 +101,8 @@ public class JobMatchService {
 
             for (JsonNode match : matchesJson) {
                 long jobId = match.path("jobId").asLong();
-                int matchPercent = match.path("matchPercent").asInt();
+                boolean fieldRelated = match.path("fieldRelated").asBoolean(true);
+                Integer matchPercent = fieldRelated ? match.path("matchPercent").asInt(0) : null;
                 String matchReason = match.path("matchReason").asText("");
                 String matchedSkills = joinSkillsArray(match.path("matchedSkills"));
                 String missingSkills = joinSkillsArray(match.path("missingSkills"));
@@ -89,6 +110,7 @@ public class JobMatchService {
                 JobMatchScore score = cachedByJobId.getOrDefault(jobId, new JobMatchScore());
                 score.setCandidateEmail(email);
                 score.setJobId(jobId);
+                score.setFieldRelated(fieldRelated);
                 score.setMatchPercent(matchPercent);
                 score.setMatchReason(matchReason);
                 score.setMatchedSkills(matchedSkills);
@@ -110,6 +132,7 @@ public class JobMatchService {
 
             Map<String, Object> match = new LinkedHashMap<>();
             match.put("jobId", score.getJobId());
+            match.put("fieldRelated", score.getFieldRelated() == null ? true : score.getFieldRelated());
             match.put("matchPercent", score.getMatchPercent());
             match.put("matchReason", score.getMatchReason());
             match.put("matchedSkills", splitSkillsString(score.getMatchedSkills()));
@@ -118,6 +141,86 @@ public class JobMatchService {
         }
 
         return new MatchScoresResult(true, matches);
+    }
+
+    public MatchDetailResult getMatchDetail(String email, Job job, String language) {
+        CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(email).orElse(null);
+
+        if (analysis == null) {
+            return new MatchDetailResult(false, job.getId(), null, null, List.of(), List.of(), List.of(), List.of(), List.of(), null, null, null, null, null, null, null);
+        }
+
+        String cvFingerprint = fingerprintCv(analysis);
+        String jobFingerprint = fingerprintJob(job);
+
+        JobMatchScore cached = jobMatchScoreRepository.findByCandidateEmailAndJobId(email, job.getId()).orElse(null);
+
+        boolean isStale = cached == null
+                || !cvFingerprint.equals(cached.getCvFingerprint())
+                || !jobFingerprint.equals(cached.getJobFingerprint())
+                || cached.getRecommendation() == null;
+
+        JobMatchScore resolved;
+
+        if (isStale) {
+            String result = openAICVAnalysisService.computeJobMatchDetail(analysis, job, language);
+            JsonNode json = readDetailObject(result);
+
+            boolean fieldRelated = json.path("fieldRelated").asBoolean(true);
+
+            JobMatchScore score = cached != null ? cached : new JobMatchScore();
+            score.setCandidateEmail(email);
+            score.setJobId(job.getId());
+            score.setFieldRelated(fieldRelated);
+            score.setMatchPercent(fieldRelated ? json.path("matchPercent").asInt(0) : null);
+            score.setSkillsMatchPercent(fieldRelated ? json.path("skillsMatchPercent").asInt(0) : null);
+            score.setExperienceMatchPercent(fieldRelated ? json.path("experienceMatchPercent").asInt(0) : null);
+            score.setEducationMatchPercent(fieldRelated ? json.path("educationMatchPercent").asInt(0) : null);
+            score.setLanguageMatchPercent(fieldRelated ? json.path("languageMatchPercent").asInt(0) : null);
+            score.setMatchReason(json.path("matchReason").asText(""));
+            score.setMatchedSkills(joinSkillsArray(json.path("matchedSkills")));
+            score.setMissingSkills(joinSkillsArray(json.path("missingSkills")));
+            score.setWhyGoodMatch(joinSkillsArray(json.path("whyGoodMatch")));
+            score.setWhyNotPerfectMatch(joinSkillsArray(json.path("whyNotPerfectMatch")));
+            score.setImprovementSuggestions(joinSkillsArray(json.path("improvementSuggestions")));
+            score.setRecommendation(json.path("recommendation").asText(""));
+            score.setShouldApply(json.path("shouldApply").asBoolean(true));
+            score.setCvFingerprint(cvFingerprint);
+            score.setJobFingerprint(jobFingerprint);
+
+            resolved = jobMatchScoreRepository.save(score);
+        } else {
+            // isStale is false only when cached is non-null (see isStale's definition above).
+            resolved = Objects.requireNonNull(cached, "cached JobMatchScore must be present when not stale");
+        }
+
+        return new MatchDetailResult(
+                true,
+                
+                .getJobId(),
+                resolved.getMatchPercent(),
+                resolved.getMatchReason(),
+                splitSkillsString(resolved.getMatchedSkills()),
+                splitSkillsString(resolved.getMissingSkills()),
+                splitSkillsString(resolved.getWhyGoodMatch()),
+                splitSkillsString(resolved.getWhyNotPerfectMatch()),
+                splitSkillsString(resolved.getImprovementSuggestions()),
+                resolved.getRecommendation(),
+                resolved.getShouldApply(),
+                resolved.getFieldRelated() == null ? true : resolved.getFieldRelated(),
+                resolved.getSkillsMatchPercent(),
+                resolved.getExperienceMatchPercent(),
+                resolved.getEducationMatchPercent(),
+                resolved.getLanguageMatchPercent()
+        );
+    }
+
+    private JsonNode readDetailObject(String result) {
+        try {
+            return objectMapper.readTree(result);
+        } catch (Exception e) {
+            return objectMapper.createObjectNode();
+        }
     }
 
     private String joinSkillsArray(JsonNode skillsNode) {

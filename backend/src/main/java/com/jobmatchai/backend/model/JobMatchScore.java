@@ -36,6 +36,36 @@ public class JobMatchScore {
     @Column(name = "job_fingerprint")
     private String jobFingerprint;
 
+    @Column(name = "why_good_match", columnDefinition = "TEXT")
+    private String whyGoodMatch;
+
+    @Column(name = "why_not_perfect_match", columnDefinition = "TEXT")
+    private String whyNotPerfectMatch;
+
+    @Column(name = "improvement_suggestions", columnDefinition = "TEXT")
+    private String improvementSuggestions;
+
+    @Column(name = "recommendation", columnDefinition = "TEXT")
+    private String recommendation;
+
+    @Column(name = "should_apply")
+    private Boolean shouldApply;
+
+    @Column(name = "field_related")
+    private Boolean fieldRelated;
+
+    @Column(name = "skills_match_percent")
+    private Integer skillsMatchPercent;
+
+    @Column(name = "experience_match_percent")
+    private Integer experienceMatchPercent;
+
+    @Column(name = "education_match_percent")
+    private Integer educationMatchPercent;
+
+    @Column(name = "language_match_percent")
+    private Integer languageMatchPercent;
+
     public JobMatchScore() {}
 
     public Long getId() {
@@ -104,5 +134,85 @@ public class JobMatchScore {
 
     public void setJobFingerprint(String jobFingerprint) {
         this.jobFingerprint = jobFingerprint;
+    }
+
+    public String getWhyGoodMatch() {
+        return whyGoodMatch;
+    }
+
+    public void setWhyGoodMatch(String whyGoodMatch) {
+        this.whyGoodMatch = whyGoodMatch;
+    }
+
+    public String getWhyNotPerfectMatch() {
+        return whyNotPerfectMatch;
+    }
+
+    public void setWhyNotPerfectMatch(String whyNotPerfectMatch) {
+        this.whyNotPerfectMatch = whyNotPerfectMatch;
+    }
+
+    public String getImprovementSuggestions() {
+        return improvementSuggestions;
+    }
+
+    public void setImprovementSuggestions(String improvementSuggestions) {
+        this.improvementSuggestions = improvementSuggestions;
+    }
+
+    public String getRecommendation() {
+        return recommendation;
+    }
+
+    public void setRecommendation(String recommendation) {
+        this.recommendation = recommendation;
+    }
+
+    public Boolean getShouldApply() {
+        return shouldApply;
+    }
+
+    public void setShouldApply(Boolean shouldApply) {
+        this.shouldApply = shouldApply;
+    }
+
+    public Boolean getFieldRelated() {
+        return fieldRelated;
+    }
+
+    public void setFieldRelated(Boolean fieldRelated) {
+        this.fieldRelated = fieldRelated;
+    }
+
+    public Integer getSkillsMatchPercent() {
+        return skillsMatchPercent;
+    }
+
+    public void setSkillsMatchPercent(Integer skillsMatchPercent) {
+        this.skillsMatchPercent = skillsMatchPercent;
+    }
+
+    public Integer getExperienceMatchPercent() {
+        return experienceMatchPercent;
+    }
+
+    public void setExperienceMatchPercent(Integer experienceMatchPercent) {
+        this.experienceMatchPercent = experienceMatchPercent;
+    }
+
+    public Integer getEducationMatchPercent() {
+        return educationMatchPercent;
+    }
+
+    public void setEducationMatchPercent(Integer educationMatchPercent) {
+        this.educationMatchPercent = educationMatchPercent;
+    }
+
+    public Integer getLanguageMatchPercent() {
+        return languageMatchPercent;
+    }
+
+    public void setLanguageMatchPercent(Integer languageMatchPercent) {
+        this.languageMatchPercent = languageMatchPercent;
     }
 }

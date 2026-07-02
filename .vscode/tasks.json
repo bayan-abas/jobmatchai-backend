@@ -50,7 +50,8 @@
                 "cwd": "${workspaceFolder}"
             },
             "problemMatcher": []
-        }
+        },
+
         {
             "label": "Clean Backend",
             "type": "shell",

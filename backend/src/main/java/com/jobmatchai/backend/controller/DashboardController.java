@@ -2,6 +2,7 @@ package com.jobmatchai.backend.controller;
 
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
+import com.jobmatchai.backend.repository.ExternalJobRepository;
 import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.NotificationRepository;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -20,6 +21,9 @@ public class DashboardController {
     private JobRepository jobRepository;
 
     @Autowired
+    private ExternalJobRepository externalJobRepository;
+
+    @Autowired
     private ApplicationRepository applicationRepository;
 
     @Autowired
@@ -32,7 +36,12 @@ public class DashboardController {
     public ResponseEntity<Map<String, Object>> getDashboardStats(@RequestParam(value = "email", required = false) String email) {
         Map<String, Object> stats = new HashMap<>();
 
-        stats.put("totalJobs", jobRepository.count());
+        long totalInternalJobs = jobRepository.count();
+        long totalExternalJobs = externalJobRepository.count();
+
+        stats.put("totalInternalJobs", totalInternalJobs);
+        stats.put("totalExternalJobs", totalExternalJobs);
+        stats.put("totalJobs", totalInternalJobs + totalExternalJobs);
         stats.put("totalApplications", applicationRepository.count());
         stats.put("totalCVAnalyses", cvAnalysisRepository.count());
 

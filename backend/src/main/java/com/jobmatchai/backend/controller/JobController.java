@@ -29,6 +29,8 @@ public class JobController {
 
     public record MatchScoreRequest(String email, List<Long> jobIds, String language) {}
 
+    public record MatchDetailRequest(String email, Long jobId, String language) {}
+
     @GetMapping("/test")
     public String test() {
         return "Jobs API is working";
@@ -194,6 +196,51 @@ public class JobController {
         } catch (Exception e) {
             e.printStackTrace();
             return ResponseEntity.internalServerError().body("Failed to compute match scores: " + e.getMessage());
+        }
+    }
+
+    @PostMapping("/match-detail")
+    public ResponseEntity<?> getMatchDetail(@RequestBody MatchDetailRequest request) {
+        try {
+            if (request.email() == null || request.email().isBlank()) {
+                return ResponseEntity.badRequest().body("Email is required");
+            }
+
+            if (request.jobId() == null) {
+                return ResponseEntity.badRequest().body("jobId is required");
+            }
+
+            Job job = jobRepository.findById(request.jobId()).orElse(null);
+            if (job == null) {
+                return ResponseEntity.status(404).body("Job not found");
+            }
+
+            JobMatchService.MatchDetailResult result =
+                    jobMatchService.getMatchDetail(request.email(), job, request.language());
+
+            Map<String, Object> response = new HashMap<>();
+            response.put("hasAnalysis", result.hasAnalysis());
+            response.put("jobId", result.jobId());
+            response.put("matchPercent", result.matchPercent());
+            response.put("matchReason", result.matchReason());
+            response.put("matchedSkills", result.matchedSkills());
+            response.put("missingSkills", result.missingSkills());
+            response.put("whyGoodMatch", result.whyGoodMatch());
+            response.put("whyNotPerfectMatch", result.whyNotPerfectMatch());
+            response.put("improvementSuggestions", result.improvementSuggestions());
+            response.put("recommendation", result.recommendation());
+            response.put("shouldApply", result.shouldApply());
+            response.put("fieldRelated", result.fieldRelated());
+            response.put("skillsMatchPercent", result.skillsMatchPercent());
+            response.put("experienceMatchPercent", result.experienceMatchPercent());
+            response.put("educationMatchPercent", result.educationMatchPercent());
+            response.put("languageMatchPercent", result.languageMatchPercent());
+
+            return ResponseEntity.ok(response);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return ResponseEntity.internalServerError().body("Failed to compute match detail: " + e.getMessage());
         }
     }
 }

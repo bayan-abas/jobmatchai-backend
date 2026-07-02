@@ -2,9 +2,11 @@ package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
 
+import java.time.LocalDateTime;
+
 @Entity
-@Table(name = "jobs")
-public class Job {
+@Table(name = "external_jobs")
+public class ExternalJob {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -12,9 +14,11 @@ public class Job {
 
     private String title;
     private String companyName;
-    private String companyEmail;
 
     private String location;
+    private String country;
+    private String city;
+
     private String type;
     private String salary;
 
@@ -24,29 +28,18 @@ public class Job {
     private String requirements;
     private String skills;
 
-    public Job() {}
+    private String sourceName;
+    private String sourceUrl;
+    private String applyUrl;
 
-    public Job(String title, String companyName, String companyEmail,
-               String location, String type, String salary,
-               String description, String requirements, String skills) {
+    private String externalJobId;
 
-        this.title = title;
-        this.companyName = companyName;
-        this.companyEmail = companyEmail;
-        this.location = location;
-        this.type = type;
-        this.salary = salary;
-        this.description = description;
-        this.requirements = requirements;
-        this.skills = skills;
-    }
+    private LocalDateTime importedAt;
+
+    public ExternalJob() {}
 
     public Long getId() {
         return id;
-    }
-
-    public void setId(Long id) {
-        this.id = id;
     }
 
     public String getTitle() {
@@ -65,20 +58,28 @@ public class Job {
         this.companyName = companyName;
     }
 
-    public String getCompanyEmail() {
-        return companyEmail;
-    }
-
-    public void setCompanyEmail(String companyEmail) {
-        this.companyEmail = companyEmail;
-    }
-
     public String getLocation() {
         return location;
     }
 
     public void setLocation(String location) {
         this.location = location;
+    }
+
+    public String getCountry() {
+        return country;
+    }
+
+    public void setCountry(String country) {
+        this.country = country;
+    }
+
+    public String getCity() {
+        return city;
+    }
+
+    public void setCity(String city) {
+        this.city = city;
     }
 
     public String getType() {
@@ -119,5 +120,45 @@ public class Job {
 
     public void setSkills(String skills) {
         this.skills = skills;
+    }
+
+    public String getSourceName() {
+        return sourceName;
+    }
+
+    public void setSourceName(String sourceName) {
+        this.sourceName = sourceName;
+    }
+
+    public String getSourceUrl() {
+        return sourceUrl;
+    }
+
+    public void setSourceUrl(String sourceUrl) {
+        this.sourceUrl = sourceUrl;
+    }
+
+    public String getApplyUrl() {
+        return applyUrl;
+    }
+
+    public void setApplyUrl(String applyUrl) {
+        this.applyUrl = applyUrl;
+    }
+
+    public String getExternalJobId() {
+        return externalJobId;
+    }
+
+    public void setExternalJobId(String externalJobId) {
+        this.externalJobId = externalJobId;
+    }
+
+    public LocalDateTime getImportedAt() {
+        return importedAt;
+    }
+
+    public void setImportedAt(LocalDateTime importedAt) {
+        this.importedAt = importedAt;
     }
 }
