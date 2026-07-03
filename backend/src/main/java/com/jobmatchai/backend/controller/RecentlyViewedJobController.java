@@ -3,6 +3,7 @@ package com.jobmatchai.backend.controller;
 import com.jobmatchai.backend.model.RecentlyViewedJob;
 import com.jobmatchai.backend.service.RecentlyViewedJobService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -11,14 +12,13 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/recently-viewed")
-@CrossOrigin(origins = "http://localhost:5173")
 public class RecentlyViewedJobController {
 
     @Autowired
     private RecentlyViewedJobService recentlyViewedJobService;
 
     public record TrackRequest(
-            String candidateEmail, Long jobId, String jobType,
+            Long jobId, String jobType,
             String jobTitle, String companyName, String location
     ) {}
 
@@ -28,17 +28,17 @@ public class RecentlyViewedJobController {
     }
 
     @PostMapping("/track")
-    public Map<String, Object> track(@RequestBody TrackRequest request) {
+    public Map<String, Object> track(@RequestBody TrackRequest request, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
 
         try {
-            if (request.candidateEmail() == null || request.jobId() == null || request.jobType() == null) {
+            if (request.jobId() == null || request.jobType() == null) {
                 response.put("success", false);
                 return response;
             }
 
             recentlyViewedJobService.recordView(
-                    request.candidateEmail(), request.jobId(), request.jobType(),
+                    authentication.getName(), request.jobId(), request.jobType(),
                     request.jobTitle(), request.companyName(), request.location());
 
             response.put("success", true);
@@ -50,7 +50,7 @@ public class RecentlyViewedJobController {
     }
 
     @GetMapping("/candidate/{email}")
-    public List<RecentlyViewedJob> getRecentlyViewed(@PathVariable String email) {
-        return recentlyViewedJobService.getRecentlyViewed(email);
+    public List<RecentlyViewedJob> getRecentlyViewed(Authentication authentication) {
+        return recentlyViewedJobService.getRecentlyViewed(authentication.getName());
     }
 }

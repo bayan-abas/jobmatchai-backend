@@ -5,6 +5,7 @@ import com.jobmatchai.backend.service.AIChatService;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -12,7 +13,6 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/chat")
-@CrossOrigin(origins = "http://localhost:5173")
 public class ChatController {
 
     @Autowired
@@ -25,15 +25,15 @@ public class ChatController {
 
     public record ChatMessage(String role, String content) {}
 
-    public record ChatRequest(String email, String message, List<ChatMessage> history, String language) {}
+    public record ChatRequest(String message, List<ChatMessage> history, String language) {}
 
     @PostMapping
-    public ResponseEntity<?> chat(@RequestBody ChatRequest request) {
+    public ResponseEntity<?> chat(@RequestBody ChatRequest request, Authentication authentication) {
         String message = request.message() == null ? "" : request.message().trim();
         String language = request.language() == null || request.language().isBlank()
                 ? "en"
                 : request.language().trim();
-        String email = request.email() == null ? "" : request.email().trim();
+        String email = authentication.getName();
 
         if (message.isBlank()) {
             return ResponseEntity.badRequest().body("Message is required.");

@@ -6,6 +6,7 @@ import com.jobmatchai.backend.service.JobMatchService;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -14,7 +15,6 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/external-jobs")
-@CrossOrigin(origins = "http://localhost:5173")
 public class ExternalJobController {
 
     @Autowired
@@ -77,16 +77,12 @@ public class ExternalJobController {
     }
 
     @PostMapping("/match-scores")
-    public ResponseEntity<?> getMatchScores(@RequestBody ExternalMatchScoreRequest request) {
+    public ResponseEntity<?> getMatchScores(@RequestBody ExternalMatchScoreRequest request, Authentication authentication) {
         try {
-            if (request.email() == null || request.email().isBlank()) {
-                return ResponseEntity.badRequest().body("Email is required");
-            }
-
             List<Long> externalJobIds = request.externalJobIds() == null ? List.of() : request.externalJobIds();
 
             JobMatchService.MatchScoresResult result = externalJobService.getMatchScoresForExternalJobs(
-                    request.email(), externalJobIds, request.language());
+                    authentication.getName(), externalJobIds, request.language());
 
             Map<String, Object> response = new HashMap<>();
             response.put("hasAnalysis", result.hasAnalysis());
@@ -101,18 +97,14 @@ public class ExternalJobController {
     }
 
     @PostMapping("/match-detail")
-    public ResponseEntity<?> getMatchDetail(@RequestBody ExternalMatchDetailRequest request) {
+    public ResponseEntity<?> getMatchDetail(@RequestBody ExternalMatchDetailRequest request, Authentication authentication) {
         try {
-            if (request.email() == null || request.email().isBlank()) {
-                return ResponseEntity.badRequest().body("Email is required");
-            }
-
             if (request.externalJobId() == null) {
                 return ResponseEntity.badRequest().body("externalJobId is required");
             }
 
             JobMatchService.MatchDetailResult result = externalJobService.getMatchDetailForExternalJob(
-                    request.email(), request.externalJobId(), request.language());
+                    authentication.getName(), request.externalJobId(), request.language());
 
             return ResponseEntity.ok(toMatchDetailResponse(result));
 

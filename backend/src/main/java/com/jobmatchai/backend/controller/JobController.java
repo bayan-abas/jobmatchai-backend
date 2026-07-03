@@ -1,12 +1,16 @@
 package com.jobmatchai.backend.controller;
 
 import com.jobmatchai.backend.model.Job;
+import com.jobmatchai.backend.model.SavedJob;
 import com.jobmatchai.backend.repository.JobRepository;
+import com.jobmatchai.backend.repository.SavedJobRepository;
 import com.jobmatchai.backend.service.JobMatchService;
 import com.jobmatchai.backend.service.NotificationService;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -15,11 +19,13 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/jobs")
-@CrossOrigin(origins = "http://localhost:5173")
 public class JobController {
 
     @Autowired
     private JobRepository jobRepository;
+
+    @Autowired
+    private SavedJobRepository savedJobRepository;
 
     @Autowired
     private JobMatchService jobMatchService;
@@ -42,13 +48,15 @@ public class JobController {
     }
 
     @GetMapping("/company/{companyEmail}")
-    public List<Job> getJobsByCompanyEmail(@PathVariable String companyEmail) {
-        return jobRepository.findByCompanyEmail(companyEmail);
+    public List<Job> getJobsByCompanyEmail(Authentication authentication) {
+        return jobRepository.findByCompanyEmail(authentication.getName());
     }
 
     @PostMapping("/add")
-    public Map<String, Object> addJob(@RequestBody Job job) {
+    @PreAuthorize("hasRole('COMPANY')")
+    public Map<String, Object> addJob(@RequestBody Job job, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
+        job.setCompanyEmail(authentication.getName());
 
         try {
             Job savedJob = jobRepository.save(job);
@@ -92,15 +100,23 @@ public class JobController {
     }
 
     @PutMapping("/{id}")
-    public Map<String, Object> updateJob(@PathVariable long id, @RequestBody Job updatedJob) {
+    @PreAuthorize("hasRole('COMPANY')")
+    public Map<String, Object> updateJob(@PathVariable long id, @RequestBody Job updatedJob, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
 
         try {
+            Job existingJob = jobRepository.findById(id).orElse(null);
+
+            if (existingJob == null || !authentication.getName().equals(existingJob.getCompanyEmail())) {
+                response.put("success", false);
+                response.put("message", "Job not found");
+                return response;
+            }
+
             return jobRepository.findById(id)
                     .map(job -> {
                         job.setTitle(updatedJob.getTitle());
                         job.setCompanyName(updatedJob.getCompanyName());
-                        job.setCompanyEmail(updatedJob.getCompanyEmail());
                         job.setLocation(updatedJob.getLocation());
                         job.setType(updatedJob.getType());
                         job.setSalary(updatedJob.getSalary());
@@ -116,6 +132,15 @@ public class JobController {
                                     "Job Updated",
                                     "Your job posting '" + savedJob.getTitle() + "' has been updated.",
                                     "JOB_UPDATED"
+                            );
+                        }
+
+                        for (SavedJob bookmark : savedJobRepository.findByJobIdAndJobType(savedJob.getId(), "internal")) {
+                            notificationService.createNotification(
+                                    bookmark.getCandidateEmail(),
+                                    "Saved Job Updated",
+                                    "A job you saved ('" + savedJob.getTitle() + "') has been updated.",
+                                    "SAVED_JOB_UPDATED"
                             );
                         }
 
@@ -139,10 +164,19 @@ public class JobController {
     }
 
     @DeleteMapping("/{id}")
-    public Map<String, Object> deleteJob(@PathVariable long id) {
+    @PreAuthorize("hasRole('COMPANY')")
+    public Map<String, Object> deleteJob(@PathVariable long id, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
 
         try {
+            Job existingJob = jobRepository.findById(id).orElse(null);
+
+            if (existingJob == null || !authentication.getName().equals(existingJob.getCompanyEmail())) {
+                response.put("success", false);
+                response.put("message", "Job not found");
+                return response;
+            }
+
             return jobRepository.findById(id)
                     .map(job -> {
                         jobRepository.deleteById(id);
@@ -175,17 +209,15 @@ public class JobController {
     }
 
     @PostMapping("/match-scores")
-    public ResponseEntity<?> getMatchScores(@RequestBody MatchScoreRequest request) {
+    public ResponseEntity<?> getMatchScores(@RequestBody MatchScoreRequest request, Authentication authentication) {
         try {
-            if (request.email() == null || request.email().isBlank()) {
-                return ResponseEntity.badRequest().body("Email is required");
-            }
-
             List<Long> jobIds = request.jobIds() == null ? List.of() : request.jobIds();
             List<Job> jobs = jobIds.isEmpty() ? List.of() : jobRepository.findAllById(jobIds);
 
             JobMatchService.MatchScoresResult result =
-                    jobMatchService.getMatchScores(request.email(), jobs, request.language());
+                    jobMatchService.getMatchScores(authentication.getName(), jobs, request.language());
+
+            notifyHighMatches(authentication.getName(), result.matches());
 
             Map<String, Object> response = new HashMap<>();
             response.put("hasAnalysis", result.hasAnalysis());
@@ -199,13 +231,32 @@ public class JobController {
         }
     }
 
-    @PostMapping("/match-detail")
-    public ResponseEntity<?> getMatchDetail(@RequestBody MatchDetailRequest request) {
-        try {
-            if (request.email() == null || request.email().isBlank()) {
-                return ResponseEntity.badRequest().body("Email is required");
+    private static final int HIGH_MATCH_THRESHOLD = 85;
+
+    private void notifyHighMatches(String candidateEmail, List<Map<String, Object>> matches) {
+        for (Map<String, Object> match : matches) {
+            Object jobIdObj = match.get("jobId");
+            Object matchPercentObj = match.get("matchPercent");
+
+            if (!(jobIdObj instanceof Long jobId) || !(matchPercentObj instanceof Integer matchPercent)) {
+                continue;
             }
 
+            if (matchPercent >= HIGH_MATCH_THRESHOLD) {
+                notificationService.createNotificationOnce(
+                        candidateEmail,
+                        "High Match Found",
+                        "You have a " + matchPercent + "% match with a job posting.",
+                        "JOB_MATCH_HIGH",
+                        jobId
+                );
+            }
+        }
+    }
+
+    @PostMapping("/match-detail")
+    public ResponseEntity<?> getMatchDetail(@RequestBody MatchDetailRequest request, Authentication authentication) {
+        try {
             if (request.jobId() == null) {
                 return ResponseEntity.badRequest().body("jobId is required");
             }
@@ -216,7 +267,7 @@ public class JobController {
             }
 
             JobMatchService.MatchDetailResult result =
-                    jobMatchService.getMatchDetail(request.email(), job, request.language());
+                    jobMatchService.getMatchDetail(authentication.getName(), job, request.language());
 
             Map<String, Object> response = new HashMap<>();
             response.put("hasAnalysis", result.hasAnalysis());

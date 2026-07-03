@@ -12,6 +12,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.UrlResource;
 import org.springframework.http.HttpHeaders;
@@ -28,7 +29,6 @@ import java.nio.file.Paths;
 
 @RestController
 @RequestMapping("/api/cv")
-@CrossOrigin(origins = "http://localhost:5173")
 public class CVController {
 
     @Autowired
@@ -46,7 +46,8 @@ public class CVController {
     @Autowired
     private NotificationService notificationService;
 
-    private final String uploadDir = "uploads/cvs/";
+    @Value("${app.upload.dir:uploads/cvs/}")
+    private String uploadDir;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @GetMapping("/test")
@@ -65,18 +66,11 @@ public class CVController {
     @PostMapping("/upload")
     public ResponseEntity<?> uploadCV(
             @RequestParam("file") MultipartFile file,
-            @RequestParam(value = "email", required = false) String email,
             @RequestParam(value = "language", defaultValue = "en") String language,
-            @RequestHeader(value = "X-User-Email", required = false) String userEmailHeader,
             Authentication authentication) {
 
         try {
-            String resolvedEmail = resolveUserEmail(email, userEmailHeader, authentication);
-
-            if (resolvedEmail.isBlank()) {
-                return ResponseEntity.badRequest().body(
-                        "Missing user email. Send the logged-in user's email as multipart form field 'email'.");
-            }
+            String resolvedEmail = authentication.getName();
 
             User user = userRepository.findByEmail(resolvedEmail);
 
@@ -159,28 +153,10 @@ public class CVController {
         }
     }
 
-    private String resolveUserEmail(String email, String userEmailHeader, Authentication authentication) {
-        if (email != null && !email.isBlank()) {
-            return email.trim();
-        }
-
-        if (userEmailHeader != null && !userEmailHeader.isBlank()) {
-            return userEmailHeader.trim();
-        }
-
-        if (authentication != null
-                && authentication.isAuthenticated()
-                && authentication.getName() != null
-                && !"anonymousUser".equals(authentication.getName())) {
-            return authentication.getName().trim();
-        }
-
-        return "";
-    }
-
     @DeleteMapping("/delete")
-    public ResponseEntity<?> deleteCV(@RequestParam("email") String email) {
+    public ResponseEntity<?> deleteCV(Authentication authentication) {
         try {
+            String email = authentication.getName();
             User user = userRepository.findByEmail(email);
 
             if (user == null) {
@@ -231,8 +207,8 @@ public class CVController {
     }
 
     @GetMapping("/current")
-    public ResponseEntity<?> getCurrentCV(@RequestParam("email") String email) {
-
+    public ResponseEntity<?> getCurrentCV(Authentication authentication) {
+        String email = authentication.getName();
         User user = userRepository.findByEmail(email);
 
         if (user == null) {
@@ -296,7 +272,8 @@ public class CVController {
     }
 
     @GetMapping({"/extract", "/extract-text"})
-    public ResponseEntity<?> extractCVText(@RequestParam("email") String email) {
+    public ResponseEntity<?> extractCVText(Authentication authentication) {
+        String email = authentication.getName();
 
         try {
             User user = userRepository.findByEmail(email);
@@ -340,8 +317,10 @@ public class CVController {
 
     @PostMapping({"/analyze", "/analyze/"})
     public ResponseEntity<?> analyzeCV(
-            @RequestParam("email") String email,
-            @RequestParam(value = "language", defaultValue = "en") String language) {
+            @RequestParam(value = "language", defaultValue = "en") String language,
+            Authentication authentication) {
+
+        String email = authentication.getName();
 
         try {
             User user = userRepository.findByEmail(email);
@@ -410,13 +389,9 @@ public class CVController {
         }
     }
 
-    @PostMapping("/analyze-test")
-    public ResponseEntity<?> analyzeTest(@RequestParam("email") String email) {
-        return ResponseEntity.ok("Analyze endpoint works for: " + email);
-    }
-
     @GetMapping("/analysis")
-    public ResponseEntity<?> getCVAnalysis(@RequestParam("email") String email) {
+    public ResponseEntity<?> getCVAnalysis(Authentication authentication) {
+        String email = authentication.getName();
         return cvAnalysisRepository.findByUserEmail(email)
                 .<ResponseEntity<?>>map(ResponseEntity::ok)
                 .orElseGet(() -> ResponseEntity.notFound().build());

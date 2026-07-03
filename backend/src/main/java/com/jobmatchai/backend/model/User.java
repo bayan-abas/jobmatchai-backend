@@ -1,6 +1,7 @@
 package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
+import java.time.LocalDateTime;
 
 @Entity
 @Table(name = "users")
@@ -20,6 +21,10 @@ public class User {
     private String role;
 
     private String cvFileName;
+
+    private Boolean premium;
+
+    private LocalDateTime premiumSince;
 
     public User() {}
 
@@ -72,5 +77,21 @@ public class User {
 
     public void setCvFileName(String cvFileName) {
         this.cvFileName = cvFileName;
+    }
+
+    public boolean isPremium() {
+        return Boolean.TRUE.equals(premium);
+    }
+
+    public void setPremium(boolean premium) {
+        this.premium = premium;
+    }
+
+    public LocalDateTime getPremiumSince() {
+        return premiumSince;
+    }
+
+    public void setPremiumSince(LocalDateTime premiumSince) {
+        this.premiumSince = premiumSince;
     }
 }

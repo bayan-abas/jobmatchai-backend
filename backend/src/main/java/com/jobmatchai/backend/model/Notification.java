@@ -27,6 +27,9 @@ public class Notification {
     @Column(name = "is_read")
     private boolean read;
 
+    @Column(name = "reference_id")
+    private Long referenceId;
+
     public Notification() {
     }
 
@@ -37,6 +40,14 @@ public class Notification {
         this.type = type;
         this.createdAt = createdAt;
         this.read = read;
+    }
+
+    public Long getReferenceId() {
+        return referenceId;
+    }
+
+    public void setReferenceId(Long referenceId) {
+        this.referenceId = referenceId;
     }
 
     public Long getId() {

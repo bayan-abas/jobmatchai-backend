@@ -4,6 +4,7 @@ import com.jobmatchai.backend.model.Notification;
 import com.jobmatchai.backend.service.NotificationService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -12,7 +13,6 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/notifications")
-@CrossOrigin(origins = "http://localhost:5173")
 public class NotificationController {
 
     @Autowired
@@ -23,23 +23,23 @@ public class NotificationController {
         return "Notifications API is working";
     }
 
-    @GetMapping("/{email}")
-    public ResponseEntity<List<Notification>> getNotifications(@PathVariable String email) {
-        List<Notification> notifications = notificationService.getNotifications(email);
+    @GetMapping
+    public ResponseEntity<List<Notification>> getNotifications(Authentication authentication) {
+        List<Notification> notifications = notificationService.getNotifications(authentication.getName());
         return ResponseEntity.ok(notifications);
     }
 
-    @GetMapping("/{email}/unread-count")
-    public ResponseEntity<Map<String, Object>> getUnreadCount(@PathVariable String email) {
-        long count = notificationService.getUnreadCount(email);
+    @GetMapping("/unread-count")
+    public ResponseEntity<Map<String, Object>> getUnreadCount(Authentication authentication) {
+        long count = notificationService.getUnreadCount(authentication.getName());
         Map<String, Object> response = new HashMap<>();
         response.put("unreadCount", count);
         return ResponseEntity.ok(response);
     }
 
     @PostMapping("/{id}/read")
-    public ResponseEntity<Map<String, Object>> markAsRead(@PathVariable Long id) {
-        Notification updated = notificationService.markAsRead(id);
+    public ResponseEntity<Map<String, Object>> markAsRead(@PathVariable Long id, Authentication authentication) {
+        Notification updated = notificationService.markAsRead(id, authentication.getName());
         Map<String, Object> response = new HashMap<>();
 
         if (updated == null) {
@@ -51,6 +51,22 @@ public class NotificationController {
         response.put("success", true);
         response.put("message", "Notification marked as read");
         response.put("notification", updated);
+        return ResponseEntity.ok(response);
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Map<String, Object>> deleteNotification(@PathVariable Long id, Authentication authentication) {
+        Map<String, Object> response = new HashMap<>();
+        boolean deleted = notificationService.deleteNotification(id, authentication.getName());
+
+        if (!deleted) {
+            response.put("success", false);
+            response.put("message", "Notification not found");
+            return ResponseEntity.badRequest().body(response);
+        }
+
+        response.put("success", true);
+        response.put("message", "Notification deleted");
         return ResponseEntity.ok(response);
     }
 }

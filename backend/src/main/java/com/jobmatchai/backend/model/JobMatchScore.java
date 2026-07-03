@@ -1,3 +1,4 @@
+
 package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;

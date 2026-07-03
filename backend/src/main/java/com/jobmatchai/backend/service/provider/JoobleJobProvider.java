@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
@@ -19,6 +21,8 @@ import java.util.List;
  */
 @Component
 public class JoobleJobProvider implements ExternalJobProvider {
+
+    private static final Logger log = LoggerFactory.getLogger(JoobleJobProvider.class);
 
     @Value("${externaljobs.jooble.api-key:}")
     private String apiKey;
@@ -50,6 +54,8 @@ public class JoobleJobProvider implements ExternalJobProvider {
             JsonNode response = responseBody == null ? null : objectMapper.readTree(responseBody);
 
             if (response == null || !response.has("jobs")) {
+                log.warn("Jooble response had no 'jobs' field: {}",
+                        responseBody == null ? "null" : responseBody.substring(0, Math.min(200, responseBody.length())));
                 return List.of();
             }
 
@@ -65,6 +71,7 @@ public class JoobleJobProvider implements ExternalJobProvider {
 
             return jobs;
         } catch (Exception e) {
+            log.warn("Jooble fetch failed: {}", e.getMessage());
             return List.of();
         }
     }

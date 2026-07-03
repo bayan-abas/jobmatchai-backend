@@ -7,6 +7,7 @@ import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.NotificationRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -14,7 +15,6 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/dashboard")
-@CrossOrigin(origins = "http://localhost:5173")
 public class DashboardController {
 
     @Autowired
@@ -33,7 +33,7 @@ public class DashboardController {
     private NotificationRepository notificationRepository;
 
     @GetMapping("/stats")
-    public ResponseEntity<Map<String, Object>> getDashboardStats(@RequestParam(value = "email", required = false) String email) {
+    public ResponseEntity<Map<String, Object>> getDashboardStats(Authentication authentication) {
         Map<String, Object> stats = new HashMap<>();
 
         long totalInternalJobs = jobRepository.count();
@@ -45,10 +45,9 @@ public class DashboardController {
         stats.put("totalApplications", applicationRepository.count());
         stats.put("totalCVAnalyses", cvAnalysisRepository.count());
 
-        if (email != null && !email.isBlank()) {
-            stats.put("userApplications", applicationRepository.countByCandidateEmail(email));
-            stats.put("unreadNotifications", notificationRepository.countByRecipientEmailAndReadFalse(email));
-        }
+        String email = authentication.getName();
+        stats.put("userApplications", applicationRepository.countByCandidateEmail(email));
+        stats.put("unreadNotifications", notificationRepository.countByRecipientEmailAndReadFalse(email));
 
         return ResponseEntity.ok(stats);
     }

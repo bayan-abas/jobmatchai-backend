@@ -26,6 +26,23 @@ public class NotificationService {
         return notificationRepository.save(notification);
     }
 
+    public void createNotificationOnce(String recipientEmail, String title, String message, String type, Long referenceId) {
+        if (notificationRepository.existsByRecipientEmailAndTypeAndReferenceId(recipientEmail, type, referenceId)) {
+            return;
+        }
+
+        Notification notification = new Notification(
+                recipientEmail,
+                title,
+                message,
+                type,
+                LocalDateTime.now(),
+                false
+        );
+        notification.setReferenceId(referenceId);
+        notificationRepository.save(notification);
+    }
+
     public List<Notification> getNotifications(String recipientEmail) {
         return notificationRepository.findByRecipientEmailOrderByCreatedAtDesc(recipientEmail);
     }
@@ -34,12 +51,23 @@ public class NotificationService {
         return notificationRepository.countByRecipientEmailAndReadFalse(recipientEmail);
     }
 
-    public Notification markAsRead(Long notificationId) {
+    public Notification markAsRead(Long notificationId, String requesterEmail) {
         return notificationRepository.findById(notificationId)
+                .filter(notification -> notification.getRecipientEmail().equals(requesterEmail))
                 .map(notification -> {
                     notification.setRead(true);
                     return notificationRepository.save(notification);
                 })
                 .orElse(null);
+    }
+
+    public boolean deleteNotification(Long notificationId, String requesterEmail) {
+        return notificationRepository.findById(notificationId)
+                .filter(notification -> notification.getRecipientEmail().equals(requesterEmail))
+                .map(notification -> {
+                    notificationRepository.delete(notification);
+                    return true;
+                })
+                .orElse(false);
     }
 }

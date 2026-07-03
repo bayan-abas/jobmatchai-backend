@@ -2,7 +2,9 @@ package com.jobmatchai.backend.controller;
 
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.UserRepository;
+import com.jobmatchai.backend.security.JwtService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.core.Authentication;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.web.bind.annotation.*;
 
@@ -12,13 +14,21 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/users")
-@CrossOrigin(origins = "http://localhost:5173")
 public class UserController {
 
     @Autowired
     private UserRepository userRepository;
 
+    @Autowired
+    private JwtService jwtService;
+
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
+
+    private static void stripPassword(User user) {
+        if (user != null) {
+            user.setPassword(null);
+        }
+    }
 
     @GetMapping("/test")
     public String test() {
@@ -27,7 +37,9 @@ public class UserController {
 
     @GetMapping("/all")
     public List<User> getAllUsers() {
-        return userRepository.findAll();
+        List<User> users = userRepository.findAll();
+        users.forEach(UserController::stripPassword);
+        return users;
     }
 
     @PostMapping("/register")
@@ -47,6 +59,7 @@ public class UserController {
             user.setPassword(encryptedPassword);
 
             User savedUser = userRepository.save(user);
+            stripPassword(savedUser);
 
             response.put("success", true);
             response.put("message", "User registered successfully");
@@ -86,8 +99,12 @@ public class UserController {
                 return response;
             }
 
+            String token = jwtService.generateToken(user.getEmail(), user.getRole());
+            stripPassword(user);
+
             response.put("success", true);
             response.put("message", "Login successful");
+            response.put("token", token);
             response.put("user", user);
             return response;
 
@@ -99,100 +116,98 @@ public class UserController {
             return response;
         }
     }
+
     @GetMapping("/{id}")
-public Map<String, Object> getUserById(@PathVariable long id) {
-    Map<String, Object> response = new HashMap<>();
-
-    return userRepository.findById(id)
-            .map(user -> {
-                response.put("success", true);
-                response.put("user", user);
-                return response;
-            })
-            .orElseGet(() -> {
-                response.put("success", false);
-                response.put("message", "User not found");
-                return response;
-            });
-}
-
-@PutMapping("/{id}")
-public Map<String, Object> updateUser(
-        @PathVariable long id,
-        @RequestBody User updatedUser
-) {
-    Map<String, Object> response = new HashMap<>();
-
-    try {
+    public Map<String, Object> getUserById(@PathVariable long id) {
+        Map<String, Object> response = new HashMap<>();
 
         return userRepository.findById(id)
                 .map(user -> {
-
-                    user.setName(updatedUser.getName());
-                    user.setEmail(updatedUser.getEmail());
-                    user.setRole(updatedUser.getRole());
-
-                    if (updatedUser.getPassword() != null &&
-                            !updatedUser.getPassword().isEmpty()) {
-
-                        String encryptedPassword =
-                                passwordEncoder.encode(updatedUser.getPassword());
-
-                        user.setPassword(encryptedPassword);
-                    }
-
-                    User savedUser = userRepository.save(user);
-
+                    stripPassword(user);
                     response.put("success", true);
-                    response.put("message", "User updated successfully");
-                    response.put("user", savedUser);
-
+                    response.put("user", user);
                     return response;
                 })
-
                 .orElseGet(() -> {
                     response.put("success", false);
                     response.put("message", "User not found");
                     return response;
                 });
-
-    } catch (Exception e) {
-
-        response.put("success", false);
-        response.put("message", e.getMessage());
-
-        return response;
     }
-}
 
-@DeleteMapping("/{id}")
-public Map<String, Object> deleteUser(@PathVariable long id) {
+    @PutMapping("/{id}")
+    public Map<String, Object> updateUser(
+            @PathVariable long id,
+            @RequestBody User updatedUser,
+            Authentication authentication
+    ) {
+        Map<String, Object> response = new HashMap<>();
 
-    Map<String, Object> response = new HashMap<>();
+        try {
+            User existingUser = userRepository.findById(id).orElse(null);
 
-    try {
+            if (existingUser == null) {
+                response.put("success", false);
+                response.put("message", "User not found");
+                return response;
+            }
 
-        if (!userRepository.existsById(id)) {
+            if (!existingUser.getEmail().equals(authentication.getName())) {
+                response.put("success", false);
+                response.put("message", "You can only update your own account");
+                return response;
+            }
 
+            existingUser.setName(updatedUser.getName());
+
+            if (updatedUser.getPassword() != null && !updatedUser.getPassword().isEmpty()) {
+                existingUser.setPassword(passwordEncoder.encode(updatedUser.getPassword()));
+            }
+
+            User savedUser = userRepository.save(existingUser);
+            stripPassword(savedUser);
+
+            response.put("success", true);
+            response.put("message", "User updated successfully");
+            response.put("user", savedUser);
+            return response;
+
+        } catch (Exception e) {
             response.put("success", false);
-            response.put("message", "User not found");
-
+            response.put("message", e.getMessage());
             return response;
         }
-
-        userRepository.deleteById(id);
-
-        response.put("success", true);
-        response.put("message", "User deleted successfully");
-
-        return response;
-
-    } catch (Exception e) {
-
-        response.put("success", false);
-        response.put("message", e.getMessage());
-
-        return response;
     }
-}
+
+    @DeleteMapping("/{id}")
+    public Map<String, Object> deleteUser(@PathVariable long id, Authentication authentication) {
+        Map<String, Object> response = new HashMap<>();
+
+        try {
+            User existingUser = userRepository.findById(id).orElse(null);
+
+            if (existingUser == null) {
+                response.put("success", false);
+                response.put("message", "User not found");
+                return response;
+            }
+
+            if (!existingUser.getEmail().equals(authentication.getName())) {
+                response.put("success", false);
+                response.put("message", "You can only delete your own account");
+                return response;
+            }
+
+            userRepository.deleteById(id);
+
+            response.put("success", true);
+            response.put("message", "User deleted successfully");
+            return response;
+
+        } catch (Exception e) {
+            response.put("success", false);
+            response.put("message", e.getMessage());
+            return response;
+        }
+    }
 }

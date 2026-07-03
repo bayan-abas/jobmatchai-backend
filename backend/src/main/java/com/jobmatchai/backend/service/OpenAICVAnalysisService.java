@@ -180,6 +180,7 @@ CV Text:
                     "model", model,
                     "input", prompt,
                     "store", false,
+                    "temperature", 0,
                     "text", Map.of("format", Map.of("type", "json_object"))
             );
 
@@ -331,6 +332,7 @@ Document text:
                     "model", model,
                     "input", prompt,
                     "store", false,
+                    "temperature", 0,
                     "text", Map.of("format", Map.of("type", "json_object"))
             );
 
@@ -435,6 +437,7 @@ Rules:
                     "model", model,
                     "input", prompt,
                     "store", false,
+                    "temperature", 0,
                     "text", Map.of("format", Map.of("type", "json_object"))
             );
 
@@ -522,6 +525,7 @@ Rules:
                     "model", model,
                     "input", prompt,
                     "store", false,
+                    "temperature", 0,
                     "text", Map.of("format", Map.of("type", "json_object"))
             );
 
@@ -601,6 +605,7 @@ Rules:
                     "model", model,
                     "input", prompt,
                     "store", false,
+                    "temperature", 0,
                     "text", Map.of("format", Map.of("type", "json_object"))
             );
 

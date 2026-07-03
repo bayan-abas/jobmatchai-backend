@@ -3,6 +3,8 @@ package com.jobmatchai.backend.controller;
 import com.jobmatchai.backend.model.SavedJob;
 import com.jobmatchai.backend.repository.SavedJobRepository;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.Authentication;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
@@ -13,7 +15,6 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/saved-jobs")
-@CrossOrigin(origins = "http://localhost:5173")
 public class SavedJobController {
 
     @Autowired
@@ -25,18 +26,20 @@ public class SavedJobController {
     }
 
     @GetMapping("/candidate/{email}")
-    public List<SavedJob> getSavedJobsByCandidate(@PathVariable String email) {
-        return savedJobRepository.findByCandidateEmailOrderBySavedAtDesc(email);
+    public List<SavedJob> getSavedJobsByCandidate(Authentication authentication) {
+        return savedJobRepository.findByCandidateEmailOrderBySavedAtDesc(authentication.getName());
     }
 
     @PostMapping("/save")
-    public Map<String, Object> saveJob(@RequestBody SavedJob savedJob) {
+    @PreAuthorize("hasRole('CANDIDATE')")
+    public Map<String, Object> saveJob(@RequestBody SavedJob savedJob, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
+        savedJob.setCandidateEmail(authentication.getName());
 
         try {
-            if (savedJob.getCandidateEmail() == null || savedJob.getJobId() == null || savedJob.getJobType() == null) {
+            if (savedJob.getJobId() == null || savedJob.getJobType() == null) {
                 response.put("success", false);
-                response.put("message", "candidateEmail, jobId and jobType are required");
+                response.put("message", "jobId and jobType are required");
                 return response;
             }
 
@@ -67,11 +70,11 @@ public class SavedJobController {
 
     @Transactional
     @DeleteMapping("/candidate/{email}/{jobType}/{jobId}")
-    public Map<String, Object> unsaveJob(@PathVariable String email, @PathVariable String jobType, @PathVariable Long jobId) {
+    public Map<String, Object> unsaveJob(@PathVariable String jobType, @PathVariable Long jobId, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
 
         try {
-            savedJobRepository.deleteByCandidateEmailAndJobIdAndJobType(email, jobId, jobType);
+            savedJobRepository.deleteByCandidateEmailAndJobIdAndJobType(authentication.getName(), jobId, jobType);
             response.put("success", true);
             response.put("message", "Job removed from favorites");
             return response;

@@ -4,6 +4,8 @@ import com.jobmatchai.backend.model.Application;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.service.NotificationService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDate;
@@ -13,7 +15,6 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/applications")
-@CrossOrigin(origins = "http://localhost:5173")
 public class ApplicationController {
 
     @Autowired
@@ -33,18 +34,20 @@ public class ApplicationController {
     }
 
     @GetMapping("/candidate/{email}")
-    public List<Application> getApplicationsByCandidate(@PathVariable String email) {
-        return applicationRepository.findByCandidateEmail(email);
+    public List<Application> getApplicationsByCandidate(Authentication authentication) {
+        return applicationRepository.findByCandidateEmail(authentication.getName());
     }
 
     @PostMapping("/apply")
-    public Map<String, Object> applyToJob(@RequestBody Application application) {
+    @PreAuthorize("hasRole('CANDIDATE')")
+    public Map<String, Object> applyToJob(@RequestBody Application application, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
+        application.setCandidateEmail(authentication.getName());
 
         try {
-            if (application.getCandidateEmail() == null || application.getJobId() == null) {
+            if (application.getJobId() == null) {
                 response.put("success", false);
-                response.put("message", "candidateEmail and jobId are required");
+                response.put("message", "jobId is required");
                 return response;
             }
 
@@ -77,6 +80,52 @@ public class ApplicationController {
             response.put("application", savedApplication);
 
             return response;
+
+        } catch (Exception e) {
+            response.put("success", false);
+            response.put("message", e.getMessage());
+            return response;
+        }
+    }
+
+    public record StatusUpdateRequest(String status) {}
+
+    @PutMapping("/{id}/status")
+    @PreAuthorize("hasRole('COMPANY')")
+    public Map<String, Object> updateStatus(@PathVariable long id, @RequestBody StatusUpdateRequest request) {
+        Map<String, Object> response = new HashMap<>();
+
+        try {
+            return applicationRepository.findById(id)
+                    .map(application -> {
+                        application.setStatus(request.status());
+                        Application saved = applicationRepository.save(application);
+
+                        if (saved.getCandidateEmail() != null && !saved.getCandidateEmail().isBlank()) {
+                            boolean accepted = "Accepted".equalsIgnoreCase(request.status());
+                            boolean rejected = "Rejected".equalsIgnoreCase(request.status());
+
+                            if (accepted || rejected) {
+                                notificationService.createNotification(
+                                        saved.getCandidateEmail(),
+                                        accepted ? "Application Accepted" : "Application Rejected",
+                                        "Your application for job ID " + saved.getJobId()
+                                                + (accepted ? " has been accepted." : " has been rejected."),
+                                        accepted ? "APPLICATION_ACCEPTED" : "APPLICATION_REJECTED"
+                                );
+                            }
+                        }
+
+                        response.put("success", true);
+                        response.put("message", "Application status updated");
+                        response.put("application", saved);
+                        return response;
+                    })
+                    .orElseGet(() -> {
+                        response.put("success", false);
+                        response.put("message", "Application not found");
+                        return response;
+                    });
 
         } catch (Exception e) {
             response.put("success", false);
