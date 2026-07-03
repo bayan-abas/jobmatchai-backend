@@ -17,6 +17,7 @@ import org.springframework.core.io.UrlResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -64,11 +65,20 @@ public class CVController {
     @PostMapping("/upload")
     public ResponseEntity<?> uploadCV(
             @RequestParam("file") MultipartFile file,
-            @RequestParam("email") String email,
-            @RequestParam(value = "language", defaultValue = "en") String language) {
+            @RequestParam(value = "email", required = false) String email,
+            @RequestParam(value = "language", defaultValue = "en") String language,
+            @RequestHeader(value = "X-User-Email", required = false) String userEmailHeader,
+            Authentication authentication) {
 
         try {
-            User user = userRepository.findByEmail(email);
+            String resolvedEmail = resolveUserEmail(email, userEmailHeader, authentication);
+
+            if (resolvedEmail.isBlank()) {
+                return ResponseEntity.badRequest().body(
+                        "Missing user email. Send the logged-in user's email as multipart form field 'email'.");
+            }
+
+            User user = userRepository.findByEmail(resolvedEmail);
 
             if (user == null) {
                 return ResponseEntity.badRequest().body("User not found");
@@ -147,6 +157,25 @@ public class CVController {
             return ResponseEntity.internalServerError()
                     .body("Failed to upload CV: " + e.getMessage());
         }
+    }
+
+    private String resolveUserEmail(String email, String userEmailHeader, Authentication authentication) {
+        if (email != null && !email.isBlank()) {
+            return email.trim();
+        }
+
+        if (userEmailHeader != null && !userEmailHeader.isBlank()) {
+            return userEmailHeader.trim();
+        }
+
+        if (authentication != null
+                && authentication.isAuthenticated()
+                && authentication.getName() != null
+                && !"anonymousUser".equals(authentication.getName())) {
+            return authentication.getName().trim();
+        }
+
+        return "";
     }
 
     @DeleteMapping("/delete")

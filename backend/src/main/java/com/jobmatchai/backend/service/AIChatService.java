@@ -16,7 +16,7 @@ import java.util.Objects;
 @Service
 public class AIChatService {
 
-    @Value("${openai.api.key}")
+    @Value("${openai.api.key:}")
     private String apiKey;
 
     @Value("${openai.model}")
@@ -92,7 +92,7 @@ Exception: when suggesting courses, certifications, learning resources, or a car
 
             Map<String, Object> response = restClient.post()
                     .uri("/v1/responses")
-                    .header("Authorization", "Bearer " + apiKey)
+                    .header("Authorization", "Bearer " + requireConfiguredApiKey())
                     .header("Content-Type", "application/json")
                     .body(Objects.requireNonNull(body))
                     .retrieve()
@@ -122,5 +122,14 @@ Exception: when suggesting courses, certifications, learning resources, or a car
             }
         } catch (Exception ignored) {}
         return "";
+    }
+
+    private String requireConfiguredApiKey() {
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new IllegalStateException(
+                    "OPENAI_API_KEY is not configured. Set it in your terminal environment or in a local .env file.");
+        }
+
+        return apiKey.trim();
     }
 }

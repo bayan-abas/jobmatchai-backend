@@ -23,7 +23,7 @@ import java.util.Set;
 @Service
 public class OpenAICVAnalysisService {
 
-    @Value("${openai.api.key}")
+    @Value("${openai.api.key:}")
     private String apiKey;
 
     @Value("${openai.model}")
@@ -955,15 +955,26 @@ Overall CV score: %s
     }
 
     private Map<String, Object> callOpenAI(Map<String, Object> body) {
+        String configuredApiKey = requireConfiguredApiKey();
+
         Map<String, Object> response = restClient.post()
                 .uri("/v1/responses")
-                .header("Authorization", "Bearer " + apiKey)
+                .header("Authorization", "Bearer " + configuredApiKey)
                 .header("Content-Type", "application/json")
                 .body(Objects.requireNonNull(body))
                 .retrieve()
                 .body(new ParameterizedTypeReference<Map<String, Object>>() {});
 
         return response != null ? response : Map.of();
+    }
+
+    private String requireConfiguredApiKey() {
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new IllegalStateException(
+                    "OPENAI_API_KEY is not configured. Set it in your terminal environment or in a local .env file.");
+        }
+
+        return apiKey.trim();
     }
 
     private String extractTextFromOpenAIResponse(Map<String, Object> response) {

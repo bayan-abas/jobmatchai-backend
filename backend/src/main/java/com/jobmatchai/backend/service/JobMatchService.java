@@ -196,8 +196,7 @@ public class JobMatchService {
 
         return new MatchDetailResult(
                 true,
-                
-                .getJobId(),
+                resolved.getJobId(),
                 resolved.getMatchPercent(),
                 resolved.getMatchReason(),
                 splitSkillsString(resolved.getMatchedSkills()),
