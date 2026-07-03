@@ -14,5 +14,13 @@ public interface ApplicationRepository extends JpaRepository<Application, Long> 
 
     List<Application> findByJobIdIn(List<Long> jobIds);
 
+    List<Application> findByJobId(Long jobId);
+
+    List<Application> findByCompanyEmail(String companyEmail);
+
     long countByCandidateEmail(String candidateEmail);
+
+    long countByCompanyEmail(String companyEmail);
+
+    long countByJobId(Long jobId);
 }

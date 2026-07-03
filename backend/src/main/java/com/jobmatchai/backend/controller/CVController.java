@@ -26,6 +26,7 @@ import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/cv")
@@ -394,6 +395,6 @@ public class CVController {
         String email = authentication.getName();
         return cvAnalysisRepository.findByUserEmail(email)
                 .<ResponseEntity<?>>map(ResponseEntity::ok)
-                .orElseGet(() -> ResponseEntity.notFound().build());
+                .orElseGet(() -> ResponseEntity.ok(Map.of("hasAnalysis", false)));
     }
 }

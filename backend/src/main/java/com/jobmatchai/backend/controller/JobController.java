@@ -1,7 +1,11 @@
 package com.jobmatchai.backend.controller;
 
+import com.jobmatchai.backend.model.Application;
 import com.jobmatchai.backend.model.Job;
+import com.jobmatchai.backend.model.JobMatchScore;
 import com.jobmatchai.backend.model.SavedJob;
+import com.jobmatchai.backend.repository.ApplicationRepository;
+import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.SavedJobRepository;
 import com.jobmatchai.backend.service.JobMatchService;
@@ -28,6 +32,12 @@ public class JobController {
     private SavedJobRepository savedJobRepository;
 
     @Autowired
+    private ApplicationRepository applicationRepository;
+
+    @Autowired
+    private JobMatchScoreRepository jobMatchScoreRepository;
+
+    @Autowired
     private JobMatchService jobMatchService;
 
     @Autowired
@@ -36,6 +46,31 @@ public class JobController {
     public record MatchScoreRequest(String email, List<Long> jobIds, String language) {}
 
     public record MatchDetailRequest(String email, Long jobId, String language) {}
+
+    public record JobWithApplicantsView(
+            Long id,
+            String title,
+            String companyName,
+            String companyEmail,
+            String location,
+            String type,
+            String salary,
+            String description,
+            String requirements,
+            String skills,
+            long applicantsCount
+    ) {}
+
+    public record JobApplicantView(
+            Long id,
+            Long jobId,
+            String jobTitle,
+            String candidateName,
+            String candidateEmail,
+            String status,
+            String appliedDate,
+            Integer matchPercent
+    ) {}
 
     @GetMapping("/test")
     public String test() {
@@ -48,8 +83,61 @@ public class JobController {
     }
 
     @GetMapping("/company/{companyEmail}")
-    public List<Job> getJobsByCompanyEmail(Authentication authentication) {
-        return jobRepository.findByCompanyEmail(authentication.getName());
+    public List<JobWithApplicantsView> getJobsByCompanyEmail(Authentication authentication) {
+        List<Job> jobs = jobRepository.findByCompanyEmail(authentication.getName());
+
+        Map<Long, Long> applicantCounts = new HashMap<>();
+        for (Application application : applicationRepository.findByCompanyEmail(authentication.getName())) {
+            applicantCounts.merge(application.getJobId(), 1L, Long::sum);
+        }
+
+        return jobs.stream()
+                .map(job -> new JobWithApplicantsView(
+                        job.getId(),
+                        job.getTitle(),
+                        job.getCompanyName(),
+                        job.getCompanyEmail(),
+                        job.getLocation(),
+                        job.getType(),
+                        job.getSalary(),
+                        job.getDescription(),
+                        job.getRequirements(),
+                        job.getSkills(),
+                        applicantCounts.getOrDefault(job.getId(), 0L)
+                ))
+                .toList();
+    }
+
+    @GetMapping("/{jobId}/applications")
+    @PreAuthorize("hasRole('COMPANY')")
+    public ResponseEntity<?> getApplicationsForJob(@PathVariable Long jobId, Authentication authentication) {
+        Job job = jobRepository.findById(jobId).orElse(null);
+
+        if (job == null || !authentication.getName().equals(job.getCompanyEmail())) {
+            return ResponseEntity.status(404).body("Job not found");
+        }
+
+        List<JobApplicantView> applicants = applicationRepository.findByJobId(jobId).stream()
+                .map(application -> {
+                    Integer matchPercent = jobMatchScoreRepository
+                            .findByCandidateEmailAndJobId(application.getCandidateEmail(), application.getJobId())
+                            .map(JobMatchScore::getMatchPercent)
+                            .orElse(null);
+
+                    return new JobApplicantView(
+                            application.getId(),
+                            application.getJobId(),
+                            application.getJobTitle(),
+                            application.getCandidateName(),
+                            application.getCandidateEmail(),
+                            application.getStatus(),
+                            application.getAppliedDate(),
+                            matchPercent
+                    );
+                })
+                .toList();
+
+        return ResponseEntity.ok(applicants);
     }
 
     @PostMapping("/add")
