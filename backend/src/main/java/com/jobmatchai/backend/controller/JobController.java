@@ -1,11 +1,10 @@
 package com.jobmatchai.backend.controller;
 
-import com.jobmatchai.backend.model.Application;
+import com.jobmatchai.backend.model.CandidateAiSummary;
 import com.jobmatchai.backend.model.Job;
-import com.jobmatchai.backend.model.JobMatchScore;
 import com.jobmatchai.backend.model.SavedJob;
 import com.jobmatchai.backend.repository.ApplicationRepository;
-import com.jobmatchai.backend.repository.JobMatchScoreRepository;
+import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
 import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.SavedJobRepository;
 import com.jobmatchai.backend.service.JobMatchService;
@@ -35,7 +34,7 @@ public class JobController {
     private ApplicationRepository applicationRepository;
 
     @Autowired
-    private JobMatchScoreRepository jobMatchScoreRepository;
+    private CandidateAiSummaryRepository candidateAiSummaryRepository;
 
     @Autowired
     private JobMatchService jobMatchService;
@@ -69,7 +68,8 @@ public class JobController {
             String candidateEmail,
             String status,
             String appliedDate,
-            Integer matchPercent
+            Integer matchPercent,
+            String matchLabel
     ) {}
 
     @GetMapping("/test")
@@ -87,8 +87,8 @@ public class JobController {
         List<Job> jobs = jobRepository.findByCompanyEmail(authentication.getName());
 
         Map<Long, Long> applicantCounts = new HashMap<>();
-        for (Application application : applicationRepository.findByCompanyEmail(authentication.getName())) {
-            applicantCounts.merge(application.getJobId(), 1L, Long::sum);
+        for (Job job : jobs) {
+            applicantCounts.put(job.getId(), applicationRepository.countByJobId(job.getId()));
         }
 
         return jobs.stream()
@@ -117,11 +117,13 @@ public class JobController {
             return ResponseEntity.status(404).body("Job not found");
         }
 
+        // CandidateAiSummary (the "AI Summary" feature) is the single source of truth for
+        // the score/label shown here - it must never be mixed with the separate candidate-
+        // facing "Job Matches" score, which comes from a different OpenAI prompt entirely.
         List<JobApplicantView> applicants = applicationRepository.findByJobId(jobId).stream()
                 .map(application -> {
-                    Integer matchPercent = jobMatchScoreRepository
-                            .findByCandidateEmailAndJobId(application.getCandidateEmail(), application.getJobId())
-                            .map(JobMatchScore::getMatchPercent)
+                    CandidateAiSummary summary = candidateAiSummaryRepository
+                            .findFirstByCandidateEmailAndJobIdOrderByIdDesc(application.getCandidateEmail(), application.getJobId())
                             .orElse(null);
 
                     return new JobApplicantView(
@@ -132,7 +134,8 @@ public class JobController {
                             application.getCandidateEmail(),
                             application.getStatus(),
                             application.getAppliedDate(),
-                            matchPercent
+                            summary != null ? summary.getMatchScore() : null,
+                            summary != null ? summary.getMatchLabel() : null
                     );
                 })
                 .toList();

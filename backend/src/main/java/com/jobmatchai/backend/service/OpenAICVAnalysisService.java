@@ -543,6 +543,75 @@ Rules:
         }
     }
 
+    public String computeCandidateSummary(CVAnalysis analysis, Job job, String language) {
+        try {
+            String languageInstruction = switch (language == null ? "en" : language) {
+                case "ar" -> "Write every text field (professionalBackground, strengths, weaknesses, overallSuitability) entirely in Arabic. Keep skill names in \"keySkills\" as-is (do not translate skill/technology names).";
+                case "he" -> "Write every text field (professionalBackground, strengths, weaknesses, overallSuitability) entirely in Hebrew. Keep skill names in \"keySkills\" as-is (do not translate skill/technology names).";
+                default -> "Write every text field in English.";
+            };
+
+            String prompt = """
+Return ONLY a raw valid JSON object. No markdown. No explanations outside the JSON.
+""" + languageInstruction + """
+
+You are a senior recruiter writing a candidate briefing for a hiring manager who is reviewing this candidate for ONE specific job opening. Refer to the candidate in the third person (e.g. "the candidate", "they") — never address the candidate directly with "you".
+
+CANDIDATE PROFILE:
+""" + buildCandidateProfileBlock(analysis) + """
+
+JOB POSTING THE CANDIDATE APPLIED TO:
+""" + buildSingleJobBlock(job) + """
+
+Return exactly this JSON structure:
+{
+  "professionalBackground": "",
+  "keySkills": ["", ""],
+  "yearsOfExperience": "",
+  "strengths": "",
+  "weaknesses": "",
+  "overallSuitability": "",
+  "matchScore": 0
+}
+
+Field instructions:
+- professionalBackground: 2-4 sentences summarizing the candidate's profession, field, and career stage, based only on the candidate profile above.
+- keySkills: an array of 5-10 of the candidate's most relevant technical/professional skills, most relevant to this job first, using the exact wording from the candidate's skills where possible.
+- yearsOfExperience: a short estimate such as "0-1 years", "2-4 years", "5-7 years", "8+ years", or "Not clearly stated in the CV" if it cannot be reasonably estimated.
+- strengths: 2-4 sentences on the candidate's main strengths relevant to this specific job.
+- weaknesses: 2-4 sentences honestly describing potential weaknesses or missing skills relative to THIS job's requirements. If the candidate profile shows no missing skills for this job, note that clearly instead of inventing gaps.
+- overallSuitability: EXACTLY 3 to 5 sentences giving the hiring manager a clear, balanced verdict on this candidate's overall suitability for this specific job, referencing concrete evidence from the candidate profile and job requirements.
+- matchScore: integer 0-100 measuring how well the candidate's ACTUAL profile matches THIS SPECIFIC job's requirements — this is a job-fit comparison, not a general CV quality score. Base it on ALL of the following, compared directly against the job's required skills, requirements, and description: (1) technical/professional skills overlap, (2) relevant work experience and its depth, (3) education/certifications relevant to the role, and (4) overall domain/field alignment.
+  Scoring rules:
+  - If the candidate's profile shows none (or almost none) of the job's core required skills/technologies/domain (e.g. the job requires Java, Spring Boot, SQL, and REST APIs for a backend role, and the candidate has no backend/programming experience at all), score MUST be low, in the 10-30 range.
+  - If the candidate has some overlapping skills but is missing several important requirements (skills, experience, or education), score in the 30-60 range.
+  - If the candidate covers most of the job's requirements with relevant experience and adequate education/certifications, score in the 60-84 range.
+  - If the candidate strongly matches nearly all required skills, experience level, and education/certification expectations, score 85-100.
+  - Be realistic, honest, and consistent: given the same candidate profile and the same job, you must always return the same score — do not vary it randomly between runs. Do not inflate the score because the candidate has a strong CV in an unrelated field — this score is specifically about fit for THIS job.
+""";
+
+            Map<String, Object> body = Map.of(
+                    "model", model,
+                    "input", prompt,
+                    "store", false,
+                    "temperature", 0,
+                    "text", Map.of("format", Map.of("type", "json_object"))
+            );
+
+            Map<String, Object> response = callOpenAI(body);
+            String result = extractTextFromOpenAIResponse(response);
+
+            if (result == null || result.isBlank()) {
+                return "{}";
+            }
+
+            return result;
+
+        } catch (Exception e) {
+            return "{}";
+        }
+    }
+
     private String buildSingleJobBlock(Job job) {
         String description = job.getDescription();
         if (description != null && description.length() > 1500) {

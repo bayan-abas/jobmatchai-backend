@@ -2,14 +2,18 @@ package com.jobmatchai.backend.controller;
 
 import com.jobmatchai.backend.model.Application;
 import com.jobmatchai.backend.model.Job;
-import com.jobmatchai.backend.model.JobMatchScore;
 import com.jobmatchai.backend.model.User;
+import com.jobmatchai.backend.model.CandidateAiSummary;
 import com.jobmatchai.backend.repository.ApplicationRepository;
-import com.jobmatchai.backend.repository.JobMatchScoreRepository;
+import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
 import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.UserRepository;
+import com.jobmatchai.backend.service.CandidateSummaryService;
 import com.jobmatchai.backend.service.NotificationService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
@@ -23,6 +27,8 @@ import java.util.Map;
 @RequestMapping("/api/applications")
 public class ApplicationController {
 
+    private static final Logger log = LoggerFactory.getLogger(ApplicationController.class);
+
     @Autowired
     private ApplicationRepository applicationRepository;
 
@@ -33,10 +39,13 @@ public class ApplicationController {
     private UserRepository userRepository;
 
     @Autowired
-    private JobMatchScoreRepository jobMatchScoreRepository;
+    private CandidateAiSummaryRepository candidateAiSummaryRepository;
 
     @Autowired
     private NotificationService notificationService;
+
+    @Autowired
+    private CandidateSummaryService candidateSummaryService;
 
     @GetMapping("/test")
     public String test() {
@@ -61,8 +70,20 @@ public class ApplicationController {
             String candidateEmail,
             String status,
             String appliedDate,
-            Integer matchPercent
+            Integer matchPercent,
+            String matchLabel
     ) {}
+
+    // CandidateAiSummary (the "AI Summary" feature) is the single source of truth for the
+    // score/label shown on candidate cards. It must never be mixed with JobMatchScore (the
+    // separate candidate-facing "Job Matches" feature, a different OpenAI prompt entirely) -
+    // doing so previously caused the card to show one AI evaluation while "AI Summary"
+    // showed another, and the value would jump the moment a summary was generated.
+    private CandidateAiSummary resolveCachedSummary(String candidateEmail, Long jobId) {
+        return candidateAiSummaryRepository
+                .findFirstByCandidateEmailAndJobIdOrderByIdDesc(candidateEmail, jobId)
+                .orElse(null);
+    }
 
     @GetMapping("/company")
     @PreAuthorize("hasRole('COMPANY')")
@@ -71,10 +92,7 @@ public class ApplicationController {
 
         return applicationRepository.findByCompanyEmail(companyEmail).stream()
                 .map(application -> {
-                    Integer matchPercent = jobMatchScoreRepository
-                            .findByCandidateEmailAndJobId(application.getCandidateEmail(), application.getJobId())
-                            .map(JobMatchScore::getMatchPercent)
-                            .orElse(null);
+                    CandidateAiSummary summary = resolveCachedSummary(application.getCandidateEmail(), application.getJobId());
 
                     return new ApplicantView(
                             application.getId(),
@@ -84,7 +102,8 @@ public class ApplicationController {
                             application.getCandidateEmail(),
                             application.getStatus(),
                             application.getAppliedDate(),
-                            matchPercent
+                            summary != null ? summary.getMatchScore() : null,
+                            summary != null ? summary.getMatchLabel() : null
                     );
                 })
                 .toList();
@@ -253,5 +272,51 @@ public class ApplicationController {
             response.put("message", e.getMessage());
             return response;
         }
+    }
+
+    @PostMapping("/{id}/ai-summary")
+    @PreAuthorize("hasRole('COMPANY')")
+    public ResponseEntity<?> getCandidateAiSummary(
+            @PathVariable Long id,
+            @RequestParam(value = "language", defaultValue = "en") String language,
+            Authentication authentication) {
+
+        Application application = applicationRepository.findById(id).orElse(null);
+
+        if (application == null) {
+            return ResponseEntity.status(404).body("Application not found");
+        }
+
+        Job job = jobRepository.findById(application.getJobId()).orElse(null);
+
+        if (job == null || !authentication.getName().equals(job.getCompanyEmail())) {
+            return ResponseEntity.status(404).body("Application not found");
+        }
+
+        log.info("[AI-SUMMARY] request received: applicationId={} candidate={} jobId={} requestedBy={}",
+                id, application.getCandidateEmail(), job.getId(), authentication.getName());
+
+        CandidateSummaryService.SummaryResult result =
+                candidateSummaryService.getCandidateSummary(application.getCandidateEmail(), job, language);
+
+        if (!result.hasAnalysis()) {
+            Map<String, Object> response = new HashMap<>();
+            response.put("hasAnalysis", false);
+            response.put("message", "This candidate has not completed a CV analysis yet.");
+            return ResponseEntity.ok(response);
+        }
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("hasAnalysis", true);
+        response.put("professionalBackground", result.professionalBackground());
+        response.put("keySkills", result.keySkills());
+        response.put("yearsOfExperience", result.yearsOfExperience());
+        response.put("strengths", result.strengths());
+        response.put("weaknesses", result.weaknesses());
+        response.put("overallSuitability", result.overallSuitability());
+        response.put("matchScore", result.matchScore());
+        response.put("matchLabel", result.matchLabel());
+
+        return ResponseEntity.ok(response);
     }
 }
