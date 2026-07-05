@@ -11,4 +11,8 @@ public interface JobMatchScoreRepository extends JpaRepository<JobMatchScore, Lo
     List<JobMatchScore> findByCandidateEmailAndJobIdIn(String candidateEmail, List<Long> jobIds);
 
     Optional<JobMatchScore> findByCandidateEmailAndJobId(String candidateEmail, Long jobId);
+
+    void deleteByCandidateEmail(String candidateEmail);
+
+    void deleteByJobIdIn(List<Long> jobIds);
 }

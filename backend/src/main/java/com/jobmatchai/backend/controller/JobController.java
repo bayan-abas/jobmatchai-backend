@@ -2,13 +2,10 @@ package com.jobmatchai.backend.controller;
 
 import com.jobmatchai.backend.model.CandidateAiSummary;
 import com.jobmatchai.backend.model.Job;
-import com.jobmatchai.backend.model.SavedJob;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
 import com.jobmatchai.backend.repository.JobRepository;
-import com.jobmatchai.backend.repository.SavedJobRepository;
 import com.jobmatchai.backend.service.JobMatchService;
-import com.jobmatchai.backend.service.NotificationService;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
@@ -28,9 +25,6 @@ public class JobController {
     private JobRepository jobRepository;
 
     @Autowired
-    private SavedJobRepository savedJobRepository;
-
-    @Autowired
     private ApplicationRepository applicationRepository;
 
     @Autowired
@@ -38,9 +32,6 @@ public class JobController {
 
     @Autowired
     private JobMatchService jobMatchService;
-
-    @Autowired
-    private NotificationService notificationService;
 
     public record MatchScoreRequest(String email, List<Long> jobIds, String language) {}
 
@@ -152,15 +143,6 @@ public class JobController {
         try {
             Job savedJob = jobRepository.save(job);
 
-            if (savedJob.getCompanyEmail() != null && !savedJob.getCompanyEmail().isBlank()) {
-                notificationService.createNotification(
-                        savedJob.getCompanyEmail(),
-                        "Job Posted Successfully",
-                        "Your job posting '" + savedJob.getTitle() + "' has been created.",
-                        "JOB_POSTED"
-                );
-            }
-
             response.put("success", true);
             response.put("message", "Job added successfully");
             response.put("job", savedJob);
@@ -217,24 +199,6 @@ public class JobController {
 
                         Job savedJob = jobRepository.save(job);
 
-                        if (savedJob.getCompanyEmail() != null && !savedJob.getCompanyEmail().isBlank()) {
-                            notificationService.createNotification(
-                                    savedJob.getCompanyEmail(),
-                                    "Job Updated",
-                                    "Your job posting '" + savedJob.getTitle() + "' has been updated.",
-                                    "JOB_UPDATED"
-                            );
-                        }
-
-                        for (SavedJob bookmark : savedJobRepository.findByJobIdAndJobType(savedJob.getId(), "internal")) {
-                            notificationService.createNotification(
-                                    bookmark.getCandidateEmail(),
-                                    "Saved Job Updated",
-                                    "A job you saved ('" + savedJob.getTitle() + "') has been updated.",
-                                    "SAVED_JOB_UPDATED"
-                            );
-                        }
-
                         response.put("success", true);
                         response.put("message", "Job updated successfully");
                         response.put("job", savedJob);
@@ -272,15 +236,6 @@ public class JobController {
                     .map(job -> {
                         jobRepository.deleteById(id);
 
-                        if (job.getCompanyEmail() != null && !job.getCompanyEmail().isBlank()) {
-                            notificationService.createNotification(
-                                    job.getCompanyEmail(),
-                                    "Job Deleted",
-                                    "Your job posting '" + job.getTitle() + "' has been deleted.",
-                                    "JOB_DELETED"
-                            );
-                        }
-
                         response.put("success", true);
                         response.put("message", "Job deleted successfully");
 
@@ -308,8 +263,6 @@ public class JobController {
             JobMatchService.MatchScoresResult result =
                     jobMatchService.getMatchScores(authentication.getName(), jobs, request.language());
 
-            notifyHighMatches(authentication.getName(), result.matches());
-
             Map<String, Object> response = new HashMap<>();
             response.put("hasAnalysis", result.hasAnalysis());
             response.put("matches", result.matches());
@@ -319,29 +272,6 @@ public class JobController {
         } catch (Exception e) {
             e.printStackTrace();
             return ResponseEntity.internalServerError().body("Failed to compute match scores: " + e.getMessage());
-        }
-    }
-
-    private static final int HIGH_MATCH_THRESHOLD = 85;
-
-    private void notifyHighMatches(String candidateEmail, List<Map<String, Object>> matches) {
-        for (Map<String, Object> match : matches) {
-            Object jobIdObj = match.get("jobId");
-            Object matchPercentObj = match.get("matchPercent");
-
-            if (!(jobIdObj instanceof Long jobId) || !(matchPercentObj instanceof Integer matchPercent)) {
-                continue;
-            }
-
-            if (matchPercent >= HIGH_MATCH_THRESHOLD) {
-                notificationService.createNotificationOnce(
-                        candidateEmail,
-                        "High Match Found",
-                        "You have a " + matchPercent + "% match with a job posting.",
-                        "JOB_MATCH_HIGH",
-                        jobId
-                );
-            }
         }
     }
 

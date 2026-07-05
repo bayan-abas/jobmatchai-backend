@@ -28,6 +28,9 @@ public class PasswordResetService {
     @Autowired
     private PasswordResetTokenRepository passwordResetTokenRepository;
 
+    @Autowired
+    private NotificationService notificationService;
+
     @Autowired(required = false)
     private JavaMailSender mailSender;
 
@@ -36,6 +39,9 @@ public class PasswordResetService {
 
     @Value("${app.frontend-url}")
     private String frontendUrl;
+
+    @Value("${app.environment:dev}")
+    private String appEnvironment;
 
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
@@ -55,16 +61,22 @@ public class PasswordResetService {
         String resetLink = frontendUrl + "/reset-password?token=" + token;
 
         if (mailHost != null && !mailHost.isBlank() && mailSender != null) {
-            SimpleMailMessage message = new SimpleMailMessage();
-            message.setTo(email);
-            message.setSubject("Reset your JobMatchAI password");
-            message.setText("Click the link below to reset your password (valid for 30 minutes):\n\n" + resetLink);
-            mailSender.send(message);
-            return null;
+            try {
+                SimpleMailMessage message = new SimpleMailMessage();
+                message.setTo(email);
+                message.setSubject("Reset your JobMatchAI password");
+                message.setText("Click the link below to reset your password (valid for 30 minutes):\n\n" + resetLink);
+                mailSender.send(message);
+            } catch (Exception e) {
+                log.error("Failed to send password reset email to {}: {}", email, e.getMessage());
+            }
+        } else {
+            log.info("Password reset link for {}: {}", email, resetLink);
         }
 
-        log.info("Password reset link for {}: {}", email, resetLink);
-        return resetLink;
+        // Only ever hand the raw reset link back in the API response in dev mode -
+        // a prod deploy with mail misconfigured must never leak it to the client.
+        return "dev".equals(appEnvironment) ? resetLink : null;
     }
 
     public boolean resetPassword(String token, String newPassword) {
@@ -85,6 +97,13 @@ public class PasswordResetService {
 
         resetToken.setUsed(true);
         passwordResetTokenRepository.save(resetToken);
+
+        notificationService.createNotification(
+                user.getEmail(),
+                "Security Alert",
+                "Your password was changed. If this was not you, contact support immediately.",
+                "SECURITY_ALERT"
+        );
 
         return true;
     }

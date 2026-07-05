@@ -5,7 +5,6 @@ import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.CVTextExtractorService;
-import com.jobmatchai.backend.service.NotificationService;
 import com.jobmatchai.backend.service.OpenAICVAnalysisService;
 import com.jobmatchai.backend.util.HashUtil;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -43,9 +42,6 @@ public class CVController {
 
     @Autowired
     private CVAnalysisRepository cvAnalysisRepository;
-
-    @Autowired
-    private NotificationService notificationService;
 
     @Value("${app.upload.dir:uploads/cvs/}")
     private String uploadDir;
@@ -138,13 +134,6 @@ public class CVController {
             user.setCvFileName(fileName);
             userRepository.save(user);
 
-            notificationService.createNotification(
-                    user.getEmail(),
-                    "CV Uploaded Successfully",
-                    "Your CV has been uploaded and saved.",
-                    "CV_UPLOADED"
-            );
-
             return ResponseEntity.ok(fileName);
 
         } catch (Exception e) {
@@ -190,13 +179,6 @@ public class CVController {
 
             cvAnalysisRepository.findByUserEmail(email)
                     .ifPresent(cvAnalysisRepository::delete);
-
-            notificationService.createNotification(
-                    user.getEmail(),
-                    "CV Deleted",
-                    "Your uploaded CV has been deleted.",
-                    "CV_DELETED"
-            );
 
             return ResponseEntity.ok("CV deleted successfully");
 
@@ -373,13 +355,6 @@ public class CVController {
             analysis.setCvTextHash(HashUtil.sha256(text));
 
             cvAnalysisRepository.save(analysis);
-
-            notificationService.createNotification(
-                    email,
-                    "CV Analysis Complete",
-                    "Your CV analysis is ready and saved.",
-                    "CV_ANALYZED"
-            );
 
             return ResponseEntity.ok(analysis);
 

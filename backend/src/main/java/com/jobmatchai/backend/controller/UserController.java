@@ -3,6 +3,8 @@ package com.jobmatchai.backend.controller;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.security.JwtService;
+import com.jobmatchai.backend.service.UserDeletionService;
+import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
@@ -22,6 +24,9 @@ public class UserController {
     @Autowired
     private JwtService jwtService;
 
+    @Autowired
+    private UserDeletionService userDeletionService;
+
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     private static void stripPassword(User user) {
@@ -29,6 +34,17 @@ public class UserController {
             user.setPassword(null);
         }
     }
+
+    public record ProfileUpdateRequest(
+            String name,
+            String password,
+            String phone,
+            String location,
+            String currentTitle,
+            String yearsOfExperience,
+            String skills,
+            String professionalSummary
+    ) {}
 
     @GetMapping("/test")
     public String test() {
@@ -43,7 +59,7 @@ public class UserController {
     }
 
     @PostMapping("/register")
-    public Map<String, Object> registerUser(@RequestBody User user) {
+    public Map<String, Object> registerUser(@Valid @RequestBody User user) {
         Map<String, Object> response = new HashMap<>();
 
         try {
@@ -138,7 +154,7 @@ public class UserController {
     @PutMapping("/{id}")
     public Map<String, Object> updateUser(
             @PathVariable long id,
-            @RequestBody User updatedUser,
+            @RequestBody ProfileUpdateRequest updatedUser,
             Authentication authentication
     ) {
         Map<String, Object> response = new HashMap<>();
@@ -158,10 +174,36 @@ public class UserController {
                 return response;
             }
 
-            existingUser.setName(updatedUser.getName());
+            if (updatedUser.name() != null) {
+                existingUser.setName(updatedUser.name());
+            }
 
-            if (updatedUser.getPassword() != null && !updatedUser.getPassword().isEmpty()) {
-                existingUser.setPassword(passwordEncoder.encode(updatedUser.getPassword()));
+            if (updatedUser.password() != null && !updatedUser.password().isEmpty()) {
+                existingUser.setPassword(passwordEncoder.encode(updatedUser.password()));
+            }
+
+            if (updatedUser.phone() != null) {
+                existingUser.setPhone(updatedUser.phone());
+            }
+
+            if (updatedUser.location() != null) {
+                existingUser.setLocation(updatedUser.location());
+            }
+
+            if (updatedUser.currentTitle() != null) {
+                existingUser.setCurrentTitle(updatedUser.currentTitle());
+            }
+
+            if (updatedUser.yearsOfExperience() != null) {
+                existingUser.setYearsOfExperience(updatedUser.yearsOfExperience());
+            }
+
+            if (updatedUser.skills() != null) {
+                existingUser.setSkills(updatedUser.skills());
+            }
+
+            if (updatedUser.professionalSummary() != null) {
+                existingUser.setProfessionalSummary(updatedUser.professionalSummary());
             }
 
             User savedUser = userRepository.save(existingUser);
@@ -198,7 +240,7 @@ public class UserController {
                 return response;
             }
 
-            userRepository.deleteById(id);
+            userDeletionService.deleteUserAccount(existingUser.getEmail());
 
             response.put("success", true);
             response.put("message", "User deleted successfully");

@@ -36,7 +36,43 @@ public class JobMatchService {
 
     // Bump this whenever the AI prompt/response schema for computeJobMatches changes,
     // so previously cached rows (missing the new fields) are treated as stale and recomputed.
-    private static final String MATCH_SCHEMA_VERSION = "v3-fieldrelated-breakdown";
+    private static final String MATCH_SCHEMA_VERSION = "v4-education-guardrail";
+
+    // Roles that typically have no formal education requirement - the AI is instructed not to
+    // penalize education for these, but this is a defensive backend clamp in case it still does.
+    private static final List<String> LOW_EDUCATION_REQUIREMENT_KEYWORDS = List.of(
+            "cashier", "sales assistant", "sales associate", "cleaner", "cleaning",
+            "warehouse", "driver", "delivery", "waiter", "waitress", "barista",
+            "security guard", "courier", "stock", "retail assistant", "housekeeping",
+            "kitchen porter", "dishwasher", "receptionist", "customer service representative"
+    );
+
+    private static boolean isLowEducationRequirementRole(String jobTitle) {
+        if (jobTitle == null) {
+            return false;
+        }
+
+        String lowerTitle = jobTitle.toLowerCase();
+        return LOW_EDUCATION_REQUIREMENT_KEYWORDS.stream().anyMatch(lowerTitle::contains);
+    }
+
+    private static Integer applyLowEducationRequirementGuardrail(
+            Integer educationMatchPercent, Integer skillsMatchPercent, Integer experienceMatchPercent) {
+        if (educationMatchPercent == null || educationMatchPercent >= 50) {
+            return educationMatchPercent;
+        }
+
+        List<Integer> otherScores = new ArrayList<>();
+        if (skillsMatchPercent != null) otherScores.add(skillsMatchPercent);
+        if (experienceMatchPercent != null) otherScores.add(experienceMatchPercent);
+
+        if (otherScores.isEmpty()) {
+            return 80;
+        }
+
+        int average = otherScores.stream().mapToInt((Integer score) -> score).sum() / otherScores.size();
+        return Math.max(educationMatchPercent, Math.max(average, 80));
+    }
 
     public record MatchScoresResult(boolean hasAnalysis, List<Map<String, Object>> matches) {}
 
@@ -168,14 +204,23 @@ public class JobMatchService {
 
             boolean fieldRelated = json.path("fieldRelated").asBoolean(true);
 
+            Integer skillsMatchPercent = fieldRelated ? json.path("skillsMatchPercent").asInt(0) : null;
+            Integer experienceMatchPercent = fieldRelated ? json.path("experienceMatchPercent").asInt(0) : null;
+            Integer educationMatchPercent = fieldRelated ? json.path("educationMatchPercent").asInt(0) : null;
+
+            if (fieldRelated && isLowEducationRequirementRole(job.getTitle())) {
+                educationMatchPercent = applyLowEducationRequirementGuardrail(
+                        educationMatchPercent, skillsMatchPercent, experienceMatchPercent);
+            }
+
             JobMatchScore score = cached != null ? cached : new JobMatchScore();
             score.setCandidateEmail(email);
             score.setJobId(job.getId());
             score.setFieldRelated(fieldRelated);
             score.setMatchPercent(fieldRelated ? json.path("matchPercent").asInt(0) : null);
-            score.setSkillsMatchPercent(fieldRelated ? json.path("skillsMatchPercent").asInt(0) : null);
-            score.setExperienceMatchPercent(fieldRelated ? json.path("experienceMatchPercent").asInt(0) : null);
-            score.setEducationMatchPercent(fieldRelated ? json.path("educationMatchPercent").asInt(0) : null);
+            score.setSkillsMatchPercent(skillsMatchPercent);
+            score.setExperienceMatchPercent(experienceMatchPercent);
+            score.setEducationMatchPercent(educationMatchPercent);
             score.setLanguageMatchPercent(fieldRelated ? json.path("languageMatchPercent").asInt(0) : null);
             score.setMatchReason(json.path("matchReason").asText(""));
             score.setMatchedSkills(joinSkillsArray(json.path("matchedSkills")));

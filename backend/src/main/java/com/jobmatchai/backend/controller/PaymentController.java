@@ -6,6 +6,7 @@ import com.jobmatchai.backend.service.NotificationService;
 import com.stripe.exception.SignatureVerificationException;
 import com.stripe.exception.StripeException;
 import com.stripe.model.Event;
+import com.stripe.model.Subscription;
 import com.stripe.model.checkout.Session;
 import com.stripe.net.Webhook;
 import com.stripe.param.checkout.SessionCreateParams;
@@ -118,7 +119,7 @@ public class PaymentController {
                 return ResponseEntity.badRequest().body(Map.of("success", false, "message", "Payment not completed."));
             }
 
-            activatePremium(authentication.getName());
+            activatePremium(session);
 
             return ResponseEntity.ok(Map.of("success", true, "message", "Premium activated."));
 
@@ -152,7 +153,7 @@ public class PaymentController {
                             : null;
 
                     if (candidateEmail != null && "paid".equals(session.getPaymentStatus())) {
-                        activatePremium(candidateEmail);
+                        activatePremium(session);
                     }
                 }
             });
@@ -161,7 +162,55 @@ public class PaymentController {
         return ResponseEntity.ok(Map.of("received", true));
     }
 
-    private void activatePremium(String email) {
+    @PostMapping("/cancel-subscription")
+    @PreAuthorize("hasRole('CANDIDATE')")
+    public ResponseEntity<?> cancelSubscription(Authentication authentication) {
+        if (stripeSecretKey == null || stripeSecretKey.isBlank()) {
+            return ResponseEntity.status(503).body(Map.of(
+                    "success", false,
+                    "message", "Payments are not configured on this server yet."
+            ));
+        }
+
+        User user = userRepository.findByEmail(authentication.getName());
+
+        if (user == null || user.getStripeSubscriptionId() == null || user.getStripeSubscriptionId().isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "success", false,
+                    "message", "No active subscription found."
+            ));
+        }
+
+        try {
+            Subscription subscription = Subscription.retrieve(user.getStripeSubscriptionId());
+            subscription.cancel();
+
+            user.setPremium(false);
+            userRepository.save(user);
+
+            notificationService.createNotification(
+                    user.getEmail(),
+                    "Premium Cancelled",
+                    "Your JobMatchAI Premium subscription has been cancelled.",
+                    "PREMIUM_CANCELLED"
+            );
+
+            return ResponseEntity.ok(Map.of("success", true, "message", "Subscription cancelled."));
+        } catch (StripeException e) {
+            return ResponseEntity.internalServerError().body(Map.of(
+                    "success", false,
+                    "message", "Failed to cancel subscription: " + e.getMessage()
+            ));
+        }
+    }
+
+    private void activatePremium(Session session) {
+        String email = session.getMetadata() != null ? session.getMetadata().get("candidateEmail") : null;
+
+        if (email == null) {
+            return;
+        }
+
         User user = userRepository.findByEmail(email);
 
         if (user == null || user.isPremium()) {
@@ -170,6 +219,8 @@ public class PaymentController {
 
         user.setPremium(true);
         user.setPremiumSince(LocalDateTime.now());
+        user.setStripeCustomerId(session.getCustomer());
+        user.setStripeSubscriptionId(session.getSubscription());
         userRepository.save(user);
 
         notificationService.createNotification(

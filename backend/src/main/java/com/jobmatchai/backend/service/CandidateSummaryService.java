@@ -88,7 +88,7 @@ public class CandidateSummaryService {
                     || !jobFingerprint.equals(cached.getJobFingerprint())
                     || cached.getMatchScore() == null;
 
-            if (!isStale) {
+            if (cached != null && !isStale) {
                 log.info("[AI-SUMMARY] candidate={} jobId={} -> cache HIT (matchScore={}, matchLabel={}); OpenAI NOT called",
                         candidateEmail, job.getId(), cached.getMatchScore(), cached.getMatchLabel());
 

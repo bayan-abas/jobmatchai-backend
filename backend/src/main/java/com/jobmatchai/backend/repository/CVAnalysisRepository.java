@@ -8,4 +8,6 @@ import java.util.Optional;
 public interface CVAnalysisRepository extends JpaRepository<CVAnalysis, Long> {
 
     Optional<CVAnalysis> findByUserEmail(String userEmail);
+
+    void deleteByUserEmail(String userEmail);
 }

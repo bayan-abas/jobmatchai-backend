@@ -1,5 +1,7 @@
 package com.jobmatchai.backend.controller;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jobmatchai.backend.model.Application;
 import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.model.User;
@@ -19,15 +21,21 @@ import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @RestController
 @RequestMapping("/api/applications")
 public class ApplicationController {
 
     private static final Logger log = LoggerFactory.getLogger(ApplicationController.class);
+
+    private static final Set<String> ALLOWED_COMPANY_STATUSES = Set.of("Accepted", "Rejected");
+
+    private static final int FREE_PLAN_MONTHLY_APPLICATION_LIMIT = 10;
 
     @Autowired
     private ApplicationRepository applicationRepository;
@@ -46,6 +54,8 @@ public class ApplicationController {
 
     @Autowired
     private CandidateSummaryService candidateSummaryService;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @GetMapping("/test")
     public String test() {
@@ -71,7 +81,9 @@ public class ApplicationController {
             String status,
             String appliedDate,
             Integer matchPercent,
-            String matchLabel
+            String matchLabel,
+            boolean viewedByCompany,
+            Map<String, String> preInterviewAnswers
     ) {}
 
     // CandidateAiSummary (the "AI Summary" feature) is the single source of truth for the
@@ -83,6 +95,18 @@ public class ApplicationController {
         return candidateAiSummaryRepository
                 .findFirstByCandidateEmailAndJobIdOrderByIdDesc(candidateEmail, jobId)
                 .orElse(null);
+    }
+
+    private Map<String, String> parsePreInterviewAnswers(String json) {
+        if (json == null || json.isBlank()) {
+            return Map.of();
+        }
+
+        try {
+            return objectMapper.readValue(json, new TypeReference<Map<String, String>>() {});
+        } catch (Exception e) {
+            return Map.of();
+        }
     }
 
     @GetMapping("/company")
@@ -103,27 +127,35 @@ public class ApplicationController {
                             application.getStatus(),
                             application.getAppliedDate(),
                             summary != null ? summary.getMatchScore() : null,
-                            summary != null ? summary.getMatchLabel() : null
+                            summary != null ? summary.getMatchLabel() : null,
+                            application.isViewedByCompany(),
+                            parsePreInterviewAnswers(application.getPreInterviewAnswersJson())
                     );
                 })
                 .toList();
     }
 
+    public record ApplyRequest(
+            Long jobId,
+            String jobTitle,
+            String companyName,
+            Map<String, String> preInterviewAnswers
+    ) {}
+
     @PostMapping("/apply")
     @PreAuthorize("hasRole('CANDIDATE')")
-    public Map<String, Object> applyToJob(@RequestBody Application application, Authentication authentication) {
+    public Map<String, Object> applyToJob(@RequestBody ApplyRequest request, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
         String candidateEmail = authentication.getName();
-        application.setCandidateEmail(candidateEmail);
 
         try {
-            if (application.getJobId() == null) {
+            if (request.jobId() == null) {
                 response.put("success", false);
                 response.put("message", "jobId is required");
                 return response;
             }
 
-            Job job = jobRepository.findById(application.getJobId()).orElse(null);
+            Job job = jobRepository.findById(request.jobId()).orElse(null);
             if (job == null) {
                 response.put("success", false);
                 response.put("message", "Job not found");
@@ -131,7 +163,7 @@ public class ApplicationController {
             }
 
             boolean alreadyApplied = applicationRepository
-                    .findByCandidateEmailAndJobId(candidateEmail, application.getJobId())
+                    .findByCandidateEmailAndJobId(candidateEmail, request.jobId())
                     .isPresent();
 
             if (alreadyApplied) {
@@ -142,23 +174,36 @@ public class ApplicationController {
 
             User candidate = userRepository.findByEmail(candidateEmail);
 
+            if (candidate == null || !candidate.isPremium()) {
+                LocalDateTime startOfMonth = LocalDate.now().withDayOfMonth(1).atStartOfDay();
+                long applicationsThisMonth = applicationRepository
+                        .countByCandidateEmailAndCreatedAtAfter(candidateEmail, startOfMonth);
+
+                if (applicationsThisMonth >= FREE_PLAN_MONTHLY_APPLICATION_LIMIT) {
+                    response.put("success", false);
+                    response.put("message",
+                            "You've reached the free plan limit of " + FREE_PLAN_MONTHLY_APPLICATION_LIMIT
+                                    + " applications this month. Upgrade to Premium for unlimited applications.");
+                    return response;
+                }
+            }
+
+            Application application = new Application();
+            application.setCandidateEmail(candidateEmail);
+            application.setJobId(job.getId());
             application.setJobTitle(job.getTitle());
             application.setCompanyName(job.getCompanyName());
             application.setCompanyEmail(job.getCompanyEmail());
-            application.setCandidateName(candidate != null ? candidate.getName() : application.getCandidateName());
+            application.setCandidateName(candidate != null ? candidate.getName() : null);
             application.setStatus("Under Review");
             application.setAppliedDate(LocalDate.now().toString());
+            application.setCreatedAt(LocalDateTime.now());
+
+            if (request.preInterviewAnswers() != null && !request.preInterviewAnswers().isEmpty()) {
+                application.setPreInterviewAnswersJson(objectMapper.writeValueAsString(request.preInterviewAnswers()));
+            }
 
             Application savedApplication = applicationRepository.save(application);
-
-            if (savedApplication.getCandidateEmail() != null && !savedApplication.getCandidateEmail().isBlank()) {
-                notificationService.createNotification(
-                        savedApplication.getCandidateEmail(),
-                        "Application Submitted",
-                        "Your application for job ID " + savedApplication.getJobId() + " has been submitted.",
-                        "APPLICATION_SUBMITTED"
-                );
-            }
 
             response.put("success", true);
             response.put("message", "Application submitted successfully");
@@ -180,6 +225,12 @@ public class ApplicationController {
     public Map<String, Object> updateStatus(@PathVariable long id, @RequestBody StatusUpdateRequest request, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
 
+        if (request.status() == null || !ALLOWED_COMPANY_STATUSES.contains(request.status())) {
+            response.put("success", false);
+            response.put("message", "Status must be Accepted or Rejected");
+            return response;
+        }
+
         try {
             Application existing = applicationRepository.findById(id).orElse(null);
 
@@ -192,6 +243,14 @@ public class ApplicationController {
             return applicationRepository.findById(id)
                     .map(application -> {
                         application.setStatus(request.status());
+
+                        // A company decision implies the application has been reviewed, even if
+                        // the company never separately opened the detail view / mark-viewed call.
+                        if (!application.isViewedByCompany()) {
+                            application.setViewedByCompany(true);
+                            application.setViewedAt(LocalDateTime.now());
+                        }
+
                         Application saved = applicationRepository.save(application);
 
                         if (saved.getCandidateEmail() != null && !saved.getCandidateEmail().isBlank()) {
@@ -227,16 +286,48 @@ public class ApplicationController {
         }
     }
 
+    @PostMapping("/{id}/mark-viewed")
+    @PreAuthorize("hasRole('COMPANY')")
+    public Map<String, Object> markViewed(@PathVariable long id, Authentication authentication) {
+        Map<String, Object> response = new HashMap<>();
+
+        Application existing = applicationRepository.findById(id).orElse(null);
+
+        if (existing == null || !authentication.getName().equals(existing.getCompanyEmail())) {
+            response.put("success", false);
+            response.put("message", "Application not found");
+            return response;
+        }
+
+        existing.setViewedByCompany(true);
+        existing.setViewedAt(LocalDateTime.now());
+
+        if ("Under Review".equals(existing.getStatus()) || existing.getStatus() == null) {
+            existing.setStatus("Viewed");
+        }
+
+        Application saved = applicationRepository.save(existing);
+
+        response.put("success", true);
+        response.put("application", saved);
+        return response;
+    }
+
     @DeleteMapping("/{id}")
     public Map<String, Object> deleteApplication(@PathVariable long id, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
 
         try {
             Application existing = applicationRepository.findById(id).orElse(null);
-            boolean owner = existing != null && (
-                    authentication.getName().equals(existing.getCompanyEmail())
-                            || authentication.getName().equals(existing.getCandidateEmail())
-            );
+
+            if (existing == null) {
+                response.put("success", false);
+                response.put("message", "Application not found");
+                return response;
+            }
+
+            boolean owner = authentication.getName().equals(existing.getCompanyEmail())
+                    || authentication.getName().equals(existing.getCandidateEmail());
 
             if (!owner) {
                 response.put("success", false);
@@ -244,18 +335,17 @@ public class ApplicationController {
                 return response;
             }
 
+            boolean isCandidate = authentication.getName().equals(existing.getCandidateEmail());
+
+            if (isCandidate && existing.isViewedByCompany()) {
+                response.put("success", false);
+                response.put("message", "This application can no longer be withdrawn because the company has already viewed it.");
+                return response;
+            }
+
             return applicationRepository.findById(id)
                     .map(application -> {
                         applicationRepository.deleteById(id);
-
-                        if (application.getCandidateEmail() != null && !application.getCandidateEmail().isBlank()) {
-                            notificationService.createNotification(
-                                    application.getCandidateEmail(),
-                                    "Application Removed",
-                                    "Your application for job ID " + application.getJobId() + " has been deleted.",
-                                    "APPLICATION_REMOVED"
-                            );
-                        }
 
                         response.put("success", true);
                         response.put("message", "Application deleted successfully");

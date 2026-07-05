@@ -1,6 +1,7 @@
 package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
+import java.time.LocalDateTime;
 
 @Entity
 @Table(name = "applications")
@@ -20,6 +21,14 @@ public class Application {
 
     private String status;
     private String appliedDate;
+
+    private LocalDateTime createdAt;
+
+    private Boolean viewedByCompany;
+    private LocalDateTime viewedAt;
+
+    @Lob
+    private String preInterviewAnswersJson;
 
     public Application() {}
 
@@ -102,5 +111,37 @@ public class Application {
 
     public void setAppliedDate(String appliedDate) {
         this.appliedDate = appliedDate;
+    }
+
+    public LocalDateTime getCreatedAt() {
+        return createdAt;
+    }
+
+    public void setCreatedAt(LocalDateTime createdAt) {
+        this.createdAt = createdAt;
+    }
+
+    public boolean isViewedByCompany() {
+        return Boolean.TRUE.equals(viewedByCompany);
+    }
+
+    public void setViewedByCompany(boolean viewedByCompany) {
+        this.viewedByCompany = viewedByCompany;
+    }
+
+    public LocalDateTime getViewedAt() {
+        return viewedAt;
+    }
+
+    public void setViewedAt(LocalDateTime viewedAt) {
+        this.viewedAt = viewedAt;
+    }
+
+    public String getPreInterviewAnswersJson() {
+        return preInterviewAnswersJson;
+    }
+
+    public void setPreInterviewAnswersJson(String preInterviewAnswersJson) {
+        this.preInterviewAnswersJson = preInterviewAnswersJson;
     }
 }

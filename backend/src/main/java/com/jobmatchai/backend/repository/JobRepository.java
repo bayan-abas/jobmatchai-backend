@@ -9,4 +9,6 @@ public interface JobRepository extends JpaRepository<Job, Long> {
 
     List<Job> findByCompanyEmail(String companyEmail);
 
+    void deleteByCompanyEmail(String companyEmail);
+
 }

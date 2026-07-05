@@ -11,4 +11,8 @@ public interface RecentlyViewedJobRepository extends JpaRepository<RecentlyViewe
     Optional<RecentlyViewedJob> findByCandidateEmailAndJobIdAndJobType(String candidateEmail, Long jobId, String jobType);
 
     List<RecentlyViewedJob> findByCandidateEmailOrderByViewedAtDesc(String candidateEmail);
+
+    void deleteByCandidateEmail(String candidateEmail);
+
+    void deleteByJobIdInAndJobType(List<Long> jobIds, String jobType);
 }

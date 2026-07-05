@@ -4,6 +4,7 @@ import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.security.JwtService;
 import com.jobmatchai.backend.service.PasswordResetService;
+import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
@@ -41,7 +42,7 @@ public class AuthController {
     public record ResetPasswordRequest(String token, String newPassword) {}
 
     @PostMapping("/register")
-    public Map<String, Object> register(@RequestBody User user) {
+    public Map<String, Object> register(@Valid @RequestBody User user) {
         Map<String, Object> response = new HashMap<>();
 
         try {
