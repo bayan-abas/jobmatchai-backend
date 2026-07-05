@@ -3,9 +3,11 @@ package com.jobmatchai.backend.service;
 import com.jobmatchai.backend.model.Application;
 import com.jobmatchai.backend.model.CVAnalysis;
 import com.jobmatchai.backend.model.Job;
+import com.jobmatchai.backend.model.JobMatchScore;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
+import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 
@@ -34,6 +36,9 @@ public class AIChatContextService {
 
     @Autowired
     private JobMatchService jobMatchService;
+
+    @Autowired
+    private JobMatchScoreRepository jobMatchScoreRepository;
 
     public record ChatContext(String mode, String contextBlock) {}
 
@@ -131,8 +136,26 @@ public class AIChatContextService {
         Map<Long, List<Application>> applicationsByJobId = allApplications.stream()
                 .collect(Collectors.groupingBy(app -> app.getJobId()));
 
-        // Dedupe CVAnalysis lookups across jobs — a candidate may have applied to multiple of this company's jobs.
+        // Batch-fetch CVAnalysis and cached JobMatchScore rows for every applicant up front,
+        // instead of one query per applicant (and, for match scores, previously one query PLUS
+        // a possible synchronous OpenAI call per applicant-per-job pair). This context is only
+        // ever read from cache - it must never trigger fresh AI scoring, which belongs solely
+        // to the candidate-facing "Job Matches" and company-facing "AI Summary" features.
+        List<String> candidateEmails = allApplications.stream().map(Application::getCandidateEmail).distinct().toList();
+
         Map<String, CVAnalysis> analysisByEmail = new HashMap<>();
+        if (!candidateEmails.isEmpty()) {
+            for (CVAnalysis analysis : cvAnalysisRepository.findByUserEmailIn(candidateEmails)) {
+                analysisByEmail.put(analysis.getUserEmail(), analysis);
+            }
+        }
+
+        Map<String, JobMatchScore> matchScoreByKey = new HashMap<>();
+        if (!candidateEmails.isEmpty()) {
+            for (JobMatchScore score : jobMatchScoreRepository.findByCandidateEmailInAndJobIdIn(candidateEmails, jobIds)) {
+                matchScoreByKey.put(score.getCandidateEmail() + "::" + score.getJobId(), score);
+            }
+        }
 
         for (Job job : companyJobs) {
             sb.append("---\n")
@@ -158,10 +181,7 @@ public class AIChatContextService {
                         "אין עדיין בקשות למשרה זו.\n"));
             } else {
                 for (Application app : applicants) {
-                    CVAnalysis candidateAnalysis = analysisByEmail.computeIfAbsent(
-                            app.getCandidateEmail(),
-                            candidateEmail -> cvAnalysisRepository.findByUserEmail(candidateEmail).orElse(null)
-                    );
+                    CVAnalysis candidateAnalysis = analysisByEmail.get(app.getCandidateEmail());
 
                     sb.append("  * Candidate: ").append(nullToNA(app.getCandidateName()))
                             .append(" (").append(nullToNA(app.getCandidateEmail())).append(")\n")
@@ -178,15 +198,13 @@ public class AIChatContextService {
                                 .append("    Missing skills (general): ").append(nullToNA(candidateAnalysis.getMissingSkills())).append("\n")
                                 .append("    Overall CV score: ").append(nullToNA(candidateAnalysis.getOverallScore())).append("\n");
 
-                        JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(
-                                app.getCandidateEmail(), List.of(job), language);
+                        JobMatchScore matchScore = matchScoreByKey.get(app.getCandidateEmail() + "::" + job.getId());
 
-                        if (result.hasAnalysis() && !result.matches().isEmpty()) {
-                            Map<String, Object> match = result.matches().get(0);
-                            sb.append("    Match percent for this job: ").append(match.get("matchPercent")).append("\n")
-                                    .append("    Match reason: ").append(match.get("matchReason")).append("\n")
-                                    .append("    Matched skills for this job: ").append(joinList(match.get("matchedSkills"))).append("\n")
-                                    .append("    Missing skills for this job: ").append(joinList(match.get("missingSkills"))).append("\n");
+                        if (matchScore != null && matchScore.getMatchPercent() != null) {
+                            sb.append("    Match percent for this job: ").append(matchScore.getMatchPercent()).append("\n")
+                                    .append("    Match reason: ").append(nullToNA(matchScore.getMatchReason())).append("\n")
+                                    .append("    Matched skills for this job: ").append(nullToNA(matchScore.getMatchedSkills())).append("\n")
+                                    .append("    Missing skills for this job: ").append(nullToNA(matchScore.getMissingSkills())).append("\n");
                         } else {
                             sb.append("    Match percent for this job: not yet computed\n");
                         }

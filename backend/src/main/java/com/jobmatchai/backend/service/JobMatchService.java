@@ -136,8 +136,15 @@ public class JobMatchService {
             JsonNode matchesJson = readMatchesArray(matchResult);
 
             for (JsonNode match : matchesJson) {
-                long jobId = match.path("jobId").asLong();
+                // A malformed entry (missing matchPercent when the job is field-related) means the AI
+                // response for this job was incomplete - skip it rather than caching a fake 0%, which
+                // would silently overwrite a previously good score for this job.
                 boolean fieldRelated = match.path("fieldRelated").asBoolean(true);
+                if (fieldRelated && !match.has("matchPercent")) {
+                    continue;
+                }
+
+                long jobId = match.path("jobId").asLong();
                 Integer matchPercent = fieldRelated ? match.path("matchPercent").asInt(0) : null;
                 String matchReason = match.path("matchReason").asText("");
                 String matchedSkills = joinSkillsArray(match.path("matchedSkills"));
@@ -191,10 +198,15 @@ public class JobMatchService {
 
         JobMatchScore cached = jobMatchScoreRepository.findByCandidateEmailAndJobId(email, job.getId()).orElse(null);
 
+        // A row is only considered "fully computed" once this detail method has successfully
+        // populated recommendation (a non-blank value can only come from a successful run here -
+        // getMatchScores never sets it). A blank/null recommendation means either no detail
+        // computation has happened yet, or the last attempt failed - either way, retry.
         boolean isStale = cached == null
                 || !cvFingerprint.equals(cached.getCvFingerprint())
                 || !jobFingerprint.equals(cached.getJobFingerprint())
-                || cached.getRecommendation() == null;
+                || cached.getRecommendation() == null
+                || cached.getRecommendation().isBlank();
 
         JobMatchScore resolved;
 
@@ -202,38 +214,58 @@ public class JobMatchService {
             String result = openAICVAnalysisService.computeJobMatchDetail(analysis, job, language);
             JsonNode json = readDetailObject(result);
 
-            boolean fieldRelated = json.path("fieldRelated").asBoolean(true);
+            // The AI call failed, returned unparsable JSON, or returned an incomplete object
+            // (missing matchPercent for a field-related job). Never cache that as a fake 0% -
+            // it would silently overwrite a previously good score and desynchronize the overall
+            // percent from its breakdown. Serve the last known-good result instead, or - if
+            // there isn't one yet - report "not yet available" rather than zeros.
+            boolean fieldRelated = json != null && json.path("fieldRelated").asBoolean(true);
+            boolean incomplete = json == null || (fieldRelated && !json.has("matchPercent"));
 
-            Integer skillsMatchPercent = fieldRelated ? json.path("skillsMatchPercent").asInt(0) : null;
-            Integer experienceMatchPercent = fieldRelated ? json.path("experienceMatchPercent").asInt(0) : null;
-            Integer educationMatchPercent = fieldRelated ? json.path("educationMatchPercent").asInt(0) : null;
+            if (incomplete) {
+                if (cached != null) {
+                    resolved = cached;
+                } else {
+                    return new MatchDetailResult(true, job.getId(), null,
+                            "We couldn't compute your match for this job right now. Please try again shortly.",
+                            List.of(), List.of(), List.of(), List.of(), List.of(),
+                            null, null, true, null, null, null, null);
+                }
+            } else {
+                Integer skillsMatchPercent = fieldRelated && json.has("skillsMatchPercent") ? json.path("skillsMatchPercent").asInt() : null;
+                Integer experienceMatchPercent = fieldRelated && json.has("experienceMatchPercent") ? json.path("experienceMatchPercent").asInt() : null;
+                Integer educationMatchPercent = fieldRelated && json.has("educationMatchPercent") ? json.path("educationMatchPercent").asInt() : null;
 
-            if (fieldRelated && isLowEducationRequirementRole(job.getTitle())) {
-                educationMatchPercent = applyLowEducationRequirementGuardrail(
-                        educationMatchPercent, skillsMatchPercent, experienceMatchPercent);
+                if (fieldRelated && isLowEducationRequirementRole(job.getTitle())) {
+                    educationMatchPercent = applyLowEducationRequirementGuardrail(
+                            educationMatchPercent, skillsMatchPercent, experienceMatchPercent);
+                }
+
+                JobMatchScore score = cached != null ? cached : new JobMatchScore();
+                score.setCandidateEmail(email);
+                score.setJobId(job.getId());
+                score.setFieldRelated(fieldRelated);
+                score.setMatchPercent(fieldRelated ? json.path("matchPercent").asInt(0) : null);
+                score.setSkillsMatchPercent(skillsMatchPercent);
+                score.setExperienceMatchPercent(experienceMatchPercent);
+                score.setEducationMatchPercent(educationMatchPercent);
+                score.setLanguageMatchPercent(fieldRelated && json.has("languageMatchPercent") ? json.path("languageMatchPercent").asInt() : null);
+                score.setMatchReason(json.path("matchReason").asText(""));
+                score.setMatchedSkills(joinSkillsArray(json.path("matchedSkills")));
+                score.setMissingSkills(joinSkillsArray(json.path("missingSkills")));
+                score.setWhyGoodMatch(joinSkillsArray(json.path("whyGoodMatch")));
+                score.setWhyNotPerfectMatch(joinSkillsArray(json.path("whyNotPerfectMatch")));
+                score.setImprovementSuggestions(joinSkillsArray(json.path("improvementSuggestions")));
+                // recommendation must end up non-blank on success so isStale can tell a completed
+                // computation apart from one that never ran / previously failed.
+                String recommendation = json.path("recommendation").asText("");
+                score.setRecommendation(recommendation.isBlank() ? "No specific recommendation available." : recommendation);
+                score.setShouldApply(json.path("shouldApply").asBoolean(true));
+                score.setCvFingerprint(cvFingerprint);
+                score.setJobFingerprint(jobFingerprint);
+
+                resolved = jobMatchScoreRepository.save(score);
             }
-
-            JobMatchScore score = cached != null ? cached : new JobMatchScore();
-            score.setCandidateEmail(email);
-            score.setJobId(job.getId());
-            score.setFieldRelated(fieldRelated);
-            score.setMatchPercent(fieldRelated ? json.path("matchPercent").asInt(0) : null);
-            score.setSkillsMatchPercent(skillsMatchPercent);
-            score.setExperienceMatchPercent(experienceMatchPercent);
-            score.setEducationMatchPercent(educationMatchPercent);
-            score.setLanguageMatchPercent(fieldRelated ? json.path("languageMatchPercent").asInt(0) : null);
-            score.setMatchReason(json.path("matchReason").asText(""));
-            score.setMatchedSkills(joinSkillsArray(json.path("matchedSkills")));
-            score.setMissingSkills(joinSkillsArray(json.path("missingSkills")));
-            score.setWhyGoodMatch(joinSkillsArray(json.path("whyGoodMatch")));
-            score.setWhyNotPerfectMatch(joinSkillsArray(json.path("whyNotPerfectMatch")));
-            score.setImprovementSuggestions(joinSkillsArray(json.path("improvementSuggestions")));
-            score.setRecommendation(json.path("recommendation").asText(""));
-            score.setShouldApply(json.path("shouldApply").asBoolean(true));
-            score.setCvFingerprint(cvFingerprint);
-            score.setJobFingerprint(jobFingerprint);
-
-            resolved = jobMatchScoreRepository.save(score);
         } else {
             // isStale is false only when cached is non-null (see isStale's definition above).
             resolved = Objects.requireNonNull(cached, "cached JobMatchScore must be present when not stale");
@@ -261,9 +293,10 @@ public class JobMatchService {
 
     private JsonNode readDetailObject(String result) {
         try {
-            return objectMapper.readTree(result);
+            JsonNode node = objectMapper.readTree(result);
+            return node != null && node.isObject() && node.size() > 0 ? node : null;
         } catch (Exception e) {
-            return objectMapper.createObjectNode();
+            return null;
         }
     }
 

@@ -109,14 +109,41 @@ public class ApplicationController {
         }
     }
 
+    // Keyed by "candidateEmail::jobId" so a batch of summaries fetched with one query
+    // (findByCandidateEmailInAndJobIdIn) can be looked up the same way per-item queries
+    // were before, without hitting the database once per row in a list endpoint - against
+    // a remote database, N applications used to mean N extra round trips here.
+    private Map<String, CandidateAiSummary> resolveCachedSummaries(List<Application> applications) {
+        if (applications.isEmpty()) {
+            return Map.of();
+        }
+
+        List<String> candidateEmails = applications.stream().map(Application::getCandidateEmail).distinct().toList();
+        List<Long> jobIds = applications.stream().map(Application::getJobId).distinct().toList();
+
+        Map<String, CandidateAiSummary> latestByKey = new HashMap<>();
+        for (CandidateAiSummary summary : candidateAiSummaryRepository.findByCandidateEmailInAndJobIdIn(candidateEmails, jobIds)) {
+            String key = summary.getCandidateEmail() + "::" + summary.getJobId();
+            CandidateAiSummary existing = latestByKey.get(key);
+            if (existing == null || summary.getId() > existing.getId()) {
+                latestByKey.put(key, summary);
+            }
+        }
+
+        return latestByKey;
+    }
+
     @GetMapping("/company")
     @PreAuthorize("hasRole('COMPANY')")
     public List<ApplicantView> getApplicationsByCompany(Authentication authentication) {
         String companyEmail = authentication.getName();
 
-        return applicationRepository.findByCompanyEmail(companyEmail).stream()
+        List<Application> applications = applicationRepository.findByCompanyEmail(companyEmail);
+        Map<String, CandidateAiSummary> summariesByKey = resolveCachedSummaries(applications);
+
+        return applications.stream()
                 .map(application -> {
-                    CandidateAiSummary summary = resolveCachedSummary(application.getCandidateEmail(), application.getJobId());
+                    CandidateAiSummary summary = summariesByKey.get(application.getCandidateEmail() + "::" + application.getJobId());
 
                     return new ApplicantView(
                             application.getId(),
@@ -195,7 +222,9 @@ public class ApplicationController {
             application.setCompanyName(job.getCompanyName());
             application.setCompanyEmail(job.getCompanyEmail());
             application.setCandidateName(candidate != null ? candidate.getName() : null);
-            application.setStatus("Under Review");
+            // Starts in automated AI screening; only moves to "Under Review" once the company
+            // actually opens it (see markViewed below).
+            application.setStatus("AI Screening");
             application.setAppliedDate(LocalDate.now().toString());
             application.setCreatedAt(LocalDateTime.now());
 
@@ -302,8 +331,10 @@ public class ApplicationController {
         existing.setViewedByCompany(true);
         existing.setViewedAt(LocalDateTime.now());
 
-        if ("Under Review".equals(existing.getStatus()) || existing.getStatus() == null) {
-            existing.setStatus("Viewed");
+        if ("Applied".equals(existing.getStatus())
+                || "AI Screening".equals(existing.getStatus())
+                || existing.getStatus() == null) {
+            existing.setStatus("Under Review");
         }
 
         Application saved = applicationRepository.save(existing);

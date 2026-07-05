@@ -1,7 +1,5 @@
 package com.jobmatchai.backend.security;
 
-import com.jobmatchai.backend.model.User;
-import com.jobmatchai.backend.repository.UserRepository;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -22,9 +20,6 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     @Autowired
     private JwtService jwtService;
 
-    @Autowired
-    private UserRepository userRepository;
-
     @Override
     protected void doFilterInternal(
             HttpServletRequest request,
@@ -38,14 +33,18 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
             String token = authHeader.substring(7);
 
             if (jwtService.isValid(token)) {
+                // Email and role are both signed into the token at login time (see
+                // JwtService.generateToken), so authenticating a request never needs to hit the
+                // database - against a remote DB that round trip cost more than the rest of most
+                // requests combined, on every single authenticated call in the app.
                 String email = jwtService.extractEmail(token);
-                User user = userRepository.findByEmail(email);
+                String role = jwtService.extractRole(token);
 
-                if (user != null && SecurityContextHolder.getContext().getAuthentication() == null) {
-                    String authority = "ROLE_" + user.getRole().toUpperCase();
+                if (email != null && role != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+                    String authority = "ROLE_" + role.toUpperCase();
 
                     UsernamePasswordAuthenticationToken authentication = new UsernamePasswordAuthenticationToken(
-                            user.getEmail(),
+                            email,
                             null,
                             List.of(new SimpleGrantedAuthority(authority))
                     );

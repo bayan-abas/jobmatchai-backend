@@ -1,5 +1,6 @@
 package com.jobmatchai.backend.controller;
 
+import com.jobmatchai.backend.model.Application;
 import com.jobmatchai.backend.model.CandidateAiSummary;
 import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.repository.ApplicationRepository;
@@ -76,10 +77,14 @@ public class JobController {
     @GetMapping("/company/{companyEmail}")
     public List<JobWithApplicantsView> getJobsByCompanyEmail(Authentication authentication) {
         List<Job> jobs = jobRepository.findByCompanyEmail(authentication.getName());
+        List<Long> jobIds = jobs.stream().map(Job::getId).toList();
 
+        // One query for every job's applicants instead of one count query per job - against
+        // a remote database each round trip is expensive, so this matters even for a
+        // handful of postings.
         Map<Long, Long> applicantCounts = new HashMap<>();
-        for (Job job : jobs) {
-            applicantCounts.put(job.getId(), applicationRepository.countByJobId(job.getId()));
+        for (Application application : applicationRepository.findByJobIdIn(jobIds)) {
+            applicantCounts.merge(application.getJobId(), 1L, Long::sum);
         }
 
         return jobs.stream()
@@ -111,11 +116,24 @@ public class JobController {
         // CandidateAiSummary (the "AI Summary" feature) is the single source of truth for
         // the score/label shown here - it must never be mixed with the separate candidate-
         // facing "Job Matches" score, which comes from a different OpenAI prompt entirely.
-        List<JobApplicantView> applicants = applicationRepository.findByJobId(jobId).stream()
+        List<Application> applications = applicationRepository.findByJobId(jobId);
+
+        // One batched query for every applicant's summary instead of one per applicant -
+        // against a remote database each round trip is expensive.
+        Map<String, CandidateAiSummary> summariesByEmail = new HashMap<>();
+        if (!applications.isEmpty()) {
+            List<String> candidateEmails = applications.stream().map(Application::getCandidateEmail).distinct().toList();
+            for (CandidateAiSummary summary : candidateAiSummaryRepository.findByCandidateEmailInAndJobIdIn(candidateEmails, List.of(jobId))) {
+                CandidateAiSummary existing = summariesByEmail.get(summary.getCandidateEmail());
+                if (existing == null || summary.getId() > existing.getId()) {
+                    summariesByEmail.put(summary.getCandidateEmail(), summary);
+                }
+            }
+        }
+
+        List<JobApplicantView> applicants = applications.stream()
                 .map(application -> {
-                    CandidateAiSummary summary = candidateAiSummaryRepository
-                            .findFirstByCandidateEmailAndJobIdOrderByIdDesc(application.getCandidateEmail(), application.getJobId())
-                            .orElse(null);
+                    CandidateAiSummary summary = summariesByEmail.get(application.getCandidateEmail());
 
                     return new JobApplicantView(
                             application.getId(),

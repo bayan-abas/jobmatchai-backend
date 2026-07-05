@@ -10,6 +10,8 @@ public interface CandidateAiSummaryRepository extends JpaRepository<CandidateAiS
 
     Optional<CandidateAiSummary> findFirstByCandidateEmailAndJobIdOrderByIdDesc(String candidateEmail, Long jobId);
 
+    List<CandidateAiSummary> findByCandidateEmailInAndJobIdIn(List<String> candidateEmails, List<Long> jobIds);
+
     void deleteByCandidateEmail(String candidateEmail);
 
     void deleteByJobIdIn(List<Long> jobIds);

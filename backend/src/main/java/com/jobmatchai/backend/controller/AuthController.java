@@ -3,6 +3,7 @@ package com.jobmatchai.backend.controller;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.security.JwtService;
+import com.jobmatchai.backend.service.NotificationService;
 import com.jobmatchai.backend.service.PasswordResetService;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -18,11 +19,16 @@ import java.util.Map;
 @RequestMapping("/api/auth")
 public class AuthController {
 
+    private static final int MIN_PASSWORD_LENGTH = 6;
+
     @Autowired
     private UserRepository userRepository;
 
     @Autowired
     private PasswordResetService passwordResetService;
+
+    @Autowired
+    private NotificationService notificationService;
 
     @Autowired
     private JwtService jwtService;
@@ -150,6 +156,47 @@ public class AuthController {
             response.put("message", "This reset link is invalid or has expired.");
             return ResponseEntity.badRequest().body(response);
         }
+
+        response.put("success", true);
+        response.put("message", "Password updated successfully.");
+        return ResponseEntity.ok(response);
+    }
+
+    public record ChangePasswordRequest(String currentPassword, String newPassword) {}
+
+    @PostMapping("/change-password")
+    public ResponseEntity<?> changePassword(@RequestBody ChangePasswordRequest request, Authentication authentication) {
+        Map<String, Object> response = new HashMap<>();
+
+        if (request.newPassword() == null || request.newPassword().length() < MIN_PASSWORD_LENGTH) {
+            response.put("success", false);
+            response.put("message", "New password must be at least " + MIN_PASSWORD_LENGTH + " characters.");
+            return ResponseEntity.badRequest().body(response);
+        }
+
+        User user = userRepository.findByEmail(authentication.getName());
+
+        if (user == null) {
+            response.put("success", false);
+            response.put("message", "User not found.");
+            return ResponseEntity.badRequest().body(response);
+        }
+
+        if (request.currentPassword() == null || !passwordEncoder.matches(request.currentPassword(), user.getPassword())) {
+            response.put("success", false);
+            response.put("message", "Current password is incorrect.");
+            return ResponseEntity.badRequest().body(response);
+        }
+
+        user.setPassword(passwordEncoder.encode(request.newPassword()));
+        userRepository.save(user);
+
+        notificationService.createNotification(
+                user.getEmail(),
+                "Security Alert",
+                "Your password was changed. If this was not you, contact support immediately.",
+                "SECURITY_ALERT"
+        );
 
         response.put("success", true);
         response.put("message", "Password updated successfully.");
