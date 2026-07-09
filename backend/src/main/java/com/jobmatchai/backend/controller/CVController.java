@@ -75,7 +75,11 @@ public class CVController {
                 return ResponseEntity.badRequest().body("User not found");
             }
 
-            File folder = new File(System.getProperty("user.dir"), uploadDir);
+            // Path.resolve (unlike the legacy File(parent, child) constructor) correctly
+            // returns uploadDir as-is when it's already absolute - which it is by default
+            // now that it points outside the project directory - instead of risking it
+            // getting silently mis-joined with the CWD.
+            File folder = Paths.get(System.getProperty("user.dir")).resolve(uploadDir).normalize().toFile();
 
             if (!folder.exists()) {
                 folder.mkdirs();
@@ -101,7 +105,20 @@ public class CVController {
             File destination = new File(folder, fileName);
             file.transferTo(destination);
 
-            String extractedText = cvTextExtractorService.extractText(destination);
+            String extractedText;
+            try {
+                extractedText = cvTextExtractorService.extractText(destination);
+            } catch (Exception extractException) {
+                // A file Tika can't parse (corrupt, or a renamed non-document binary) would
+                // otherwise be written to disk and left there forever, unassociated with any
+                // user - clean it up the same as the "no readable text" case below.
+                destination.delete();
+                return ResponseEntity.badRequest()
+                        .body(pickByLanguage(language,
+                                "The uploaded file does not contain readable CV text.",
+                                "الملف الذي تم رفعه لا يحتوي على نص سيرة ذاتية قابل للقراءة.",
+                                "הקובץ שהועלה אינו מכיל טקסט קורות חיים קריא."));
+            }
 
             if (extractedText == null || extractedText.isBlank()) {
                 destination.delete();
@@ -131,10 +148,18 @@ public class CVController {
                                 "קובץ קורות החיים אינו תקין: ") + reason);
             }
 
+            // Drop the previous CV file now that the new one is validated and about to
+            // replace it - otherwise every re-upload leaves the old file on disk forever.
+            String previousFileName = user.getCvFileName();
+            if (previousFileName != null && !previousFileName.isBlank() && !previousFileName.equals(fileName)) {
+                new File(folder, previousFileName).delete();
+            }
+
             user.setCvFileName(fileName);
+            user.setOriginalCvFileName(originalFileName);
             userRepository.save(user);
 
-            return ResponseEntity.ok(fileName);
+            return ResponseEntity.ok(Map.of("fileName", fileName, "originalFileName", originalFileName));
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -175,6 +200,7 @@ public class CVController {
             }
 
             user.setCvFileName(null);
+            user.setOriginalCvFileName(null);
             userRepository.save(user);
 
             cvAnalysisRepository.findByUserEmail(email)
@@ -205,10 +231,44 @@ public class CVController {
         return ResponseEntity.ok(user.getCvFileName());
     }
 
+    // Storage key (for building the download URL) and the original upload name
+    // (for display) together, since /current alone only ever exposed the storage key.
+    @GetMapping("/current-info")
+    public ResponseEntity<?> getCurrentCVInfo(Authentication authentication) {
+        String email = authentication.getName();
+        User user = userRepository.findByEmail(email);
+
+        if (user == null) {
+            return ResponseEntity.badRequest().body("User not found");
+        }
+
+        String fileName = user.getCvFileName();
+
+        if (fileName == null || fileName.isBlank()) {
+            return ResponseEntity.ok(Map.of("fileName", "", "originalFileName", ""));
+        }
+
+        String originalFileName = user.getOriginalCvFileName();
+
+        return ResponseEntity.ok(Map.of(
+                "fileName", fileName,
+                "originalFileName", originalFileName != null && !originalFileName.isBlank() ? originalFileName : fileName));
+    }
+
     @GetMapping("/download/{fileName}")
-    public ResponseEntity<?> downloadCV(@PathVariable String fileName) {
+    public ResponseEntity<?> downloadCV(@PathVariable String fileName, Authentication authentication) {
 
         try {
+            // This only ever needs to serve the requesting candidate's own CV (no other
+            // part of the app - company or otherwise - links to this endpoint), so require
+            // the file to actually belong to them. Without this, any authenticated user
+            // could download any other candidate's CV just by guessing/enumerating the
+            // "{timestamp}_{name}" storage filename.
+            User owner = userRepository.findByEmail(authentication.getName());
+            if (owner == null || !fileName.equals(owner.getCvFileName())) {
+                return ResponseEntity.status(403).body("You do not have access to this file");
+            }
+
             Path uploadPath = Paths.get(System.getProperty("user.dir"))
                     .resolve(uploadDir)
                     .normalize()
@@ -229,6 +289,13 @@ public class CVController {
             String resourceFilename = resource.getFilename();
             String lowerFileName = resourceFilename == null ? "" : resourceFilename.toLowerCase();
 
+            // Prefer the name the candidate actually uploaded over the sanitized/
+            // timestamp-prefixed storage name, so the browser's save dialog and inline
+            // viewer both show the real file name instead of a generic one.
+            String displayFilename = owner.getOriginalCvFileName() != null && !owner.getOriginalCvFileName().isBlank()
+                    ? owner.getOriginalCvFileName()
+                    : resourceFilename;
+
             MediaType mediaType = MediaType.APPLICATION_OCTET_STREAM;
 
             if (lowerFileName.endsWith(".pdf")) {
@@ -244,7 +311,7 @@ public class CVController {
                     .contentType(mediaType)
                     .header(
                             HttpHeaders.CONTENT_DISPOSITION,
-                            "inline; filename=\"" + (resourceFilename != null ? resourceFilename : fileName) + "\"")
+                            "inline; filename=\"" + (displayFilename != null ? displayFilename : fileName) + "\"")
                     .body(resource);
 
         } catch (Exception e) {
@@ -334,12 +401,33 @@ public class CVController {
                 return ResponseEntity.badRequest().body("Could not extract text from this CV");
             }
 
-            String aiResult = openAICVAnalysisService.analyzeCV(text, language);
-            JsonNode json = objectMapper.readTree(aiResult);
+            // Fingerprint includes language so re-analyzing in a different language still
+            // regenerates wording, but re-running with the same CV + language is a no-op -
+            // this is what keeps the score stable instead of drifting across repeated calls.
+            String cvTextHash = HashUtil.sha256(text + "|" + language);
 
             CVAnalysis analysis = cvAnalysisRepository
                     .findByUserEmail(email)
                     .orElse(new CVAnalysis());
+
+            if (cvTextHash.equals(analysis.getCvTextHash())) {
+                return ResponseEntity.ok(analysis);
+            }
+
+            String aiResult = openAICVAnalysisService.analyzeCV(text, language);
+            JsonNode json = objectMapper.readTree(aiResult);
+
+            // analyzeCV() swallows OpenAI failures (timeout, rate limit, malformed response)
+            // internally and returns a normally-shaped JSON with overallScore left blank and
+            // the error message stuffed into "summary" - that's the only signal a failure
+            // happened. Treating it as a real result would cache a fake "0%" analysis under
+            // this CV's hash, and since the hash wouldn't change on retry, the user would be
+            // stuck seeing that fake failure forever instead of ever getting a real score.
+            if (json.path("overallScore").asText("").isBlank()) {
+                String failureMessage = json.path("summary").asText("");
+                return ResponseEntity.internalServerError()
+                        .body(failureMessage.isBlank() ? "Failed to analyze CV. Please try again." : failureMessage);
+            }
 
             analysis.setUserEmail(email);
             analysis.setCandidateField(json.path("candidateField").asText(""));
@@ -352,7 +440,7 @@ public class CVController {
             analysis.setScoreLevel(json.path("scoreLevel").asText(""));
             analysis.setEvaluationReason(json.path("evaluationReason").asText(""));
             analysis.setMissingInformation(json.path("missingInformation").asText(""));
-            analysis.setCvTextHash(HashUtil.sha256(text));
+            analysis.setCvTextHash(cvTextHash);
 
             cvAnalysisRepository.save(analysis);
 

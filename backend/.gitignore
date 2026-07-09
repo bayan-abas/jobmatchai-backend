@@ -36,3 +36,6 @@ build/
 .env
 .env.*
 !.env.example
+
+### Uploaded user files (CVs contain real personal data - never commit these) ###
+uploads/
