@@ -2,6 +2,8 @@ package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
 
+import java.time.LocalDateTime;
+
 @Entity
 @Table(name = "jobs")
 public class Job {
@@ -23,6 +25,9 @@ public class Job {
 
     private String requirements;
     private String skills;
+
+    @Column(name = "created_at", updatable = false)
+    private LocalDateTime createdAt;
 
     public Job() {}
 
@@ -119,5 +124,20 @@ public class Job {
 
     public void setSkills(String skills) {
         this.skills = skills;
+    }
+
+    public LocalDateTime getCreatedAt() {
+        return createdAt;
+    }
+
+    public void setCreatedAt(LocalDateTime createdAt) {
+        this.createdAt = createdAt;
+    }
+
+    @PrePersist
+    protected void onCreate() {
+        if (createdAt == null) {
+            createdAt = LocalDateTime.now();
+        }
     }
 }

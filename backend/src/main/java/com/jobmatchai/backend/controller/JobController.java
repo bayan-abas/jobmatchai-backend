@@ -50,7 +50,8 @@ public class JobController {
             String description,
             String requirements,
             String skills,
-            long applicantsCount
+            long applicantsCount,
+            String createdAt
     ) {}
 
     public record JobApplicantView(
@@ -63,6 +64,23 @@ public class JobController {
             String appliedDate,
             Integer matchPercent,
             String matchLabel
+    ) {}
+
+    public record JobDetailsView(
+            Long id,
+            String title,
+            String companyName,
+            String companyEmail,
+            String location,
+            String type,
+            String salary,
+            String description,
+            String requirements,
+            String skills,
+            String createdAt,
+            long applicantsCount,
+            Integer averageMatchScore,
+            String status
     ) {}
 
     @GetMapping("/test")
@@ -100,7 +118,8 @@ public class JobController {
                         job.getDescription(),
                         job.getRequirements(),
                         job.getSkills(),
-                        applicantCounts.getOrDefault(job.getId(), 0L)
+                        applicantCounts.getOrDefault(job.getId(), 0L),
+                        job.getCreatedAt() != null ? job.getCreatedAt().toString() : null
                 ))
                 .toList();
     }
@@ -151,6 +170,64 @@ public class JobController {
                 .toList();
 
         return ResponseEntity.ok(applicants);
+    }
+
+    @GetMapping("/{id}/company-details")
+    @PreAuthorize("hasRole('COMPANY')")
+    public ResponseEntity<?> getJobDetailsForCompany(@PathVariable Long id, Authentication authentication) {
+        Job job = jobRepository.findById(id).orElse(null);
+
+        if (job == null || !authentication.getName().equals(job.getCompanyEmail())) {
+            return ResponseEntity.status(404).body("Job not found");
+        }
+
+        List<Application> applications = applicationRepository.findByJobId(id);
+
+        // Same source/averaging as the company job postings list (getJobsByCompanyEmail +
+        // the client-side average in CompanyJobPostings.tsx) - the latest CandidateAiSummary
+        // per candidate for this job, never the separate candidate-facing JobMatchScore.
+        Integer averageMatchScore = null;
+        if (!applications.isEmpty()) {
+            List<String> candidateEmails = applications.stream().map(Application::getCandidateEmail).distinct().toList();
+            Map<String, CandidateAiSummary> summariesByEmail = new HashMap<>();
+            for (CandidateAiSummary summary : candidateAiSummaryRepository.findByCandidateEmailInAndJobIdIn(candidateEmails, List.of(id))) {
+                CandidateAiSummary existing = summariesByEmail.get(summary.getCandidateEmail());
+                if (existing == null || summary.getId() > existing.getId()) {
+                    summariesByEmail.put(summary.getCandidateEmail(), summary);
+                }
+            }
+
+            List<Integer> scores = summariesByEmail.values().stream()
+                    .map(CandidateAiSummary::getMatchScore)
+                    .filter(java.util.Objects::nonNull)
+                    .toList();
+
+            if (!scores.isEmpty()) {
+                averageMatchScore = (int) Math.round(scores.stream().mapToInt(Integer::intValue).average().orElse(0));
+            }
+        }
+
+        JobDetailsView view = new JobDetailsView(
+                job.getId(),
+                job.getTitle(),
+                job.getCompanyName(),
+                job.getCompanyEmail(),
+                job.getLocation(),
+                job.getType(),
+                job.getSalary(),
+                job.getDescription(),
+                job.getRequirements(),
+                job.getSkills(),
+                job.getCreatedAt() != null ? job.getCreatedAt().toString() : null,
+                applications.size(),
+                averageMatchScore,
+                // No status column exists on Job yet - every job is treated as Active
+                // everywhere else in the app (see CompanyJobPostings.tsx), so this mirrors
+                // that same convention rather than inventing a new value.
+                "Active"
+        );
+
+        return ResponseEntity.ok(view);
     }
 
     @PostMapping("/add")
