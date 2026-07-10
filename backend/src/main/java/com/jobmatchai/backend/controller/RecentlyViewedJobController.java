@@ -37,9 +37,11 @@ public class RecentlyViewedJobController {
                 return response;
             }
 
+            // jobTitle/companyName/location are still accepted in the request body for
+            // backward compatibility with the current frontend, but are no longer stored -
+            // recordView only needs the identity of what was viewed, not a snapshot of it.
             recentlyViewedJobService.recordView(
-                    authentication.getName(), request.jobId(), request.jobType(),
-                    request.jobTitle(), request.companyName(), request.location());
+                    authentication.getName(), request.jobId(), request.jobType());
 
             response.put("success", true);
             return response;

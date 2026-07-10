@@ -2,6 +2,8 @@ package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
 
+import java.time.LocalDateTime;
+
 @Entity
 @Table(name = "recently_viewed_jobs", uniqueConstraints = {
         @UniqueConstraint(columnNames = {"candidate_email", "job_id", "job_type"})
@@ -15,10 +17,20 @@ public class RecentlyViewedJob {
     private String candidateEmail;
     private Long jobId;
     private String jobType;
+
+    // Not persisted - derivable via a (jobId, jobType) join to Job/ExternalJob, and a
+    // "recently viewed" breadcrumb should reflect the job's current details anyway, not a
+    // snapshot from whenever it was viewed. Populated by RecentlyViewedJobService on read.
+    @Transient
     private String jobTitle;
+
+    @Transient
     private String companyName;
+
+    @Transient
     private String location;
-    private String viewedAt;
+
+    private LocalDateTime viewedAt;
 
     public RecentlyViewedJob() {}
 
@@ -74,11 +86,11 @@ public class RecentlyViewedJob {
         this.location = location;
     }
 
-    public String getViewedAt() {
+    public LocalDateTime getViewedAt() {
         return viewedAt;
     }
 
-    public void setViewedAt(String viewedAt) {
+    public void setViewedAt(LocalDateTime viewedAt) {
         this.viewedAt = viewedAt;
     }
 }

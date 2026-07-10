@@ -9,6 +9,7 @@ import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
 import com.jobmatchai.backend.util.HashUtil;
+import com.jobmatchai.backend.util.MatchLabelUtil;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -90,7 +91,7 @@ public class CandidateSummaryService {
 
             if (cached != null && !isStale) {
                 log.info("[AI-SUMMARY] candidate={} jobId={} -> cache HIT (matchScore={}, matchLabel={}); OpenAI NOT called",
-                        candidateEmail, job.getId(), cached.getMatchScore(), cached.getMatchLabel());
+                        candidateEmail, job.getId(), cached.getMatchScore(), MatchLabelUtil.fromScore(cached.getMatchScore()));
 
                 return toResult(cached);
             }
@@ -114,7 +115,6 @@ public class CandidateSummaryService {
 
             int matchScore = clampScore(json.path("matchScore").asInt(0));
             summary.setMatchScore(matchScore);
-            summary.setMatchLabel(deriveMatchLabel(matchScore));
 
             summary.setCvFingerprint(cvFingerprint);
             summary.setJobFingerprint(jobFingerprint);
@@ -122,7 +122,7 @@ public class CandidateSummaryService {
             CandidateAiSummary resolved = candidateAiSummaryRepository.save(summary);
 
             log.info("[AI-SUMMARY] candidate={} jobId={} -> generated and saved new matchScore={}, matchLabel={}",
-                    candidateEmail, job.getId(), resolved.getMatchScore(), resolved.getMatchLabel());
+                    candidateEmail, job.getId(), resolved.getMatchScore(), MatchLabelUtil.fromScore(resolved.getMatchScore()));
 
             return toResult(resolved);
         }
@@ -138,20 +138,12 @@ public class CandidateSummaryService {
                 resolved.getWeaknesses(),
                 resolved.getOverallSuitability(),
                 resolved.getMatchScore(),
-                resolved.getMatchLabel()
+                MatchLabelUtil.fromScore(resolved.getMatchScore())
         );
     }
 
     private int clampScore(int score) {
         return Math.max(0, Math.min(score, 100));
-    }
-
-    private String deriveMatchLabel(int score) {
-        if (score >= 85) return "Excellent Match";
-        if (score >= 70) return "Strong Match";
-        if (score >= 50) return "Moderate Match";
-        if (score >= 30) return "Weak Match";
-        return "Poor Match";
     }
 
     private JsonNode readObject(String result) {

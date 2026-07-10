@@ -16,7 +16,16 @@ public class ExternalJob {
     private String companyName;
 
     private String location;
+
+    // Not persisted - every import provider only ever fetches from the single configured
+    // country (externaljobs.import.country), and city was either an exact copy of location
+    // or unset depending on the provider, so neither was real per-row data worth storing.
+    // Populated by ExternalJobService when jobs are read, so the API response shape (and the
+    // frontend's country/city filters) stay exactly as they were.
+    @Transient
     private String country;
+
+    @Transient
     private String city;
 
     private String type;
@@ -27,6 +36,12 @@ public class ExternalJob {
 
     private String requirements;
     private String skills;
+
+    // One of frontend/src/utils/jobInference.ts's INDUSTRY_KEYS, resolved by the provider from
+    // its own category/occupation data at import time (see ExternalJobData.industry) - null
+    // when the provider gave no such signal, in which case the frontend falls back to
+    // title-based classification instead of guessing from this field.
+    private String industry;
 
     private String sourceName;
     private String sourceUrl;
@@ -120,6 +135,14 @@ public class ExternalJob {
 
     public void setSkills(String skills) {
         this.skills = skills;
+    }
+
+    public String getIndustry() {
+        return industry;
+    }
+
+    public void setIndustry(String industry) {
+        this.industry = industry;
     }
 
     public String getSourceName() {

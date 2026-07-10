@@ -29,6 +29,17 @@ public class OpenAICVAnalysisService {
     @Value("${openai.model}")
     private String model;
 
+    // computeJobMatches is called far more often, and at far higher volume per user action
+    // (one call per 10-job chunk, several chunks per page load), than the other single-shot
+    // calls in this class (analyzeCV, computeJobMatchDetail, computeCandidateSummary) - it's
+    // a bounded classification/scoring task (score N jobs against one profile, structured
+    // JSON out) rather than open-ended reasoning, so it doesn't need the flagship model. Using
+    // a smaller, faster model just for this call is what actually cuts the wall-clock wait for
+    // match percentages to appear, instead of only tuning chunk size/concurrency around the
+    // same slow model. Defaults to a distinct model but falls back to the main model if unset.
+    @Value("${openai.match-model:${openai.model}}")
+    private String matchModel;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private final RestClient restClient = RestClient.builder()
@@ -79,6 +90,7 @@ Core evaluation philosophy:
 - For non-technical careers, value reliability, responsibility, customer service, operations, safety, organization, leadership, communication, and field-specific practical expertise.
 - Missing technologies must never lower the score for non-software candidates.
 - The score should represent the overall strength of the candidate profile and CV presentation, not only ATS keyword density.
+- Career changers: a candidate's most recent PAID job is not automatically their field. When a degree (especially one in progress), coursework, technical skills, or stated career interests clearly point toward a different field than the candidate's work history, that is a career transition (careerStage "career_transition") - identify candidateField and professionTitle by what the candidate is now qualified for and actively pursuing (their education/skills/stated direction), not just their most recent job title. Example: someone working as a customer support agent while completing a Computer Science or Information Systems degree with real programming coursework (e.g. Java, Python, SQL, web development) is a software career-changer, not a permanent customer-support professional - their limited paid experience in the new field is a normal, expected part of transitioning, not a reason to discount the field itself.
 
 ABSOLUTE RULES:
 - Base every claim on something written in the CV. You may interpret professional meaning from job titles, dates, responsibilities, and industry context, but do not invent facts.
@@ -94,6 +106,10 @@ Return exactly this JSON structure:
   "careerStage": "",
   "estimatedYearsExperience": "",
   "skills": "",
+  "technicalSkills": "",
+  "softSkills": "",
+  "languages": "",
+  "previousJobTitles": "",
   "summary": "",
   "strengths": "",
   "missingSkills": "",
@@ -104,6 +120,7 @@ Return exactly this JSON structure:
   "portfolioDetailScore": 0,
   "educationEvidence": "",
   "certificationsEvidence": "",
+  "licensesEvidence": "",
   "leadershipEvidence": "",
   "communicationEvidence": "",
   "achievementEvidence": "",
@@ -114,7 +131,7 @@ Return exactly this JSON structure:
 
 Field instructions:
 
-1. candidateField: Identify the primary field based on the CV. Use exactly one English value:
+1. candidateField: Identify the field the candidate is qualified for and pursuing NOW, per the career-changer guidance above - not necessarily their most recent paid job. Use exactly one English value:
    "software", "construction", "healthcare", "education", "business", "finance", "legal", "trades", "hospitality", "manufacturing", "sales", "customer_support", "administration", "operations", "cleaning", "other".
 
 2. professionTitle: The best specific profession/title for this candidate, such as "Construction Manager", "Accountant", "Teacher", "Nurse", "Chef", "Cleaner", "Sales Representative", "Administrative Employee", "Software Developer".
@@ -123,11 +140,19 @@ Field instructions:
 
 4. estimatedYearsExperience: Use the CV dates/history. Return a short text such as "0-1", "2-4", "5-7", "8+", or "unclear but experienced".
 
-5. skills: A comma-separated list of skills and professional capabilities explicitly supported by the CV. Include field-specific practical skills and soft/professional skills when evidenced by roles or responsibilities. For example: site supervision, budgeting, lesson planning, patient care, food preparation, customer service, office administration, sales negotiation, team leadership.
+5. skills: A comma-separated list of skills and professional capabilities explicitly supported by the CV. Include field-specific practical skills and soft/professional skills when evidenced by roles or responsibilities. For example: site supervision, budgeting, lesson planning, patient care, food preparation, customer service, office administration, sales negotiation, team leadership. List named technologies, programming languages, tools, and platforms individually and by their exact name as written in the CV (e.g. "Java", "Python", "SQL", "HTML", "CSS", "JavaScript", "Node.js", "SAP S/4HANA") - never collapse them into a vague summary phrase like "software fundamentals" or "programming skills", since job matching later needs the exact names to compare against job requirements.
 
-6. summary: Write 4-5 warm, specific sentences directly to the candidate. Explain the profession you identified, career stage, what makes the profile valuable, and the main opportunity to improve. Mention concrete evidence from the CV.
+6. summary: Write 4-5 warm, specific sentences directly to the candidate. Explain the profession you identified, career stage, what makes the profile valuable, and the main opportunity to improve. Mention concrete evidence from the CV. If the candidate's education, certifications, or experience genuinely support more than one distinct professional field (e.g. a career changer with real credentials/experience in both an old and a new field, or someone dual-qualified in two professions), explicitly name every field they are genuinely qualified for, not just the single primary one - this profile is read by a job-matching system that needs to recognize all of it, not just the headline field.
 
-7. strengths: Write 5-7 sentences of natural prose, not bullets. Cover what the candidate is doing well, what makes them valuable, strongest qualifications, responsibilities, career progression, education/certifications, communication/leadership, and practical field experience where present. Tie each point to the candidate's actual CV.
+7. strengths: Write 5-7 sentences of natural prose, not bullets. Cover what the candidate is doing well, what makes them valuable, strongest qualifications, responsibilities, career progression, education/certifications, communication/leadership, and practical field experience where present. Tie each point to the candidate's actual CV. Make sure education, certifications, and languages are each mentioned explicitly if the CV shows them, even briefly - do not let them get absorbed into vague summary phrases.
+
+5b. technicalSkills: A comma-separated subset of "skills" above containing only hard/technical/domain-specific practical skills, named technologies, tools, and platforms (e.g. "Java", "Python", "patient charting systems", "AutoCAD", "SAP S/4HANA", "surgical suturing"). Exclude soft skills. "none" if the CV shows none.
+
+5c. softSkills: A comma-separated list of interpersonal/professional soft skills clearly evidenced by roles or responsibilities (e.g. "communication", "leadership", "teamwork", "customer service", "time management"). "none" if the CV shows none.
+
+5d. languages: A comma-separated list of spoken/written languages the candidate knows, with proficiency if stated (e.g. "English (fluent), Arabic (native), Hebrew (intermediate)"). "none" if not mentioned in the CV.
+
+5e. previousJobTitles: A comma-separated list of the candidate's past job titles/roles, in the exact wording used in the CV, most recent first. "none" if the CV shows no job titles.
 
 8. missingSkills: A comma-separated list of genuinely useful missing skills, certifications, or details for the detected profession only. Never suggest programming skills unless candidateField is "software". Do not include anything already present in the CV.
 
@@ -148,7 +173,9 @@ Field instructions:
 
 13. educationEvidence: exactly one of "none", "general", "relevant_degree".
 
-14. certificationsEvidence: exactly one of "none", "general", "field_relevant".
+14. certificationsEvidence: exactly one of "none", "general", "field_relevant". General professional certifications/courses/training, not a legal practice license.
+
+14b. licensesEvidence: exactly one of "none", "in_progress", "licensed". Specifically about a formal LEGAL LICENSE or registration required to practice a regulated profession - medical license, nursing registration/license, bar admission (law), teaching license/certification, professional engineering (PE) license, pharmacy license, pilot license, licensed electrician/contractor, CPA license, etc. "licensed" only if the CV states the candidate holds (or historically held) such a license/registration/degree that grants it (e.g. "M.D.", "licensed physician", "Registered Nurse (RN)", "admitted to the bar", "board-certified"). "in_progress" if currently studying for or awaiting that license (e.g. in medical/nursing/law school, residency, internship). "none" if the CV shows no evidence of a practice license for a regulated profession, or the candidate's profession does not require one.
 
 15. leadershipEvidence: exactly one of "none", "implicit", "clear", "strong".
     Give credit for management, supervision, training, responsibility for operations, leading teams, coordinating people, or senior roles.
@@ -236,7 +263,12 @@ CV Text:
             ObjectNode finalJson = objectMapper.createObjectNode();
 
             finalJson.put("candidateField", json.path("candidateField").asText("other"));
+            finalJson.put("professionTitle", json.path("professionTitle").asText(""));
             finalJson.put("skills", rawSkills);
+            finalJson.put("technicalSkills", json.path("technicalSkills").asText(""));
+            finalJson.put("softSkills", json.path("softSkills").asText(""));
+            finalJson.put("languages", json.path("languages").asText(""));
+            finalJson.put("previousJobTitles", json.path("previousJobTitles").asText(""));
             finalJson.put("summary", json.path("summary").asText(""));
             finalJson.put("strengths", json.path("strengths").asText(""));
             finalJson.put("missingSkills", filteredMissingStr);
@@ -245,6 +277,15 @@ CV Text:
             finalJson.put("scoreLevel", scoreLevel);
             finalJson.put("evaluationReason", evaluationReason);
             finalJson.put("missingInformation", json.path("cvQualityIssues").asText(""));
+            finalJson.put("educationEvidence", json.path("educationEvidence").asText(""));
+            finalJson.put("certificationsEvidence", json.path("certificationsEvidence").asText(""));
+            finalJson.put("licensesEvidence", json.path("licensesEvidence").asText(""));
+            finalJson.put("yearsOfExperience", json.path("estimatedYearsExperience").asText(""));
+            // professionalExperienceEvidence is already a fixed vocabulary (none/entry_level/
+            // mid_level/senior_level) - reused verbatim as experienceLevel, the value
+            // JobMatchService's deterministic experience-scoring formula compares against a
+            // job's required seniority, instead of trying to parse a free-text years string.
+            finalJson.put("experienceLevel", json.path("professionalExperienceEvidence").asText("none"));
 
             return objectMapper.writeValueAsString(finalJson);
 
@@ -380,61 +421,99 @@ Document text:
         };
     }
 
-    public String computeJobMatches(CVAnalysis analysis, List<Job> jobs, String language) {
+    // jobFingerprints/retryFeedback exist to support JobMatchService's per-job validation loop:
+    // jobFingerprints is the caller-computed (jobId + title + company + normalized title +
+    // content hash) fingerprint for each job, which the AI must echo back unchanged - this is
+    // what lets the caller detect a verdict that got attached to the wrong job internally, even
+    // within a single-job request (a garbled/omitted echo is itself a red flag). retryFeedback
+    // is null on the first attempt; on a validation-triggered retry it carries the caller's
+    // itemized complaints about the previous response, so the model corrects the SAME problems
+    // instead of the caller just hoping a second blind attempt happens to come out right.
+    public String computeJobMatches(
+            CVAnalysis analysis, List<Job> jobs, Map<Long, String> jobFingerprints,
+            String language, String retryFeedback) {
         try {
             if (jobs == null || jobs.isEmpty()) {
                 return "{\"matches\":[]}";
             }
 
-            List<Job> cappedJobs = jobs.size() > 50 ? jobs.subList(0, 50) : jobs;
+            // Deliberately small: batching many jobs into one prompt is what previously let the
+            // model attach one job's verdict to a different job's jobId. JobMatchService now
+            // defaults to one job per call; this cap is a hard backstop, not the primary control.
+            List<Job> cappedJobs = jobs.size() > 5 ? jobs.subList(0, 5) : jobs;
 
             String languageInstruction = switch (language == null ? "en" : language) {
-                case "ar" -> "Write every \"matchReason\" value entirely in Arabic. Keep skill names in \"matchedSkills\"/\"missingSkills\" as-is (do not translate skill/technology names).";
-                case "he" -> "Write every \"matchReason\" value entirely in Hebrew. Keep skill names in \"matchedSkills\"/\"missingSkills\" as-is (do not translate skill/technology names).";
+                case "ar" -> "Write every \"matchReason\" value entirely in Arabic. Keep skill names as-is (do not translate skill/technology names).";
+                case "he" -> "Write every \"matchReason\" value entirely in Hebrew. Keep skill names as-is (do not translate skill/technology names).";
                 default -> "Write every \"matchReason\" value in English.";
             };
+
+            String retryBlock = (retryFeedback == null || retryFeedback.isBlank())
+                    ? ""
+                    : "\nYOUR PREVIOUS RESPONSE FOR THIS REQUEST WAS REJECTED FOR THESE REASONS - FIX EVERY ONE OF THEM THIS TIME:\n"
+                            + retryFeedback + "\n";
 
             String prompt = """
 Return ONLY a raw valid JSON object. No markdown. No explanations outside the JSON.
 """ + languageInstruction + """
+""" + retryBlock + """
 
-You are an expert technical recruiter. Compare ONE candidate against MULTIPLE job postings and score how well the candidate fits EACH job independently.
+You are an expert technical recruiter. Compare ONE candidate against one or more job postings and score how well the candidate fits EACH job independently, using the candidate's STRUCTURED profile data below as the primary evidence - not just the free-text summary/strengths prose.
 
 CANDIDATE PROFILE:
 """ + buildCandidateProfileBlock(analysis) + """
 
 JOB POSTINGS TO SCORE (score each one independently, based only on its own requirements/skills/description):
-""" + buildJobsBlock(cappedJobs) + """
+""" + buildJobsBlock(cappedJobs, jobFingerprints) + """
 
-For EACH job listed above, FIRST decide "fieldRelated": set it to false ONLY if the candidate's profession/field and this job's profession/field are fundamentally unrelated — completely different professions where no meaningful skill/experience comparison is possible (e.g. a chef candidate vs. a lawyer job, a nurse candidate vs. a software engineer job, an accountant candidate vs. an electrician job). Set it to true for anything else, including jobs that are a weak or partial match within a related or comparable field.
+IMPORTANT - YOUR ROLE HERE: you are the ANALYST, not the CALCULATOR. You never invent a raw 0-100 fit number for anything below. For every judgment, you pick ONE label from a small fixed list - the backend then turns that label into a number using a fixed formula. This is what keeps the score for an unchanged candidate+job pair from drifting between requests: the same label always produces the same number, deterministically, outside of you.
 
-If "fieldRelated" is false for a job: set its matchPercent to null, matchedSkills and missingSkills to empty arrays, and matchReason to ONE short sentence explaining the field mismatch (e.g. "This job belongs to a completely different professional field."). Skip the scoring/classification steps below for that job.
+STEP 1 - fieldRelationCloseness (professional-FIELD relevance only, never "is this a perfect match"):
+This asks ONLY how closely related the candidate's documented professional field/background is to this job's profession. It is NOT asking whether the candidate is a great match, has every required skill, has enough experience, or holds the exact license this specific role prefers - those questions belong entirely to steps 2/3, which can and should come out low for a weak-but-related fit. A low score elsewhere is the correct outcome for a related-but-weak fit; "unrelated" here is reserved for genuinely different professions.
 
-If "fieldRelated" is true, evaluate fit based on: skills overlap, relevant experience/seniority match, field/domain match, and overall qualification for that specific job's requirements. Do not give every job a similar score — scores must vary meaningfully based on actual fit. A job requiring skills the candidate doesn't have should score low; a job matching the candidate's strongest skills and experience should score high. If a job does not name any specific education requirement (e.g. cashier, sales assistant, cleaner, warehouse worker, driver, waiter/waitress, security guard, barista, courier roles), do not penalize the candidate for education at all when scoring that job — judge purely on skills/experience/domain fit.
+Weigh the candidate's ENTIRE structured profile - Profession title, Candidate field, Previous job titles, Technical/soft skills, Education evidence, Certifications evidence, Licenses evidence, and the free-text summary/strengths - together. Never decide this from a single data point in isolation.
 
-Also classify EACH skill listed in that job's "Required skills" line into either matchedSkills or missingSkills:
-- Treat a job skill as MATCHED if the candidate's skills/summary/strengths show they clearly have that skill OR a reasonable equivalent — even if worded, abbreviated, or formatted differently (e.g. "JS" = "JavaScript", "React.js" = "React", "Postgres" = "PostgreSQL", "Node" = "Node.js", translated/synonymous terms, common abbreviations, or a broader skill that clearly implies it).
-- Treat a job skill as MISSING only if the candidate shows no reasonable evidence of that skill or an equivalent.
-- Every skill from that job's "Required skills" line must appear in exactly one of matchedSkills or missingSkills, using the EXACT wording from the job's "Required skills" line (do not rewrite/rename it).
-- If a job has no listed skills, both arrays should be empty for that job.
+Choose exactly one of:
+- "same_role": the job is the same specific profession/title as the candidate's (e.g. a licensed doctor CV against a "Physician" job).
+- "same_specialization": same specific profession, different seniority or sub-specialty (e.g. doctor CV against a specific medical specialty role, or a general "Healthcare"/clinical support role for a doctor).
+- "same_broad_field": related but a genuinely different specific role/license within the same broad field - the field/domain knowledge transfers, but the exact credential does not (e.g. a doctor CV against a "Nurse" job - both medicine, different license; an Information Systems graduate against a Junior QA/Automation Engineer, Support Engineer, ERP, or CRM implementation job - both IT, different specific role).
+- "unrelated": genuinely different professions with no meaningful skill/knowledge transfer, OR a role that legally requires a specific license/degree the candidate's Education/Certifications/Licenses evidence shows no relevant credential for at all (e.g. a doctor CV against a "Software Developer" job with no software education/skills evidence; an Information Systems graduate against a "Senior Surgeon" job; a chef CV against a lawyer job).
+
+If a candidate's structured profile shows real evidence (education, credentials, meaningful experience, or a described career transition) supporting a field OTHER than the primary "Candidate field" label, judge closeness against THAT field too - a candidate can be genuinely qualified in more than one field at once.
+
+If fieldRelationCloseness is "unrelated" for a job: skip STEP 2/3 entirely for that job - leave every skill array empty and every required* field null, and write matchReason as ONE sentence that names BOTH the candidate's actual field/profession AND this job's actual profession (e.g. "Your background is in accounting, and this Electrician role requires a licensed trade unrelated to your field.") - never reuse a generic template sentence verbatim, it must read as specific to this exact candidate and this exact job.
+
+STEP 2 - if fieldRelationCloseness is NOT "unrelated", classify this job's required skills (from its Required skills / Requirements / Description text):
+- For each skill/requirement the posting lists, decide if it reads as MANDATORY (required, must-have, essential) or PREFERRED (nice-to-have, a plus, preferred, bonus) - if the posting gives no such cue, treat it as MANDATORY by default.
+- matchedMandatorySkills / missingMandatorySkills: every MANDATORY skill, matched if the candidate's technical/soft skills or summary/strengths show that skill or a reasonable equivalent (abbreviations, translations, synonyms, or a broader skill that clearly implies it count as matched), missing otherwise.
+- matchedPreferredSkills / missingPreferredSkills: same classification for PREFERRED skills.
+- Use the EXACT wording from the job's skill/requirement text. Every skill must appear in exactly one of the four arrays. Empty arrays if the job lists no skills.
+
+STEP 3 - classify these three job requirements ONLY if the posting actually states or clearly implies them; otherwise leave the field null/absent (a null requirement is excluded from the final score entirely, not treated as "candidate fails it"):
+- requiredExperienceLevel: exactly one of "entry", "mid", "senior", or null if the posting states no seniority/years-of-experience expectation. A junior candidate applying to a senior posting in their own field should get "senior" here (which the backend will score appropriately low) - this must never influence fieldRelationCloseness.
+- requiredEducationLevel: exactly one of "any_degree" (posting wants a degree, field unspecified), "relevant_degree" (posting wants a degree IN this specific field), or null if no degree is required. Never set this for general/vocational roles (cashier, retail, warehouse, driver, cleaner, security guard, etc.).
+- requiredCertificationLevel: exactly one of "general_cert" (posting wants some relevant certification), "specific_license" (posting legally requires a named practice license, e.g. medical/nursing/bar/PE license), or null if neither is required. A missing certification/license here must lower ITS OWN score, not flip fieldRelationCloseness away from a shared broad field (e.g. doctor vs. nurse job above).
 
 Return exactly this JSON structure:
 {
   "matches": [
-    { "jobId": 0, "fieldRelated": true, "matchPercent": 0, "matchReason": "", "matchedSkills": [], "missingSkills": [] }
+    { "jobId": 0, "jobTitle": "", "jobFingerprint": "", "fieldRelationCloseness": "unrelated", "matchReason": "",
+      "matchedMandatorySkills": [], "missingMandatorySkills": [], "matchedPreferredSkills": [], "missingPreferredSkills": [],
+      "requiredExperienceLevel": null, "requiredEducationLevel": null, "requiredCertificationLevel": null }
   ]
 }
 
 Rules:
-- fieldRelated: boolean, per the rule above.
-- matchPercent: integer 0-100 when fieldRelated is true; null when fieldRelated is false.
-- matchReason: ONE concise sentence (max ~20 words) explaining the score (or the field mismatch), written directly to the candidate ("you").
-- matchedSkills / missingSkills: arrays of strings, exact wording from the job's skill list, no duplicates between the two arrays. Empty arrays when fieldRelated is false.
+- jobTitle: copy the EXACT "Title:" value given for that jobId above, unchanged.
+- jobFingerprint: copy the EXACT "Fingerprint:" value given for that jobId above, unchanged. Both jobTitle and jobFingerprint are cross-checks, not scoring inputs - they are what lets the caller catch a verdict that got attached to the wrong job internally, so get them exactly right, character for character.
+- fieldRelationCloseness: exactly one of "same_role", "same_specialization", "same_broad_field", "unrelated" - never any other value.
+- matchReason: ONE concise sentence (max ~25 words), SPECIFIC to this exact job and candidate (name the actual job title/profession involved - never reuse a generic stock phrase across different jobs), written directly to the candidate ("you").
+- requiredExperienceLevel/requiredEducationLevel/requiredCertificationLevel: use null (not a placeholder string) when the posting gives no signal for that requirement.
 - Include exactly one entry per job listed above, using the exact jobId given.
 """;
 
             Map<String, Object> body = Map.of(
-                    "model", model,
+                    "model", matchModel,
                     "input", prompt,
                     "store", false,
                     "temperature", 0,
@@ -451,17 +530,47 @@ Rules:
             return result;
 
         } catch (Exception e) {
+            // Swallowed on purpose (caller falls back to "no score yet" for this batch and
+            // retries on the next request), but log it - otherwise a transient OpenAI failure
+            // (rate limit, timeout, truncated JSON) silently drops every job in this batch
+            // with zero trace of why.
+            e.printStackTrace();
             return "{\"matches\":[]}";
         }
     }
 
-    public String computeJobMatchDetail(CVAnalysis analysis, Job job, String language) {
+    // matchPercent/matchedSkills/missingSkills/fieldRelevance/experience/education/certification/
+    // location scores are all GIVEN, not computed here - they come from JobMatchService's core,
+    // backend-weighted computation (see MatchScoreCalculator), which is the single source of
+    // truth shown on the job card. This method only fills in the narrative explanation (plus
+    // languageMatchPercent, which is informational and not part of the weighted score) anchored
+    // to that already-decided number, instead of a second, independently-judged score for the
+    // same job.
+    public String computeJobMatchDetail(
+            CVAnalysis analysis, Job job, String language,
+            int matchPercent, List<String> matchedSkills, List<String> missingSkills) {
         try {
             String languageInstruction = switch (language == null ? "en" : language) {
-                case "ar" -> "Write every text field (matchReason, whyGoodMatch, whyNotPerfectMatch, improvementSuggestions, recommendation) entirely in Arabic. Keep skill names in matchedSkills/missingSkills as-is (do not translate skill/technology names).";
-                case "he" -> "Write every text field (matchReason, whyGoodMatch, whyNotPerfectMatch, improvementSuggestions, recommendation) entirely in Hebrew. Keep skill names in matchedSkills/missingSkills as-is (do not translate skill/technology names).";
+                case "ar" -> "Write every text field (whyGoodMatch, whyNotPerfectMatch, improvementSuggestions, recommendation) entirely in Arabic.";
+                case "he" -> "Write every text field (whyGoodMatch, whyNotPerfectMatch, improvementSuggestions, recommendation) entirely in Hebrew.";
                 default -> "Write every text field in English.";
             };
+
+            String matchedSkillsText = matchedSkills.isEmpty() ? "none" : String.join(", ", matchedSkills);
+            String missingSkillsText = missingSkills.isEmpty() ? "none" : String.join(", ", missingSkills);
+
+            // Built with plain concatenation (not a text block) since it interpolates
+            // matchPercent mid-sentence in several places - a text block's closing/reopening
+            // """ must be followed by a line break, so it can't sit mid-line like this.
+            String givenScoreBlock =
+                    "This candidate's overall match for this job has ALREADY been determined: " + matchPercent + "% match.\n"
+                    + "Already-matched skills: " + matchedSkillsText + "\n"
+                    + "Already-identified missing skills: " + missingSkillsText + "\n\n"
+                    + "Your job is NOT to re-decide the overall fit or the matched/missing skill lists - those are fixed and given above. "
+                    + "Build a detailed, honest, personalized breakdown and explanation that is fully CONSISTENT with this exact " + matchPercent + "% score. "
+                    + "Do not write anything that implies a meaningfully higher or lower fit than " + matchPercent + "% - if the score is low, "
+                    + "whyGoodMatch/recommendation should not read as if this were a strong match, and if the score is high, whyNotPerfectMatch "
+                    + "should focus on minor gaps rather than implying a poor fit.";
 
             String prompt = """
 Return ONLY a raw valid JSON object. No markdown. No explanations outside the JSON.
@@ -475,29 +584,13 @@ CANDIDATE PROFILE:
 JOB POSTING:
 """ + buildSingleJobBlock(job) + """
 
-FIRST decide "fieldRelated": set it to false ONLY if the candidate's profession/field and this job's profession/field are fundamentally unrelated — completely different professions where no meaningful skill/experience comparison is possible (e.g. a chef candidate vs. a lawyer job, a nurse candidate vs. a software engineer job, an accountant candidate vs. an electrician job). Set it to true for anything else, including a weak or partial match within a related or comparable field.
+""" + givenScoreBlock + """
 
-If "fieldRelated" is false: set matchPercent and skillsMatchPercent/experienceMatchPercent/educationMatchPercent/languageMatchPercent all to null, matchedSkills/missingSkills/whyGoodMatch/improvementSuggestions to empty arrays, matchReason to ONE short sentence explaining the field mismatch (e.g. "This job belongs to a completely different professional field."), whyNotPerfectMatch to one or two bullet points briefly noting the field mismatch (not skill gaps), recommendation to a short note that a meaningful evaluation isn't possible for this job, and shouldApply to false. Skip everything below for that job.
-
-If "fieldRelated" is true, evaluate this candidate against this job thoroughly and honestly, the same way a senior recruiter would coach the candidate one-on-one.
-
-Classify EACH skill listed in the job's "Required skills" line into either matchedSkills or missingSkills:
-- Treat a job skill as MATCHED if the candidate's skills/summary/strengths show they clearly have that skill OR a reasonable equivalent — even if worded, abbreviated, or formatted differently (e.g. "JS" = "JavaScript", "React.js" = "React", "Postgres" = "PostgreSQL", "Node" = "Node.js", translated/synonymous terms, common abbreviations, or a broader skill that clearly implies it).
-- Treat a job skill as MISSING only if the candidate shows no reasonable evidence of that skill or an equivalent.
-- Every skill from the job's "Required skills" line must appear in exactly one of matchedSkills or missingSkills, using the EXACT wording from that line.
-- If the job has no listed skills, both arrays should be empty.
+Evaluate this candidate against this job thoroughly and honestly, the same way a senior recruiter would coach the candidate one-on-one.
 
 Return exactly this JSON structure:
 {
-  "fieldRelated": true,
-  "matchPercent": 0,
-  "skillsMatchPercent": 0,
-  "experienceMatchPercent": 0,
-  "educationMatchPercent": 0,
   "languageMatchPercent": 0,
-  "matchReason": "",
-  "matchedSkills": [],
-  "missingSkills": [],
   "whyGoodMatch": ["", ""],
   "whyNotPerfectMatch": ["", ""],
   "improvementSuggestions": ["", ""],
@@ -506,19 +599,13 @@ Return exactly this JSON structure:
 }
 
 Rules:
-- fieldRelated: boolean, per the rule above.
-- matchPercent: integer 0-100, your holistic overall score, consistent with the matchedSkills/missingSkills classification and broadly in line with the four breakdown scores below (does not need to be their exact average).
-- skillsMatchPercent: integer 0-100, how well the candidate's skills specifically cover this job's required skills.
-- experienceMatchPercent: integer 0-100, how well the candidate's years/seniority/type of experience matches what this job needs.
-- educationMatchPercent: integer 0-100, how well the candidate's education/certifications match what this job needs. If the job has no explicit education requirement (e.g. cashier, sales assistant, cleaner, warehouse worker, driver, waiter/waitress, security guard, barista, courier roles), default to a high score (80+) rather than a neutral/low one — never let a missing education requirement pull this score down.
 - languageMatchPercent: integer 0-100, how well the candidate's language/communication skills match what this job needs (if no language requirement is evident, score based on general communication evidence in the profile, defaulting to a reasonable score rather than 0).
-- matchReason: ONE concise sentence (max ~20 words) explaining the score, written directly to the candidate ("you").
-- matchedSkills / missingSkills: arrays of strings, exact wording from the job's skill list, no duplicates between the two arrays.
+- recommendation: 2-3 sentences giving a clear, personal apply-or-not recommendation with reasoning, written directly to the candidate ("you"), consistent with the given """ + matchPercent + """
+% score.
 - whyGoodMatch: 2-4 short bullet points, each written directly to the candidate ("you"), citing concrete evidence from the candidate profile.
-- whyNotPerfectMatch: 2-4 short bullet points explaining honestly what keeps this from being a perfect match. If matchPercent is very high, it is fine for this to focus on minor gaps.
+- whyNotPerfectMatch: 2-4 short bullet points explaining honestly what keeps this from being a perfect match. If the given score is very high, it is fine for this to focus on minor gaps.
 - improvementSuggestions: 2-4 concrete, actionable bullet points on what the candidate could do to become a stronger fit for this exact job.
-- recommendation: 2-3 sentences giving a clear, personal apply-or-not recommendation with reasoning, written directly to the candidate ("you").
-- shouldApply: true if you would recommend applying despite any gaps, false only if the mismatch is severe.
+- shouldApply: true if the given score and analysis support applying despite any gaps, false only if the mismatch is severe.
 """;
 
             Map<String, Object> body = Map.of(
@@ -687,25 +774,49 @@ Rules:
         }
     }
 
+    // Every field here is a PERSISTED, structured value from the CV-analysis step - never
+    // something the job matcher has to infer solely from free-text prose. This is what lets the
+    // regulated-profession fieldRelated guardrail actually check "does this candidate have a
+    // relevant license" instead of hoping the summary paragraph happened to mention one.
     private String buildCandidateProfileBlock(CVAnalysis analysis) {
         return """
-Field: %s
-Skills: %s
-Experience summary: %s
-Strengths: %s
+Candidate field (broad label - the candidate's real background may span more than this one field; read the fields below for the full picture): %s
+Profession title: %s
+Years of experience: %s
+Experience level (none / entry_level / mid_level / senior_level): %s
+Previous job titles (most recent first): %s
+Technical skills: %s
+Soft skills: %s
+Languages: %s
+Education evidence (none / general / relevant_degree): %s
+Certifications evidence (none / general / field_relevant): %s
+Licenses evidence - formal legal practice license/registration for a regulated profession, e.g. medical license, nursing registration, bar admission, PE license (none / in_progress / licensed): %s
+Summary (career stage, education, and overall profile): %s
+Strengths (qualifications, education/certifications, career progression, and field-specific experience): %s
 Missing skills: %s
+Roles a career advisor already identified as a good fit for this candidate (strong signal for fieldRelated - if a job posting's title/role closely matches one of these, that is direct evidence supporting fieldRelated=true even if the candidate's most recent paid job was in an unrelated field, e.g. a career changer): %s
 Overall CV score: %s
 """.formatted(
                 nullToNA(analysis.getCandidateField()),
-                nullToNA(analysis.getSkills()),
+                nullToNA(analysis.getProfessionTitle()),
+                nullToNA(analysis.getYearsOfExperience()),
+                nullToNA(analysis.getExperienceLevel()),
+                nullToNA(analysis.getPreviousJobTitles()),
+                nullToNA(analysis.getTechnicalSkills()),
+                nullToNA(analysis.getSoftSkills()),
+                nullToNA(analysis.getLanguages()),
+                nullToNA(analysis.getEducationEvidence()),
+                nullToNA(analysis.getCertificationsEvidence()),
+                nullToNA(analysis.getLicensesEvidence()),
                 nullToNA(analysis.getSummary()),
                 nullToNA(analysis.getStrengths()),
                 nullToNA(analysis.getMissingSkills()),
+                nullToNA(analysis.getRecommendedRoles()),
                 nullToNA(analysis.getOverallScore())
         );
     }
 
-    private String buildJobsBlock(List<Job> jobs) {
+    private String buildJobsBlock(List<Job> jobs, Map<Long, String> jobFingerprints) {
         StringBuilder sb = new StringBuilder();
 
         for (Job job : jobs) {
@@ -714,9 +825,13 @@ Overall CV score: %s
                 description = description.substring(0, 500);
             }
 
+            String fingerprint = jobFingerprints == null ? null : jobFingerprints.get(job.getId());
+
             sb.append("---\n")
                     .append("jobId: ").append(job.getId()).append("\n")
+                    .append("Fingerprint: ").append(nullToNA(fingerprint)).append("\n")
                     .append("Title: ").append(nullToNA(job.getTitle())).append("\n")
+                    .append("Company: ").append(nullToNA(job.getCompanyName())).append("\n")
                     .append("Type: ").append(nullToNA(job.getType())).append("\n")
                     .append("Location: ").append(nullToNA(job.getLocation())).append("\n")
                     .append("Required skills: ").append(nullToNA(job.getSkills())).append("\n")
@@ -729,6 +844,10 @@ Overall CV score: %s
 
     private String nullToNA(String value) {
         return (value == null || value.isBlank()) ? "N/A" : value;
+    }
+
+    private String nullToNA(Integer value) {
+        return value == null ? "N/A" : String.valueOf(value);
     }
 
     private int parseConfidence(JsonNode confidenceNode) {

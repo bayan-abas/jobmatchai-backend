@@ -1,14 +1,23 @@
 package com.jobmatchai.backend.config;
 
+import com.jobmatchai.backend.model.User;
+import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.security.JwtAuthenticationFilter;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 import org.springframework.web.cors.CorsConfiguration;
@@ -18,7 +27,17 @@ import jakarta.servlet.http.HttpServletResponse;
 
 import java.util.List;
 
+// @EnableWebSecurity is what makes Spring Boot treat this class's SecurityFilterChain as the
+// application's real web security configuration; without it (and without any other
+// UserDetailsService/AuthenticationManager/AuthenticationProvider bean in the context - see
+// userDetailsService()/authenticationManager() below), Spring Boot's
+// UserDetailsServiceAutoConfiguration falls back to generating its own single in-memory user
+// with a random logged password and wires the default AuthenticationManager to it - which is
+// exactly the "Using generated security password" / "inMemoryUserDetailsManager" log output
+// this class exists to prevent, and which causes every real request (including /api/auth/login,
+// even though it's permitAll() below) to be evaluated against the wrong, empty user store.
 @Configuration
+@EnableWebSecurity
 @EnableMethodSecurity
 public class SecurityConfig {
 
@@ -54,6 +73,46 @@ public class SecurityConfig {
                 .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
 
         return http.build();
+    }
+
+    // Backs the framework's AuthenticationManager with the real users table instead of Spring
+    // Boot's auto-generated single in-memory user. The app's own /api/auth/login flow
+    // (AuthService) checks credentials manually against UserRepository + BCrypt and never calls
+    // through this bean directly - JwtAuthenticationFilter is what actually authenticates every
+    // other request, straight from the JWT's signed claims, with no UserDetailsService lookup
+    // needed. This bean's job is purely to give Spring Security a real UserDetailsService so it
+    // stops substituting the fake one (and to have one wired correctly for any future code -
+    // e.g. an @PreAuthorize check or a manager-based login path - that does need it).
+    @Bean
+    public UserDetailsService userDetailsService(UserRepository userRepository) {
+        return email -> {
+            User user = userRepository.findByEmail(email);
+            if (user == null) {
+                throw new UsernameNotFoundException("No user found for email: " + email);
+            }
+
+            String role = user.getRole() != null ? user.getRole().toUpperCase() : "CANDIDATE";
+
+            return org.springframework.security.core.userdetails.User
+                    .withUsername(user.getEmail())
+                    .password(user.getPassword())
+                    .authorities("ROLE_" + role)
+                    .build();
+        };
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    // Standard Spring Security pattern: this assembles the real AuthenticationManager from
+    // whatever UserDetailsService/PasswordEncoder beans exist in the context (the ones defined
+    // above), rather than letting Spring Boot autoconfigure one against the generated in-memory
+    // user.
+    @Bean
+    public AuthenticationManager authenticationManager(AuthenticationConfiguration configuration) throws Exception {
+        return configuration.getAuthenticationManager();
     }
 
     @Bean

@@ -37,9 +37,6 @@ public class CandidateAiSummary {
     @Column(name = "match_score")
     private Integer matchScore;
 
-    @Column(name = "match_label")
-    private String matchLabel;
-
     @Column(name = "cv_fingerprint")
     private String cvFingerprint;
 
@@ -120,14 +117,6 @@ public class CandidateAiSummary {
 
     public void setMatchScore(Integer matchScore) {
         this.matchScore = matchScore;
-    }
-
-    public String getMatchLabel() {
-        return matchLabel;
-    }
-
-    public void setMatchLabel(String matchLabel) {
-        this.matchLabel = matchLabel;
     }
 
     public String getCvFingerprint() {

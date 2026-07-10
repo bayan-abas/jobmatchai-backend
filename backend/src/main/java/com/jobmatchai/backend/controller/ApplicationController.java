@@ -12,9 +12,11 @@ import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.CandidateSummaryService;
 import com.jobmatchai.backend.service.NotificationService;
+import com.jobmatchai.backend.util.MatchLabelUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
@@ -86,17 +88,6 @@ public class ApplicationController {
             Map<String, String> preInterviewAnswers
     ) {}
 
-    // CandidateAiSummary (the "AI Summary" feature) is the single source of truth for the
-    // score/label shown on candidate cards. It must never be mixed with JobMatchScore (the
-    // separate candidate-facing "Job Matches" feature, a different OpenAI prompt entirely) -
-    // doing so previously caused the card to show one AI evaluation while "AI Summary"
-    // showed another, and the value would jump the moment a summary was generated.
-    private CandidateAiSummary resolveCachedSummary(String candidateEmail, Long jobId) {
-        return candidateAiSummaryRepository
-                .findFirstByCandidateEmailAndJobIdOrderByIdDesc(candidateEmail, jobId)
-                .orElse(null);
-    }
-
     private Map<String, String> parsePreInterviewAnswers(String json) {
         if (json == null || json.isBlank()) {
             return Map.of();
@@ -109,6 +100,12 @@ public class ApplicationController {
         }
     }
 
+    // CandidateAiSummary (the "AI Summary" feature) is the single source of truth for the
+    // score/label shown on candidate cards. It must never be mixed with JobMatchScore (the
+    // separate candidate-facing "Job Matches" feature, a different OpenAI prompt entirely) -
+    // doing so previously caused the card to show one AI evaluation while "AI Summary"
+    // showed another, and the value would jump the moment a summary was generated.
+    //
     // Keyed by "candidateEmail::jobId" so a batch of summaries fetched with one query
     // (findByCandidateEmailInAndJobIdIn) can be looked up the same way per-item queries
     // were before, without hitting the database once per row in a list endpoint - against
@@ -154,7 +151,7 @@ public class ApplicationController {
                             application.getStatus(),
                             application.getAppliedDate(),
                             summary != null ? summary.getMatchScore() : null,
-                            summary != null ? summary.getMatchLabel() : null,
+                            summary != null ? MatchLabelUtil.fromScore(summary.getMatchScore()) : null,
                             application.isViewedByCompany(),
                             parsePreInterviewAnswers(application.getPreInterviewAnswersJson())
                     );
@@ -225,7 +222,6 @@ public class ApplicationController {
             // Starts in automated AI screening; only moves to "Under Review" once the company
             // actually opens it (see markViewed below).
             application.setStatus("AI Screening");
-            application.setAppliedDate(LocalDate.now().toString());
             application.setCreatedAt(LocalDateTime.now());
 
             if (request.preInterviewAnswers() != null && !request.preInterviewAnswers().isEmpty()) {
@@ -234,12 +230,35 @@ public class ApplicationController {
 
             Application savedApplication = applicationRepository.save(application);
 
+            notificationService.createNotification(
+                    candidateEmail,
+                    "Application Submitted",
+                    "Your application for " + job.getTitle() + " at " + job.getCompanyName() + " has been submitted.",
+                    "APPLICATION_SUBMITTED"
+            );
+
+            if (job.getCompanyEmail() != null && !job.getCompanyEmail().isBlank()) {
+                notificationService.createNotification(
+                        job.getCompanyEmail(),
+                        "New Applicant",
+                        (candidate != null ? candidate.getName() : "A candidate") + " applied for " + job.getTitle() + ".",
+                        "APPLICATION_SUBMITTED"
+                );
+            }
+
             response.put("success", true);
             response.put("message", "Application submitted successfully");
             response.put("application", savedApplication);
 
             return response;
 
+        } catch (DataIntegrityViolationException e) {
+            // Backstop for the check-then-insert race above (see the unique constraint on
+            // Application) - a double-click or overlapping request lands here instead of
+            // creating a duplicate row.
+            response.put("success", false);
+            response.put("message", "You already applied to this job");
+            return response;
         } catch (Exception e) {
             response.put("success", false);
             response.put("message", e.getMessage());
@@ -374,19 +393,24 @@ public class ApplicationController {
                 return response;
             }
 
-            return applicationRepository.findById(id)
-                    .map(application -> {
-                        applicationRepository.deleteById(id);
+            boolean isCompany = authentication.getName().equals(existing.getCompanyEmail());
+            applicationRepository.deleteById(id);
 
-                        response.put("success", true);
-                        response.put("message", "Application deleted successfully");
-                        return response;
-                    })
-                    .orElseGet(() -> {
-                        response.put("success", false);
-                        response.put("message", "Application not found");
-                        return response;
-                    });
+            // A company removing an application otherwise vanishes it from the candidate's
+            // list with no trace - let them know instead of it silently disappearing.
+            if (isCompany) {
+                notificationService.createNotification(
+                        existing.getCandidateEmail(),
+                        "Application Removed",
+                        "Your application for " + existing.getJobTitle() + " at " + existing.getCompanyName()
+                                + " was removed by the company.",
+                        "APPLICATION_REMOVED"
+                );
+            }
+
+            response.put("success", true);
+            response.put("message", "Application deleted successfully");
+            return response;
 
         } catch (Exception e) {
             response.put("success", false);

@@ -1,7 +1,9 @@
 package com.jobmatchai.backend.controller;
 
 import com.jobmatchai.backend.model.CVAnalysis;
+import com.jobmatchai.backend.model.CVAnalysisCache;
 import com.jobmatchai.backend.model.User;
+import com.jobmatchai.backend.repository.CVAnalysisCacheRepository;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.CVTextExtractorService;
@@ -26,6 +28,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Map;
+import java.util.Optional;
 
 @RestController
 @RequestMapping("/api/cv")
@@ -42,6 +45,18 @@ public class CVController {
 
     @Autowired
     private CVAnalysisRepository cvAnalysisRepository;
+
+    @Autowired
+    private CVAnalysisCacheRepository cvAnalysisCacheRepository;
+
+    // Bump this whenever the analyzeCV prompt changes materially (mirrors JobMatchService's
+    // MATCH_SCHEMA_VERSION pattern) - keeps a prompt improvement from being silently masked by
+    // stale cached results for CV content that was already analyzed under the old prompt.
+    // v3 added the structured evidence fields (professionTitle, educationEvidence,
+    // certificationsEvidence, licensesEvidence, yearsOfExperience, technicalSkills, softSkills,
+    // languages, previousJobTitles) the job matcher now relies on instead of free-text prose -
+    // any CV analyzed under v2 has all of those as null/blank, so it must be recomputed.
+    private static final String ANALYSIS_PROMPT_VERSION = "v3-structured-evidence";
 
     @Value("${app.upload.dir:uploads/cvs/}")
     private String uploadDir;
@@ -414,6 +429,44 @@ public class CVController {
                 return ResponseEntity.ok(analysis);
             }
 
+            // Durable, content-addressable cache that survives CV deletion (unlike the
+            // per-user CVAnalysis row above, which deleteCV removes entirely). The exact same
+            // file re-uploaded after a delete hashes to the exact same value, so a hit here
+            // gives byte-identical results instead of relying on the AI to reproduce the same
+            // output for the same input - which the OpenAI Responses API this app uses does
+            // not guarantee (it has no seed parameter, unlike the Chat Completions API).
+            Optional<CVAnalysisCache> cached = cvAnalysisCacheRepository
+                    .findByCvTextHashAndLanguageAndPromptVersion(cvTextHash, language, ANALYSIS_PROMPT_VERSION);
+
+            if (cached.isPresent()) {
+                CVAnalysisCache hit = cached.get();
+                analysis.setUserEmail(email);
+                analysis.setCandidateField(hit.getCandidateField());
+                analysis.setProfessionTitle(hit.getProfessionTitle());
+                analysis.setSkills(hit.getSkills());
+                analysis.setTechnicalSkills(hit.getTechnicalSkills());
+                analysis.setSoftSkills(hit.getSoftSkills());
+                analysis.setLanguages(hit.getLanguages());
+                analysis.setPreviousJobTitles(hit.getPreviousJobTitles());
+                analysis.setSummary(hit.getSummary());
+                analysis.setStrengths(hit.getStrengths());
+                analysis.setMissingSkills(hit.getMissingSkills());
+                analysis.setRecommendedRoles(hit.getRecommendedRoles());
+                analysis.setOverallScore(hit.getOverallScore());
+                analysis.setEvaluationReason(hit.getEvaluationReason());
+                analysis.setMissingInformation(hit.getMissingInformation());
+                analysis.setEducationEvidence(hit.getEducationEvidence());
+                analysis.setCertificationsEvidence(hit.getCertificationsEvidence());
+                analysis.setLicensesEvidence(hit.getLicensesEvidence());
+                analysis.setYearsOfExperience(hit.getYearsOfExperience());
+                analysis.setExperienceLevel(hit.getExperienceLevel());
+                analysis.setCvTextHash(cvTextHash);
+
+                cvAnalysisRepository.save(analysis);
+
+                return ResponseEntity.ok(analysis);
+            }
+
             String aiResult = openAICVAnalysisService.analyzeCV(text, language);
             JsonNode json = objectMapper.readTree(aiResult);
 
@@ -431,18 +484,55 @@ public class CVController {
 
             analysis.setUserEmail(email);
             analysis.setCandidateField(json.path("candidateField").asText(""));
+            analysis.setProfessionTitle(json.path("professionTitle").asText(""));
             analysis.setSkills(json.path("skills").asText(""));
+            analysis.setTechnicalSkills(json.path("technicalSkills").asText(""));
+            analysis.setSoftSkills(json.path("softSkills").asText(""));
+            analysis.setLanguages(json.path("languages").asText(""));
+            analysis.setPreviousJobTitles(json.path("previousJobTitles").asText(""));
             analysis.setSummary(json.path("summary").asText(""));
             analysis.setStrengths(json.path("strengths").asText(""));
             analysis.setMissingSkills(json.path("missingSkills").asText(""));
             analysis.setRecommendedRoles(json.path("recommendedRoles").asText(""));
-            analysis.setOverallScore(json.path("overallScore").asText(""));
-            analysis.setScoreLevel(json.path("scoreLevel").asText(""));
+            analysis.setOverallScore(json.path("overallScore").asInt());
             analysis.setEvaluationReason(json.path("evaluationReason").asText(""));
             analysis.setMissingInformation(json.path("missingInformation").asText(""));
+            analysis.setEducationEvidence(json.path("educationEvidence").asText(""));
+            analysis.setCertificationsEvidence(json.path("certificationsEvidence").asText(""));
+            analysis.setLicensesEvidence(json.path("licensesEvidence").asText(""));
+            analysis.setYearsOfExperience(json.path("yearsOfExperience").asText(""));
+            analysis.setExperienceLevel(json.path("experienceLevel").asText("none"));
             analysis.setCvTextHash(cvTextHash);
 
             cvAnalysisRepository.save(analysis);
+
+            // Store in the durable cache too, so the next analysis of this exact CV content -
+            // by this user after a delete/re-upload, or by anyone else who uploads
+            // byte-identical content - reuses this result instead of calling the AI again.
+            CVAnalysisCache cacheEntry = new CVAnalysisCache();
+            cacheEntry.setCvTextHash(cvTextHash);
+            cacheEntry.setLanguage(language);
+            cacheEntry.setPromptVersion(ANALYSIS_PROMPT_VERSION);
+            cacheEntry.setCandidateField(analysis.getCandidateField());
+            cacheEntry.setProfessionTitle(analysis.getProfessionTitle());
+            cacheEntry.setSkills(analysis.getSkills());
+            cacheEntry.setTechnicalSkills(analysis.getTechnicalSkills());
+            cacheEntry.setSoftSkills(analysis.getSoftSkills());
+            cacheEntry.setLanguages(analysis.getLanguages());
+            cacheEntry.setPreviousJobTitles(analysis.getPreviousJobTitles());
+            cacheEntry.setSummary(analysis.getSummary());
+            cacheEntry.setStrengths(analysis.getStrengths());
+            cacheEntry.setMissingSkills(analysis.getMissingSkills());
+            cacheEntry.setRecommendedRoles(analysis.getRecommendedRoles());
+            cacheEntry.setOverallScore(analysis.getOverallScore());
+            cacheEntry.setEvaluationReason(analysis.getEvaluationReason());
+            cacheEntry.setMissingInformation(analysis.getMissingInformation());
+            cacheEntry.setEducationEvidence(analysis.getEducationEvidence());
+            cacheEntry.setCertificationsEvidence(analysis.getCertificationsEvidence());
+            cacheEntry.setLicensesEvidence(analysis.getLicensesEvidence());
+            cacheEntry.setYearsOfExperience(analysis.getYearsOfExperience());
+            cacheEntry.setExperienceLevel(analysis.getExperienceLevel());
+            cvAnalysisCacheRepository.save(cacheEntry);
 
             return ResponseEntity.ok(analysis);
 

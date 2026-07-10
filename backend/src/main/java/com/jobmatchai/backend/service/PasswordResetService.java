@@ -11,8 +11,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.MimeMessageHelper;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.UUID;
@@ -142,5 +144,18 @@ public class PasswordResetService {
         );
 
         return true;
+    }
+
+    // Used and expired tokens have no ongoing value - without this they only ever get
+    // removed when the whole account is deleted, so this table would otherwise grow forever.
+    // Runs once a day; a day's delay past expiry/use is irrelevant since an expired or
+    // already-used token can't be redeemed anyway.
+    @Scheduled(cron = "0 0 3 * * *")
+    @Transactional
+    public void cleanupExpiredTokens() {
+        int deleted = passwordResetTokenRepository.deleteByUsedTrueOrExpiresAtBefore(LocalDateTime.now());
+        if (deleted > 0) {
+            log.info("[PASSWORD-RESET-CLEANUP] removed {} expired/used reset tokens", deleted);
+        }
     }
 }

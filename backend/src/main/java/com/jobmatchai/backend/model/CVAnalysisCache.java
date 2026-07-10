@@ -2,24 +2,35 @@ package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
 
+// A content-addressable cache of CV analysis results, keyed by the exact text content that was
+// analyzed rather than by which user uploaded it. Re-analyzing byte-identical CV content (e.g.
+// after deleting and re-uploading the same file) reuses the stored result instead of calling the
+// AI again, which is what makes repeat analyses of the same CV perfectly consistent - the model
+// itself is not guaranteed to reproduce the same output for the same input, so this sidesteps
+// that instead of relying on it. promptVersion is included in the uniqueness key so that
+// improving the analysis prompt never gets masked by silently serving pre-fix cached results.
 @Entity
-@Table(name = "cv_analysis")
-public class CVAnalysis {
+@Table(name = "cv_analysis_cache", uniqueConstraints = {
+        @UniqueConstraint(columnNames = {"cv_text_hash", "language", "prompt_version"})
+})
+public class CVAnalysisCache {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(name = "user_email")
-    private String userEmail;
+    @Column(name = "cv_text_hash")
+    private String cvTextHash;
+
+    @Column(name = "language")
+    private String language;
+
+    @Column(name = "prompt_version")
+    private String promptVersion;
 
     @Column(name = "candidate_field", columnDefinition = "TEXT")
     private String candidateField;
 
-    // The specific profession/title (e.g. "Doctor", "Registered Nurse", "Information Systems
-    // Analyst") - candidateField alone is too coarse a bucket for the job matcher to reliably
-    // judge field relevance from (e.g. "healthcare" covers both doctors and nurses, which are
-    // related but not interchangeable for licensing purposes).
     @Column(name = "profession_title", columnDefinition = "TEXT")
     private String professionTitle;
 
@@ -41,36 +52,21 @@ public class CVAnalysis {
     @Column(name = "overall_score")
     private Integer overallScore;
 
-    // Structured evidence fields the job matcher relies on for regulated-profession decisions
-    // (fieldRelated + education/certification component scores) instead of inferring them from
-    // whatever the free-text summary/strengths prose happened to mention.
     @Column(name = "education_evidence")
     private String educationEvidence;
 
     @Column(name = "certifications_evidence")
     private String certificationsEvidence;
 
-    // Distinct from certificationsEvidence: certifications are a general credential signal (any
-    // field), while this is specifically about a LEGAL PRACTICE LICENSE (medical license, bar
-    // admission, nursing license, PE license, etc.) - the exact evidence the regulated-profession
-    // fieldRelated guardrail needs, that a generic "certifications" bucket would blur.
     @Column(name = "licenses_evidence")
     private String licensesEvidence;
 
     @Column(name = "years_of_experience")
     private String yearsOfExperience;
 
-    // Bucketed seniority (none/entry_level/mid_level/senior_level), distinct from
-    // yearsOfExperience's free-text display string - this is the value JobMatchService's
-    // deterministic experience-scoring formula actually compares against a job's required
-    // seniority level, since two free-text strings ("8+" vs "senior") can't be compared
-    // numerically without this kind of shared, fixed vocabulary on both sides.
     @Column(name = "experience_level")
     private String experienceLevel;
 
-    // Named technologies/tools/domain-specific practical skills, split from softSkills so the
-    // job matcher can score "required skills" against a clean, comparable list instead of a
-    // mixed bag of hard and soft skills.
     @Column(name = "technical_skills", columnDefinition = "TEXT")
     private String technicalSkills;
 
@@ -89,10 +85,7 @@ public class CVAnalysis {
     @Column(name = "missing_information", columnDefinition = "TEXT")
     private String missingInformation;
 
-    @Column(name = "cv_text_hash")
-    private String cvTextHash;
-
-    public CVAnalysis() {
+    public CVAnalysisCache() {
     }
 
     public Long getId() {
@@ -103,12 +96,28 @@ public class CVAnalysis {
         this.id = id;
     }
 
-    public String getUserEmail() {
-        return userEmail;
+    public String getCvTextHash() {
+        return cvTextHash;
     }
 
-    public void setUserEmail(String userEmail) {
-        this.userEmail = userEmail;
+    public void setCvTextHash(String cvTextHash) {
+        this.cvTextHash = cvTextHash;
+    }
+
+    public String getLanguage() {
+        return language;
+    }
+
+    public void setLanguage(String language) {
+        this.language = language;
+    }
+
+    public String getPromptVersion() {
+        return promptVersion;
+    }
+
+    public void setPromptVersion(String promptVersion) {
+        this.promptVersion = promptVersion;
     }
 
     public String getCandidateField() {
@@ -181,14 +190,6 @@ public class CVAnalysis {
 
     public void setMissingInformation(String missingInformation) {
         this.missingInformation = missingInformation;
-    }
-
-    public String getCvTextHash() {
-        return cvTextHash;
-    }
-
-    public void setCvTextHash(String cvTextHash) {
-        this.cvTextHash = cvTextHash;
     }
 
     public String getProfessionTitle() {
@@ -271,5 +272,3 @@ public class CVAnalysis {
         this.previousJobTitles = previousJobTitles;
     }
 }
-
-

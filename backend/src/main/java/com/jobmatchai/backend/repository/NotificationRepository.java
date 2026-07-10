@@ -2,6 +2,9 @@ package com.jobmatchai.backend.repository;
 
 import com.jobmatchai.backend.model.Notification;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 
 import java.util.List;
 
@@ -10,4 +13,8 @@ public interface NotificationRepository extends JpaRepository<Notification, Long
     long countByRecipientEmailAndReadFalse(String recipientEmail);
     boolean existsByRecipientEmailAndTypeAndReferenceId(String recipientEmail, String type, Long referenceId);
     void deleteByRecipientEmail(String recipientEmail);
+
+    @Modifying
+    @Query("UPDATE Notification n SET n.read = true WHERE n.recipientEmail = :recipientEmail AND n.read = false")
+    int markAllAsReadByRecipientEmail(@Param("recipientEmail") String recipientEmail);
 }

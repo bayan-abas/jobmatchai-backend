@@ -54,6 +54,15 @@ public class NotificationController {
         return ResponseEntity.ok(response);
     }
 
+    @PostMapping("/mark-all-read")
+    public ResponseEntity<Map<String, Object>> markAllAsRead(Authentication authentication) {
+        int updated = notificationService.markAllAsRead(authentication.getName());
+        Map<String, Object> response = new HashMap<>();
+        response.put("success", true);
+        response.put("updated", updated);
+        return ResponseEntity.ok(response);
+    }
+
     @DeleteMapping("/{id}")
     public ResponseEntity<Map<String, Object>> deleteNotification(@PathVariable Long id, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();

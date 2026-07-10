@@ -30,6 +30,11 @@ public class JobicyJobProvider implements ExternalJobProvider {
             .build();
 
     @Override
+    public boolean usesKeywords() {
+        return false;
+    }
+
+    @Override
     public List<ExternalJobData> fetchJobs(String keywords, String country, int maxResults) {
         try {
             String responseBody = restClient.get()
@@ -72,8 +77,70 @@ public class JobicyJobProvider implements ExternalJobProvider {
                 null,
                 applyUrl,
                 applyUrl,
-                "Jobicy"
+                "Jobicy",
+                resolveIndustry(result.path("jobIndustry"))
         );
+    }
+
+    // Jobicy tags every listing with its own category slugs (its "jobIndustry" array - e.g.
+    // "dev", "marketing", "customer-service", "finance-legal") - a real, provider-supplied
+    // category, not a keyword guess, so it's used directly instead of falling back to
+    // title/description inference. Matched by substring against Jobicy's own (small, controlled)
+    // slug vocabulary rather than an exact-string dictionary, since the exact slug spelling can
+    // vary slightly (e.g. "customer-service" vs "customer_service") - substring matching is safe
+    // here specifically because the input is a short controlled tag, not free-text job prose.
+    // Deliberately conservative: a tag with no confident, unambiguous mapping (Jobicy's generic
+    // "business", "management", "all-others", "wellness" tags cut across multiple of our
+    // industries) is left unmapped so the job falls through to title-based classification
+    // instead of being guessed into the wrong bucket.
+    private String resolveIndustry(JsonNode industryTags) {
+        if (industryTags == null || !industryTags.isArray()) {
+            return null;
+        }
+
+        for (JsonNode tagNode : industryTags) {
+            String tag = tagNode.asText("").toLowerCase();
+            if (tag.isBlank()) {
+                continue;
+            }
+
+            if (tag.contains("dev") || tag.contains("data") || tag.contains("engineer")
+                    || tag.contains("it-")) {
+                return "technology";
+            }
+            if (tag.contains("design")) {
+                return "design";
+            }
+            if (tag.contains("market")) {
+                return "marketing";
+            }
+            if (tag.contains("customer")) {
+                return "customerService";
+            }
+            if (tag.contains("sale")) {
+                return "sales";
+            }
+            if (tag.contains("hr") || tag.contains("human-resources")) {
+                return "humanResources";
+            }
+            if (tag.contains("legal")) {
+                return "legal";
+            }
+            if (tag.contains("writ") || tag.contains("copywriting")) {
+                return "writing";
+            }
+            if (tag.contains("health") || tag.contains("biotech") || tag.contains("medical")) {
+                return "healthcare";
+            }
+            if (tag.contains("supply-chain") || tag.contains("logistics")) {
+                return "logistics";
+            }
+            if (tag.contains("finance") && !tag.contains("legal")) {
+                return "finance";
+            }
+        }
+
+        return null;
     }
 
     private String formatSalary(JsonNode result) {

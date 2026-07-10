@@ -8,7 +8,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
-import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -53,7 +53,7 @@ public class SavedJobController {
                 return response;
             }
 
-            savedJob.setSavedAt(LocalDate.now().toString());
+            savedJob.setSavedAt(LocalDateTime.now());
             SavedJob saved = savedJobRepository.save(savedJob);
 
             response.put("success", true);

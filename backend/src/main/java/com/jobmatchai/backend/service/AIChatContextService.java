@@ -231,7 +231,6 @@ Strengths: %s
 Missing skills (general): %s
 Recommended roles: %s
 Overall CV score: %s
-Score level: %s
 Score rationale: %s
 CV quality notes: %s
 """.formatted(
@@ -242,7 +241,6 @@ CV quality notes: %s
                 nullToNA(analysis.getMissingSkills()),
                 nullToNA(analysis.getRecommendedRoles()),
                 nullToNA(analysis.getOverallScore()),
-                nullToNA(analysis.getScoreLevel()),
                 nullToNA(analysis.getEvaluationReason()),
                 nullToNA(analysis.getMissingInformation())
         );

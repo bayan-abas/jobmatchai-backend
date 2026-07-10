@@ -19,5 +19,14 @@ public record ExternalJobData(
         String skills,
         String applyUrl,
         String sourceUrl,
-        String sourceName
+        String sourceName,
+        // One of frontend/src/utils/jobInference.ts's INDUSTRY_KEYS (e.g. "technology",
+        // "healthcare", "legal"), resolved here - not left to the frontend - whenever the
+        // provider's own API already tells us the job's category/industry or occupation code,
+        // since that is far more reliable than guessing from free-text title/description
+        // keywords. Null when the provider gives no such signal (e.g. Jooble), in which case
+        // the frontend classifier falls back to title-first keyword inference. Must stay a
+        // literal INDUSTRY_KEYS value - the frontend trusts this field outright when non-null
+        // rather than re-validating it.
+        String industry
 ) {}

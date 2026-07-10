@@ -25,11 +25,20 @@ public class JobMatchScore {
     @Column(name = "match_reason", columnDefinition = "TEXT")
     private String matchReason;
 
+    // Combined (mandatory + preferred) lists, kept for backward compatibility with existing
+    // readers (AI chat context, frontend job cards). missingRequiredSkills/missingPreferredSkills
+    // below are the same data split out for callers that need the mandatory/preferred distinction.
     @Column(name = "matched_skills", columnDefinition = "TEXT")
     private String matchedSkills;
 
     @Column(name = "missing_skills", columnDefinition = "TEXT")
     private String missingSkills;
+
+    @Column(name = "missing_required_skills", columnDefinition = "TEXT")
+    private String missingRequiredSkills;
+
+    @Column(name = "missing_preferred_skills", columnDefinition = "TEXT")
+    private String missingPreferredSkills;
 
     @Column(name = "cv_fingerprint")
     private String cvFingerprint;
@@ -66,6 +75,23 @@ public class JobMatchScore {
 
     @Column(name = "language_match_percent")
     private Integer languageMatchPercent;
+
+    // Weighted-scoring components (see MatchScoreCalculator) - matchPercent is the single
+    // backend-computed weighted combination of these, not a number the AI invents directly.
+    @Column(name = "field_relevance_percent")
+    private Integer fieldRelevancePercent;
+
+    @Column(name = "certification_match_percent")
+    private Integer certificationMatchPercent;
+
+    @Column(name = "location_match_percent")
+    private Integer locationMatchPercent;
+
+    // The per-job fingerprint (jobId + title + company + normalized title + content hash) the
+    // AI was asked to echo back for this result, so a stale/misattributed cache row can be told
+    // apart from one that was actually validated against the exact job it's attached to.
+    @Column(name = "job_content_fingerprint")
+    private String jobContentFingerprint;
 
     public JobMatchScore() {}
 
@@ -215,5 +241,53 @@ public class JobMatchScore {
 
     public void setLanguageMatchPercent(Integer languageMatchPercent) {
         this.languageMatchPercent = languageMatchPercent;
+    }
+
+    public String getMissingRequiredSkills() {
+        return missingRequiredSkills;
+    }
+
+    public void setMissingRequiredSkills(String missingRequiredSkills) {
+        this.missingRequiredSkills = missingRequiredSkills;
+    }
+
+    public String getMissingPreferredSkills() {
+        return missingPreferredSkills;
+    }
+
+    public void setMissingPreferredSkills(String missingPreferredSkills) {
+        this.missingPreferredSkills = missingPreferredSkills;
+    }
+
+    public Integer getFieldRelevancePercent() {
+        return fieldRelevancePercent;
+    }
+
+    public void setFieldRelevancePercent(Integer fieldRelevancePercent) {
+        this.fieldRelevancePercent = fieldRelevancePercent;
+    }
+
+    public Integer getCertificationMatchPercent() {
+        return certificationMatchPercent;
+    }
+
+    public void setCertificationMatchPercent(Integer certificationMatchPercent) {
+        this.certificationMatchPercent = certificationMatchPercent;
+    }
+
+    public Integer getLocationMatchPercent() {
+        return locationMatchPercent;
+    }
+
+    public void setLocationMatchPercent(Integer locationMatchPercent) {
+        this.locationMatchPercent = locationMatchPercent;
+    }
+
+    public String getJobContentFingerprint() {
+        return jobContentFingerprint;
+    }
+
+    public void setJobContentFingerprint(String jobContentFingerprint) {
+        this.jobContentFingerprint = jobContentFingerprint;
     }
 }

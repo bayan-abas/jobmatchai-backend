@@ -132,6 +132,11 @@ public class ExternalJobController {
         response.put("experienceMatchPercent", result.experienceMatchPercent());
         response.put("educationMatchPercent", result.educationMatchPercent());
         response.put("languageMatchPercent", result.languageMatchPercent());
+        response.put("fieldRelevancePercent", result.fieldRelevancePercent());
+        response.put("certificationMatchPercent", result.certificationMatchPercent());
+        response.put("locationMatchPercent", result.locationMatchPercent());
+        response.put("missingRequiredSkills", result.missingRequiredSkills());
+        response.put("missingPreferredSkills", result.missingPreferredSkills());
         return response;
     }
 }

@@ -1,13 +1,19 @@
 package com.jobmatchai.backend.controller;
 
+import com.jobmatchai.backend.dto.RegisterRequest;
+import com.jobmatchai.backend.exception.EmailAlreadyExistsException;
+import com.jobmatchai.backend.exception.InvalidCredentialsException;
+import com.jobmatchai.backend.exception.InvalidRoleException;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.UserRepository;
-import com.jobmatchai.backend.security.JwtService;
+import com.jobmatchai.backend.service.AuthService;
 import com.jobmatchai.backend.service.UserDeletionService;
+import com.jobmatchai.backend.service.UserRegistrationService;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -22,12 +28,13 @@ public class UserController {
     private UserRepository userRepository;
 
     @Autowired
-    private JwtService jwtService;
-
-    @Autowired
     private UserDeletionService userDeletionService;
 
-    private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
+    @Autowired
+    private UserRegistrationService userRegistrationService;
+
+    @Autowired
+    private AuthService authService;
 
     private static void stripPassword(User user) {
         if (user != null) {
@@ -35,15 +42,22 @@ public class UserController {
         }
     }
 
+    // No password field here on purpose - password changes go through the dedicated
+    // /api/auth/change-password endpoint, which verifies the current password first.
+    // This endpoint is authenticated as the account owner, but that alone shouldn't be
+    // enough to silently rotate the password (e.g. from a hijacked session) with no check.
     public record ProfileUpdateRequest(
             String name,
-            String password,
             String phone,
             String location,
             String currentTitle,
             String yearsOfExperience,
             String skills,
-            String professionalSummary
+            String professionalSummary,
+            String industry,
+            String companySize,
+            String website,
+            String companyDescription
     ) {}
 
     @GetMapping("/test")
@@ -59,82 +73,58 @@ public class UserController {
     }
 
     @PostMapping("/register")
-    public Map<String, Object> registerUser(@Valid @RequestBody User user) {
+    public ResponseEntity<Map<String, Object>> registerUser(@Valid @RequestBody RegisterRequest request) {
         Map<String, Object> response = new HashMap<>();
 
         try {
-            User existingUser = userRepository.findByEmail(user.getEmail());
-
-            if (existingUser != null) {
-                response.put("success", false);
-                response.put("message", "Email already exists");
-                return response;
-            }
-
-            String encryptedPassword = passwordEncoder.encode(user.getPassword());
-            user.setPassword(encryptedPassword);
-
-            User savedUser = userRepository.save(user);
-            stripPassword(savedUser);
+            User savedUser = userRegistrationService.register(request);
 
             response.put("success", true);
             response.put("message", "User registered successfully");
             response.put("user", savedUser);
-            return response;
+            return ResponseEntity.status(HttpStatus.CREATED).body(response);
 
+        } catch (EmailAlreadyExistsException | InvalidRoleException e) {
+            response.put("success", false);
+            response.put("message", e.getMessage());
+            return ResponseEntity.badRequest().body(response);
         } catch (Exception e) {
             e.printStackTrace();
 
             response.put("success", false);
             response.put("message", e.getMessage());
-            return response;
+            return ResponseEntity.internalServerError().body(response);
         }
     }
 
     @PostMapping("/login")
-    public Map<String, Object> loginUser(@RequestBody Map<String, String> loginData) {
+    public ResponseEntity<Map<String, Object>> loginUser(@RequestBody Map<String, String> loginData) {
         Map<String, Object> response = new HashMap<>();
 
         try {
-            String email = loginData.get("email");
-            String password = loginData.get("password");
-
-            User user = userRepository.findByEmail(email);
-
-            if (user == null) {
-                response.put("success", false);
-                response.put("message", "User not found");
-                return response;
-            }
-
-            boolean passwordMatches = passwordEncoder.matches(password, user.getPassword());
-
-            if (!passwordMatches) {
-                response.put("success", false);
-                response.put("message", "Wrong password");
-                return response;
-            }
-
-            String token = jwtService.generateToken(user.getEmail(), user.getRole());
-            stripPassword(user);
+            AuthService.LoginResult result = authService.login(loginData.get("email"), loginData.get("password"));
 
             response.put("success", true);
             response.put("message", "Login successful");
-            response.put("token", token);
-            response.put("user", user);
-            return response;
+            response.put("token", result.token());
+            response.put("user", result.user());
+            return ResponseEntity.ok(response);
 
+        } catch (InvalidCredentialsException e) {
+            response.put("success", false);
+            response.put("message", e.getMessage());
+            return ResponseEntity.badRequest().body(response);
         } catch (Exception e) {
             e.printStackTrace();
 
             response.put("success", false);
             response.put("message", e.getMessage());
-            return response;
+            return ResponseEntity.internalServerError().body(response);
         }
     }
 
     @GetMapping("/{id}")
-    public Map<String, Object> getUserById(@PathVariable long id) {
+    public ResponseEntity<Map<String, Object>> getUserById(@PathVariable long id) {
         Map<String, Object> response = new HashMap<>();
 
         return userRepository.findById(id)
@@ -142,17 +132,17 @@ public class UserController {
                     stripPassword(user);
                     response.put("success", true);
                     response.put("user", user);
-                    return response;
+                    return ResponseEntity.ok(response);
                 })
                 .orElseGet(() -> {
                     response.put("success", false);
                     response.put("message", "User not found");
-                    return response;
+                    return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
                 });
     }
 
     @PutMapping("/{id}")
-    public Map<String, Object> updateUser(
+    public ResponseEntity<Map<String, Object>> updateUser(
             @PathVariable long id,
             @RequestBody ProfileUpdateRequest updatedUser,
             Authentication authentication
@@ -165,32 +155,31 @@ public class UserController {
             if (existingUser == null) {
                 response.put("success", false);
                 response.put("message", "User not found");
-                return response;
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
             }
 
             if (!existingUser.getEmail().equals(authentication.getName())) {
                 response.put("success", false);
                 response.put("message", "You can only update your own account");
-                return response;
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(response);
             }
 
-            if (updatedUser.name() != null) {
+            // Required fields (mirrors registration's required-field set): only apply an
+            // update if it's a real value, not blank - otherwise a stray empty string in
+            // the request would silently wipe out the candidate's name/phone/location/title.
+            if (updatedUser.name() != null && !updatedUser.name().isBlank()) {
                 existingUser.setName(updatedUser.name());
             }
 
-            if (updatedUser.password() != null && !updatedUser.password().isEmpty()) {
-                existingUser.setPassword(passwordEncoder.encode(updatedUser.password()));
-            }
-
-            if (updatedUser.phone() != null) {
+            if (updatedUser.phone() != null && !updatedUser.phone().isBlank()) {
                 existingUser.setPhone(updatedUser.phone());
             }
 
-            if (updatedUser.location() != null) {
+            if (updatedUser.location() != null && !updatedUser.location().isBlank()) {
                 existingUser.setLocation(updatedUser.location());
             }
 
-            if (updatedUser.currentTitle() != null) {
+            if (updatedUser.currentTitle() != null && !updatedUser.currentTitle().isBlank()) {
                 existingUser.setCurrentTitle(updatedUser.currentTitle());
             }
 
@@ -206,23 +195,43 @@ public class UserController {
                 existingUser.setProfessionalSummary(updatedUser.professionalSummary());
             }
 
+            // Company profile fields. industry/companySize are required on the company
+            // registration form, so they get the same blank-guard as the candidate required
+            // fields above; website/companyDescription are optional and may legitimately be
+            // cleared to blank.
+            if (updatedUser.industry() != null && !updatedUser.industry().isBlank()) {
+                existingUser.setIndustry(updatedUser.industry());
+            }
+
+            if (updatedUser.companySize() != null && !updatedUser.companySize().isBlank()) {
+                existingUser.setCompanySize(updatedUser.companySize());
+            }
+
+            if (updatedUser.website() != null) {
+                existingUser.setWebsite(updatedUser.website());
+            }
+
+            if (updatedUser.companyDescription() != null) {
+                existingUser.setCompanyDescription(updatedUser.companyDescription());
+            }
+
             User savedUser = userRepository.save(existingUser);
             stripPassword(savedUser);
 
             response.put("success", true);
             response.put("message", "User updated successfully");
             response.put("user", savedUser);
-            return response;
+            return ResponseEntity.ok(response);
 
         } catch (Exception e) {
             response.put("success", false);
             response.put("message", e.getMessage());
-            return response;
+            return ResponseEntity.internalServerError().body(response);
         }
     }
 
     @DeleteMapping("/{id}")
-    public Map<String, Object> deleteUser(@PathVariable long id, Authentication authentication) {
+    public ResponseEntity<Map<String, Object>> deleteUser(@PathVariable long id, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
 
         try {
@@ -231,25 +240,25 @@ public class UserController {
             if (existingUser == null) {
                 response.put("success", false);
                 response.put("message", "User not found");
-                return response;
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
             }
 
             if (!existingUser.getEmail().equals(authentication.getName())) {
                 response.put("success", false);
                 response.put("message", "You can only delete your own account");
-                return response;
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(response);
             }
 
             userDeletionService.deleteUserAccount(existingUser.getEmail());
 
             response.put("success", true);
             response.put("message", "User deleted successfully");
-            return response;
+            return ResponseEntity.ok(response);
 
         } catch (Exception e) {
             response.put("success", false);
             response.put("message", e.getMessage());
-            return response;
+            return ResponseEntity.internalServerError().body(response);
         }
     }
 }

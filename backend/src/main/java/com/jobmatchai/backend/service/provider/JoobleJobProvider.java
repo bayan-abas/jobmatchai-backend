@@ -104,7 +104,10 @@ public class JoobleJobProvider implements ExternalJobProvider {
                 null,
                 applyUrl,
                 applyUrl,
-                joobleSourceLabel(result)
+                joobleSourceLabel(result),
+                // Jooble's API doesn't surface a category/occupation field - the frontend
+                // classifier falls back to title-based inference for these.
+                null
         );
     }
 

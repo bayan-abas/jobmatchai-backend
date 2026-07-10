@@ -3,8 +3,14 @@ package com.jobmatchai.backend.model;
 import jakarta.persistence.*;
 import java.time.LocalDateTime;
 
+// The candidate-facing check-then-insert (see ApplicationController.applyToJob) is not
+// atomic under concurrency - a double-click or two overlapping requests could both pass
+// the "already applied" check before either insert lands. This constraint is the actual
+// backstop against duplicate applications for the same job.
 @Entity
-@Table(name = "applications")
+@Table(name = "applications", uniqueConstraints = {
+        @UniqueConstraint(columnNames = {"candidate_email", "job_id"})
+})
 public class Application {
 
     @Id
@@ -20,7 +26,6 @@ public class Application {
     private String candidateName;
 
     private String status;
-    private String appliedDate;
 
     private LocalDateTime createdAt;
 
@@ -34,7 +39,7 @@ public class Application {
 
     public Application(Long jobId, String jobTitle, String companyName, String companyEmail,
                        String candidateEmail, String candidateName,
-                       String status, String appliedDate) {
+                       String status) {
         this.jobId = jobId;
         this.jobTitle = jobTitle;
         this.companyName = companyName;
@@ -42,7 +47,6 @@ public class Application {
         this.candidateEmail = candidateEmail;
         this.candidateName = candidateName;
         this.status = status;
-        this.appliedDate = appliedDate;
     }
 
     public Long getId() {
@@ -105,12 +109,11 @@ public class Application {
         this.status = status;
     }
 
+    // Not a persisted column - the API response shape (and every existing frontend caller)
+    // still expects an "appliedDate" field, so it's computed from createdAt on the fly
+    // instead of being a second, separately-stored copy of the same date.
     public String getAppliedDate() {
-        return appliedDate;
-    }
-
-    public void setAppliedDate(String appliedDate) {
-        this.appliedDate = appliedDate;
+        return createdAt == null ? null : createdAt.toLocalDate().toString();
     }
 
     public LocalDateTime getCreatedAt() {

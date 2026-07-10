@@ -4,6 +4,7 @@ import com.jobmatchai.backend.model.Notification;
 import com.jobmatchai.backend.repository.NotificationRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -59,6 +60,11 @@ public class NotificationService {
                     return notificationRepository.save(notification);
                 })
                 .orElse(null);
+    }
+
+    @Transactional
+    public int markAllAsRead(String recipientEmail) {
+        return notificationRepository.markAllAsReadByRecipientEmail(recipientEmail);
     }
 
     public boolean deleteNotification(Long notificationId, String requesterEmail) {

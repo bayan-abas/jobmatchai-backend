@@ -102,8 +102,52 @@ public class JSearchJobProvider implements ExternalJobProvider {
                 skills,
                 textOrNull(result, "job_apply_link"),
                 textOrNull(result, "job_apply_link"),
-                joinPublishers(result)
+                joinPublishers(result),
+                resolveIndustry(result)
         );
+    }
+
+    // JSearch results can include an O*NET-SOC occupation code (job_onet_soc, e.g.
+    // "15-1252.00") when the underlying listing has one - this is a real, standardized U.S.
+    // Department of Labor occupation classification, not a keyword guess, so a confidently
+    // mappable major group is used directly instead of falling back to title/description
+    // inference. Only the major group (the two digits before the first hyphen) is used, and
+    // only for groups that map cleanly to exactly one of our industries - several SOC major
+    // groups (11 Management, 13 Business/Financial, 19 Science, 21 Community/Social Service,
+    // 27 Arts/Media/Design, 39 Personal Care) are deliberately left unmapped because they cut
+    // across multiple of our industries too broadly to guess confidently (e.g. group 11
+    // contains both "Marketing Managers" and "Construction Managers") - those fall through to
+    // title-based classification instead, where the job's own title/description words settle it
+    // properly. This field may not be present on every result (or at all, depending on API
+    // plan/response variant); resolveIndustry simply returns null when it's missing, which is
+    // exactly the signal the frontend classifier needs to fall back to title-based inference.
+    private String resolveIndustry(JsonNode result) {
+        String socCode = textOrNull(result, "job_onet_soc");
+        if (socCode == null || socCode.isBlank()) {
+            return null;
+        }
+
+        int hyphenIndex = socCode.indexOf('-');
+        String majorGroup = hyphenIndex > 0 ? socCode.substring(0, hyphenIndex) : socCode;
+
+        return switch (majorGroup) {
+            case "15" -> "technology";
+            case "17" -> "engineering";
+            case "23" -> "legal";
+            case "25" -> "education";
+            case "29", "31" -> "healthcare";
+            case "33" -> "security";
+            case "35" -> "restaurants";
+            case "37" -> "cleaning";
+            case "41" -> "sales";
+            case "43" -> "administration";
+            case "45" -> "agriculture";
+            case "47", "49" -> "construction";
+            case "51" -> "factory";
+            case "53" -> "logistics";
+            case "55" -> "security";
+            default -> null;
+        };
     }
 
     private String joinPublishers(JsonNode result) {

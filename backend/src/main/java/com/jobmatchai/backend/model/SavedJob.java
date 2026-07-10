@@ -2,6 +2,8 @@ package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
 
+import java.time.LocalDateTime;
+
 @Entity
 @Table(name = "saved_jobs", uniqueConstraints = {
         @UniqueConstraint(columnNames = {"candidate_email", "job_id", "job_type"})
@@ -19,12 +21,12 @@ public class SavedJob {
     private String companyName;
     private String location;
     private String salary;
-    private String savedAt;
+    private LocalDateTime savedAt;
 
     public SavedJob() {}
 
     public SavedJob(Long jobId, String jobType, String jobTitle, String companyName,
-                     String location, String salary, String candidateEmail, String savedAt) {
+                     String location, String salary, String candidateEmail, LocalDateTime savedAt) {
         this.jobId = jobId;
         this.jobType = jobType;
         this.jobTitle = jobTitle;
@@ -95,11 +97,11 @@ public class SavedJob {
         this.salary = salary;
     }
 
-    public String getSavedAt() {
+    public LocalDateTime getSavedAt() {
         return savedAt;
     }
 
-    public void setSavedAt(String savedAt) {
+    public void setSavedAt(LocalDateTime savedAt) {
         this.savedAt = savedAt;
     }
 }

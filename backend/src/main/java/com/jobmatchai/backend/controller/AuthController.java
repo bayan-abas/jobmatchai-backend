@@ -1,12 +1,18 @@
 package com.jobmatchai.backend.controller;
 
+import com.jobmatchai.backend.dto.RegisterRequest;
+import com.jobmatchai.backend.exception.EmailAlreadyExistsException;
+import com.jobmatchai.backend.exception.InvalidCredentialsException;
+import com.jobmatchai.backend.exception.InvalidRoleException;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.UserRepository;
-import com.jobmatchai.backend.security.JwtService;
+import com.jobmatchai.backend.service.AuthService;
 import com.jobmatchai.backend.service.NotificationService;
 import com.jobmatchai.backend.service.PasswordResetService;
+import com.jobmatchai.backend.service.UserRegistrationService;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
@@ -14,12 +20,17 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 @RestController
 @RequestMapping("/api/auth")
 public class AuthController {
 
     private static final int MIN_PASSWORD_LENGTH = 6;
+
+    // At least MIN_PASSWORD_LENGTH characters, containing at least one letter and one digit.
+    private static final Pattern PASSWORD_PATTERN =
+            Pattern.compile("^(?=.*[A-Za-z])(?=.*\\d).{" + MIN_PASSWORD_LENGTH + ",}$");
 
     @Autowired
     private UserRepository userRepository;
@@ -31,82 +42,61 @@ public class AuthController {
     private NotificationService notificationService;
 
     @Autowired
-    private JwtService jwtService;
+    private UserRegistrationService userRegistrationService;
+
+    @Autowired
+    private AuthService authService;
 
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     public record LoginRequest(String email, String password) {}
-
-    private static void stripPassword(User user) {
-        if (user != null) {
-            user.setPassword(null);
-        }
-    }
 
     public record ForgotPasswordRequest(String email) {}
 
     public record ResetPasswordRequest(String token, String newPassword) {}
 
     @PostMapping("/register")
-    public Map<String, Object> register(@Valid @RequestBody User user) {
+    public ResponseEntity<Map<String, Object>> register(@Valid @RequestBody RegisterRequest request) {
         Map<String, Object> response = new HashMap<>();
 
         try {
-            User existingUser = userRepository.findByEmail(user.getEmail());
-
-            if (existingUser != null) {
-                response.put("success", false);
-                response.put("message", "Email already exists");
-                return response;
-            }
-
-            user.setPassword(passwordEncoder.encode(user.getPassword()));
-
-            User savedUser = userRepository.save(user);
-            stripPassword(savedUser);
+            User savedUser = userRegistrationService.register(request);
 
             response.put("success", true);
             response.put("message", "User registered successfully");
             response.put("user", savedUser);
-            return response;
+            return ResponseEntity.status(HttpStatus.CREATED).body(response);
+        } catch (EmailAlreadyExistsException | InvalidRoleException e) {
+            response.put("success", false);
+            response.put("message", e.getMessage());
+            return ResponseEntity.badRequest().body(response);
         } catch (Exception e) {
             response.put("success", false);
             response.put("message", e.getMessage());
-            return response;
+            return ResponseEntity.internalServerError().body(response);
         }
     }
 
     @PostMapping("/login")
-    public Map<String, Object> login(@RequestBody LoginRequest request) {
+    public ResponseEntity<Map<String, Object>> login(@RequestBody LoginRequest request) {
         Map<String, Object> response = new HashMap<>();
 
         try {
-            User user = userRepository.findByEmail(request.email());
-
-            if (user == null) {
-                response.put("success", false);
-                response.put("message", "User not found");
-                return response;
-            }
-
-            if (!passwordEncoder.matches(request.password(), user.getPassword())) {
-                response.put("success", false);
-                response.put("message", "Wrong password");
-                return response;
-            }
-
-            String token = jwtService.generateToken(user.getEmail(), user.getRole());
-            stripPassword(user);
+            AuthService.LoginResult result = authService.login(request.email(), request.password());
 
             response.put("success", true);
             response.put("message", "Login successful");
-            response.put("token", token);
-            response.put("user", user);
-            return response;
+            response.put("token", result.token());
+            response.put("user", result.user());
+            return ResponseEntity.ok(response);
+        } catch (InvalidCredentialsException e) {
+            response.put("success", false);
+            response.put("message", e.getMessage());
+            return ResponseEntity.badRequest().body(response);
         } catch (Exception e) {
             response.put("success", false);
             response.put("message", e.getMessage());
-            return response;
+            return ResponseEntity.internalServerError().body(response);
         }
     }
 
@@ -149,6 +139,12 @@ public class AuthController {
             return ResponseEntity.badRequest().body(response);
         }
 
+        if (!PASSWORD_PATTERN.matcher(request.newPassword()).matches()) {
+            response.put("success", false);
+            response.put("message", "Password must be at least 6 characters and contain both letters and numbers.");
+            return ResponseEntity.badRequest().body(response);
+        }
+
         boolean success = passwordResetService.resetPassword(request.token(), request.newPassword());
 
         if (!success) {
@@ -168,9 +164,9 @@ public class AuthController {
     public ResponseEntity<?> changePassword(@RequestBody ChangePasswordRequest request, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
 
-        if (request.newPassword() == null || request.newPassword().length() < MIN_PASSWORD_LENGTH) {
+        if (request.newPassword() == null || !PASSWORD_PATTERN.matcher(request.newPassword()).matches()) {
             response.put("success", false);
-            response.put("message", "New password must be at least " + MIN_PASSWORD_LENGTH + " characters.");
+            response.put("message", "New password must be at least " + MIN_PASSWORD_LENGTH + " characters and contain both letters and numbers.");
             return ResponseEntity.badRequest().body(response);
         }
 

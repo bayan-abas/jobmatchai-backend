@@ -115,6 +115,19 @@ public class PaymentController {
         try {
             Session session = Session.retrieve(sessionId);
 
+            // A session_id isn't a secret the way a token is - it can end up in browser
+            // history, a shared success-URL, or a referrer header. Without this check,
+            // anyone logged in could activate premium on someone ELSE's account just by
+            // calling this endpoint with a session_id that isn't theirs (Stripe still
+            // requires the session to be genuinely paid, but ties the activation to
+            // whatever email was stashed in its metadata, not to the caller).
+            String sessionCandidateEmail = session.getMetadata() != null
+                    ? session.getMetadata().get("candidateEmail")
+                    : null;
+            if (sessionCandidateEmail == null || !sessionCandidateEmail.equalsIgnoreCase(authentication.getName())) {
+                return ResponseEntity.status(403).body(Map.of("success", false, "message", "This checkout session does not belong to you."));
+            }
+
             if (!"paid".equals(session.getPaymentStatus())) {
                 return ResponseEntity.badRequest().body(Map.of("success", false, "message", "Payment not completed."));
             }

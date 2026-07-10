@@ -7,6 +7,7 @@ import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
 import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.service.JobMatchService;
+import com.jobmatchai.backend.util.MatchLabelUtil;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
@@ -144,7 +145,7 @@ public class JobController {
                             application.getStatus(),
                             application.getAppliedDate(),
                             summary != null ? summary.getMatchScore() : null,
-                            summary != null ? summary.getMatchLabel() : null
+                            summary != null ? MatchLabelUtil.fromScore(summary.getMatchScore()) : null
                     );
                 })
                 .toList();
@@ -325,6 +326,11 @@ public class JobController {
             response.put("experienceMatchPercent", result.experienceMatchPercent());
             response.put("educationMatchPercent", result.educationMatchPercent());
             response.put("languageMatchPercent", result.languageMatchPercent());
+            response.put("fieldRelevancePercent", result.fieldRelevancePercent());
+            response.put("certificationMatchPercent", result.certificationMatchPercent());
+            response.put("locationMatchPercent", result.locationMatchPercent());
+            response.put("missingRequiredSkills", result.missingRequiredSkills());
+            response.put("missingPreferredSkills", result.missingPreferredSkills());
 
             return ResponseEntity.ok(response);
 
