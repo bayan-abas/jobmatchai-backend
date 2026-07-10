@@ -64,6 +64,19 @@ public class User {
     @Column(columnDefinition = "TEXT")
     private String companyDescription;
 
+    private String linkedin;
+
+    private String github;
+
+    // Just the founding year (e.g. "2022") - kept as a String like the other free-text
+    // company fields rather than an Integer, since it's display-only and never used in
+    // date arithmetic.
+    private String founded;
+
+    // Free text rather than an enum: the examples (Startup/Private Company/Enterprise/
+    // Non-profit) are UI suggestions, not a fixed backend vocabulary to validate against.
+    private String companyType;
+
     public User() {}
 
     public User(String name, String email, String password, String role) {
@@ -235,5 +248,37 @@ public class User {
 
     public void setCompanyDescription(String companyDescription) {
         this.companyDescription = companyDescription;
+    }
+
+    public String getLinkedin() {
+        return linkedin;
+    }
+
+    public void setLinkedin(String linkedin) {
+        this.linkedin = linkedin;
+    }
+
+    public String getGithub() {
+        return github;
+    }
+
+    public void setGithub(String github) {
+        this.github = github;
+    }
+
+    public String getFounded() {
+        return founded;
+    }
+
+    public void setFounded(String founded) {
+        this.founded = founded;
+    }
+
+    public String getCompanyType() {
+        return companyType;
+    }
+
+    public void setCompanyType(String companyType) {
+        this.companyType = companyType;
     }
 }

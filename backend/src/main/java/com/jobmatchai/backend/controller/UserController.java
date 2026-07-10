@@ -57,7 +57,11 @@ public class UserController {
             String industry,
             String companySize,
             String website,
-            String companyDescription
+            String companyDescription,
+            String linkedin,
+            String github,
+            String founded,
+            String companyType
     ) {}
 
     @GetMapping("/test")
@@ -213,6 +217,22 @@ public class UserController {
 
             if (updatedUser.companyDescription() != null) {
                 existingUser.setCompanyDescription(updatedUser.companyDescription());
+            }
+
+            if (updatedUser.linkedin() != null) {
+                existingUser.setLinkedin(updatedUser.linkedin());
+            }
+
+            if (updatedUser.github() != null) {
+                existingUser.setGithub(updatedUser.github());
+            }
+
+            if (updatedUser.founded() != null) {
+                existingUser.setFounded(updatedUser.founded());
+            }
+
+            if (updatedUser.companyType() != null) {
+                existingUser.setCompanyType(updatedUser.companyType());
             }
 
             User savedUser = userRepository.save(existingUser);
