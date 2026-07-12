@@ -50,9 +50,11 @@ public class ExternalJobService {
     // (which is itself a tech-leaning remote-jobs feed - see JobicyJobProvider). Deliberately a
     // config property (not a constant) so it can be extended/tuned per deployment without a
     // code change.
-    @Value("${externaljobs.import.keywords:software developer,web developer,project manager,accountant,mechanical engineer,graphic designer,electrician,registered nurse,teacher," +
+    @Value("${externaljobs.import.keywords:software developer,web developer,project manager,accountant,mechanical engineer,civil engineer,electrical engineer,graphic designer,electrician," +
+            "physician,doctor,dentist,pharmacist,physical therapist,veterinarian,registered nurse,healthcare assistant,lawyer,attorney,teacher,chef," +
+            "marketing manager,human resources,financial analyst,data analyst,IT support,social worker,real estate agent,plumber,HVAC technician,welder,security guard,bank teller,translator," +
             "retail sales associate,cashier,customer service representative,sales representative,administrative assistant,warehouse worker,logistics coordinator,driver,transportation," +
-            "hospitality staff,hotel receptionist,healthcare assistant,cleaner,construction worker,manufacturing worker," +
+            "hospitality staff,hotel receptionist,cleaner,construction worker,manufacturing worker," +
             "remote customer service,remote software developer,work from home}")
     private String categoryKeywordsCsv;
 
