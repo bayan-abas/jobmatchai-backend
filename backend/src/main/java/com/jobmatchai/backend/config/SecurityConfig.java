@@ -117,8 +117,17 @@ public class SecurityConfig {
 
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
+        // APP_CORS_ALLOWED_ORIGIN accepts a comma-separated list, not just one origin - a
+        // self-hosted deployment commonly needs to allow both the real production frontend
+        // domain and a local dev frontend (http://localhost:5173) against the same backend.
+        List<String> origins = List.of(allowedOrigin.split(","))
+                .stream()
+                .map(String::trim)
+                .filter(origin -> !origin.isEmpty())
+                .toList();
+
         CorsConfiguration configuration = new CorsConfiguration();
-        configuration.setAllowedOrigins(List.of(allowedOrigin));
+        configuration.setAllowedOrigins(origins);
         configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
         configuration.setAllowedHeaders(List.of("*"));
 

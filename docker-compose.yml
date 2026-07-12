@@ -1,0 +1,21 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      # Overridable via .env, but given an explicit container-local default here since the
+      # application.properties default (a path under the user's home directory) doesn't mean
+      # anything meaningful inside a container - it would just be an ephemeral path inside
+      # whatever user account the JRE base image runs as, lost on every recreate. Pointing it
+      # at the mounted volume below is what makes uploaded CVs survive a redeploy/restart.
+      APP_UPLOAD_DIR: /data/uploads/cvs/
+    volumes:
+      - cv-uploads:/data/uploads
+    restart: unless-stopped
+
+volumes:
+  cv-uploads:
