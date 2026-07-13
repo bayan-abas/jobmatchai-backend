@@ -6,8 +6,10 @@ import com.jobmatchai.backend.model.Application;
 import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.model.CandidateAiSummary;
+import com.jobmatchai.backend.model.CVAnalysis;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
+import com.jobmatchai.backend.repository.CVAnalysisRepository;
 import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.CandidateSummaryService;
@@ -25,6 +27,7 @@ import org.springframework.web.bind.annotation.*;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -35,7 +38,12 @@ public class ApplicationController {
 
     private static final Logger log = LoggerFactory.getLogger(ApplicationController.class);
 
-    private static final Set<String> ALLOWED_COMPANY_STATUSES = Set.of("Accepted", "Rejected");
+    // "Accepted"/"Rejected" are the only FINAL decisions - once set, updateStatus refuses any
+    // further change (see the guard below). "Shortlisted"/"Under Review" are reversible
+    // intermediate states a company can move between freely before making a final call.
+    private static final Set<String> ALLOWED_COMPANY_STATUSES =
+            Set.of("Accepted", "Rejected", "Shortlisted", "Under Review");
+    private static final Set<String> FINAL_COMPANY_STATUSES = Set.of("Accepted", "Rejected");
 
     // Fixed vocabulary for how the company will contact an accepted candidate - "other" is the
     // one value that requires the accompanying free-text contactMethodOther to be non-blank
@@ -63,6 +71,9 @@ public class ApplicationController {
 
     @Autowired
     private CandidateSummaryService candidateSummaryService;
+
+    @Autowired
+    private CVAnalysisRepository cvAnalysisRepository;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -309,7 +320,7 @@ public class ApplicationController {
 
         if (request.status() == null || !ALLOWED_COMPANY_STATUSES.contains(request.status())) {
             response.put("success", false);
-            response.put("message", "Status must be Accepted or Rejected");
+            response.put("message", "Status must be one of: Accepted, Rejected, Shortlisted, Under Review");
             return response;
         }
 
@@ -356,7 +367,7 @@ public class ApplicationController {
             // time firing a fresh, contradictory notification to the candidate, while leftover
             // fields from the earlier decision (e.g. contactMethod from an old acceptance) stayed
             // on the row instead of being cleared by the new one.
-            if (ALLOWED_COMPANY_STATUSES.contains(existing.getStatus())) {
+            if (FINAL_COMPANY_STATUSES.contains(existing.getStatus())) {
                 response.put("success", false);
                 response.put("message", "This application has already been " + existing.getStatus().toLowerCase()
                         + " and cannot be changed.");
@@ -409,6 +420,16 @@ public class ApplicationController {
 
                                 notificationService.createNotification(
                                         saved.getCandidateEmail(), "Application Rejected", text, "APPLICATION_REJECTED");
+                            } else if ("Shortlisted".equals(saved.getStatus())) {
+                                notificationService.createNotification(
+                                        saved.getCandidateEmail(), "Application Shortlisted",
+                                        "Your application for " + jobTitle + " has been shortlisted.",
+                                        "APPLICATION_SHORTLISTED");
+                            } else if ("Under Review".equals(saved.getStatus())) {
+                                notificationService.createNotification(
+                                        saved.getCandidateEmail(), "Application Status Updated",
+                                        "Your application for " + jobTitle + " is under review.",
+                                        "APPLICATION_STATUS_UPDATED");
                             }
                         }
 
@@ -561,5 +582,75 @@ public class ApplicationController {
         response.put("matchLabel", result.matchLabel());
 
         return ResponseEntity.ok(response);
+    }
+
+    // Raw, already-extracted CVAnalysis fields for the company's candidate-details view (skills
+    // chips, experience, education, languages) - a plain DB read, never calling OpenAI, so it's
+    // always safe to fetch on every page load (unlike ai-summary above, which can trigger a
+    // fresh generation the first time it's called for a candidate+job pair).
+    @GetMapping("/{id}/candidate-profile")
+    @PreAuthorize("hasRole('COMPANY')")
+    public ResponseEntity<?> getCandidateProfile(@PathVariable Long id, Authentication authentication) {
+        Application application = applicationRepository.findById(id).orElse(null);
+
+        if (application == null) {
+            return ResponseEntity.status(404).body("Application not found");
+        }
+
+        Job job = jobRepository.findById(application.getJobId()).orElse(null);
+
+        if (job == null || !authentication.getName().equals(job.getCompanyEmail())) {
+            return ResponseEntity.status(404).body("Application not found");
+        }
+
+        User candidate = userRepository.findByEmail(application.getCandidateEmail());
+        boolean resumeUploaded = candidate != null
+                && candidate.getCvFileName() != null
+                && !candidate.getCvFileName().isBlank();
+
+        CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(application.getCandidateEmail()).orElse(null);
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("resumeUploaded", resumeUploaded);
+
+        if (analysis == null) {
+            response.put("hasAnalysis", false);
+            return ResponseEntity.ok(response);
+        }
+
+        response.put("hasAnalysis", true);
+        response.put("skills", splitSkills(analysis.getTechnicalSkills(), analysis.getSoftSkills(), analysis.getSkills()));
+        response.put("yearsOfExperience", analysis.getYearsOfExperience());
+        response.put("experienceLevel", analysis.getExperienceLevel());
+        response.put("previousJobTitles", analysis.getPreviousJobTitles());
+        response.put("educationEvidence", analysis.getEducationEvidence());
+        response.put("certificationsEvidence", analysis.getCertificationsEvidence());
+        response.put("licensesEvidence", analysis.getLicensesEvidence());
+        response.put("languages", analysis.getLanguages());
+
+        return ResponseEntity.ok(response);
+    }
+
+    // technicalSkills/softSkills are the structured v3 fields; skills is the legacy combined
+    // string kept for CVs analyzed before that split existed - falls back to it only when both
+    // structured fields are empty, and never shows the same skill twice.
+    private List<String> splitSkills(String technicalSkills, String softSkills, String legacySkills) {
+        String combined = String.join(",",
+                technicalSkills == null ? "" : technicalSkills,
+                softSkills == null ? "" : softSkills);
+
+        if (combined.replace(",", "").isBlank() && legacySkills != null) {
+            combined = legacySkills;
+        }
+
+        LinkedHashSet<String> unique = new LinkedHashSet<>();
+        for (String skill : combined.split(",")) {
+            String trimmed = skill.trim();
+            if (!trimmed.isEmpty()) {
+                unique.add(trimmed);
+            }
+        }
+
+        return List.copyOf(unique);
     }
 }

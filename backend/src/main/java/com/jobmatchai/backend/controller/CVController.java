@@ -1,10 +1,14 @@
 package com.jobmatchai.backend.controller;
 
+import com.jobmatchai.backend.model.Application;
 import com.jobmatchai.backend.model.CVAnalysis;
 import com.jobmatchai.backend.model.CVAnalysisCache;
+import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.model.User;
+import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CVAnalysisCacheRepository;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
+import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.CVTextExtractorService;
 import com.jobmatchai.backend.service.OpenAICVAnalysisService;
@@ -21,6 +25,7 @@ import org.springframework.core.io.UrlResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
@@ -53,6 +58,12 @@ public class CVController {
 
     @Autowired
     private CVAnalysisCacheRepository cvAnalysisCacheRepository;
+
+    @Autowired
+    private ApplicationRepository applicationRepository;
+
+    @Autowired
+    private JobRepository jobRepository;
 
     // Bump this whenever the analyzeCV prompt changes materially (mirrors JobMatchService's
     // MATCH_SCHEMA_VERSION pattern) - keeps a prompt improvement from being silently masked by
@@ -294,56 +305,100 @@ public class CVController {
                 return ResponseEntity.status(403).body("You do not have access to this file");
             }
 
-            Path uploadPath = Paths.get(System.getProperty("user.dir"))
-                    .resolve(uploadDir)
-                    .normalize()
-                    .toAbsolutePath();
-
-            Path filePath = uploadPath.resolve(fileName).normalize().toAbsolutePath();
-
-            if (!filePath.startsWith(uploadPath)) {
-                return ResponseEntity.badRequest().body("Invalid file name");
-            }
-
-            Resource resource = new UrlResource(filePath.toUri());
-
-            if (!resource.exists()) {
-                return ResponseEntity.notFound().build();
-            }
-
-            String resourceFilename = resource.getFilename();
-            String lowerFileName = resourceFilename == null ? "" : resourceFilename.toLowerCase();
-
-            // Prefer the name the candidate actually uploaded over the sanitized/
-            // timestamp-prefixed storage name, so the browser's save dialog and inline
-            // viewer both show the real file name instead of a generic one.
-            String displayFilename = owner.getOriginalCvFileName() != null && !owner.getOriginalCvFileName().isBlank()
-                    ? owner.getOriginalCvFileName()
-                    : resourceFilename;
-
-            MediaType mediaType = MediaType.APPLICATION_OCTET_STREAM;
-
-            if (lowerFileName.endsWith(".pdf")) {
-                mediaType = MediaType.APPLICATION_PDF;
-            } else if (lowerFileName.endsWith(".doc")) {
-                mediaType = MediaType.parseMediaType("application/msword");
-            } else if (lowerFileName.endsWith(".docx")) {
-                mediaType = MediaType.parseMediaType(
-                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
-            }
-
-            return ResponseEntity.ok()
-                    .contentType(mediaType)
-                    .header(
-                            HttpHeaders.CONTENT_DISPOSITION,
-                            "inline; filename=\"" + (displayFilename != null ? displayFilename : fileName) + "\"")
-                    .body(resource);
+            return serveCvFile(fileName, owner.getOriginalCvFileName());
 
         } catch (Exception e) {
             log.error("Failed to download CV fileName={}", fileName, e);
             return ResponseEntity.internalServerError()
                     .body("Failed to download CV. Please try again.");
         }
+    }
+
+    // Company-side equivalent of downloadCV above - scoped by applicationId (never a raw
+    // filename, so there's no filename to guess/enumerate) and ownership-checked the same way
+    // every other company endpoint in this app checks an application: the requester must be the
+    // company that owns the job the application was submitted to.
+    @GetMapping("/company-download/{applicationId}")
+    @PreAuthorize("hasRole('COMPANY')")
+    public ResponseEntity<?> downloadCandidateResume(@PathVariable Long applicationId, Authentication authentication) {
+
+        try {
+            Application application = applicationRepository.findById(applicationId).orElse(null);
+
+            if (application == null) {
+                return ResponseEntity.status(404).body("Application not found");
+            }
+
+            Job job = jobRepository.findById(application.getJobId()).orElse(null);
+
+            if (job == null || !authentication.getName().equals(job.getCompanyEmail())) {
+                return ResponseEntity.status(404).body("Application not found");
+            }
+
+            User candidate = userRepository.findByEmail(application.getCandidateEmail());
+
+            if (candidate == null || candidate.getCvFileName() == null || candidate.getCvFileName().isBlank()) {
+                return ResponseEntity.status(404).body("This candidate has no resume on file");
+            }
+
+            return serveCvFile(candidate.getCvFileName(), candidate.getOriginalCvFileName());
+
+        } catch (Exception e) {
+            log.error("Failed to download candidate resume applicationId={}", applicationId, e);
+            return ResponseEntity.internalServerError()
+                    .body("Failed to download resume. Please try again.");
+        }
+    }
+
+    // Shared by downloadCV (candidate downloading their own resume) and
+    // downloadCandidateResume (company downloading an applicant's resume) - both already
+    // verify the caller is entitled to fileName before calling this; it only resolves the
+    // path safely and picks the right content type/display name.
+    private ResponseEntity<?> serveCvFile(String fileName, String originalFileName) throws Exception {
+        Path uploadPath = Paths.get(System.getProperty("user.dir"))
+                .resolve(uploadDir)
+                .normalize()
+                .toAbsolutePath();
+
+        Path filePath = uploadPath.resolve(fileName).normalize().toAbsolutePath();
+
+        if (!filePath.startsWith(uploadPath)) {
+            return ResponseEntity.badRequest().body("Invalid file name");
+        }
+
+        Resource resource = new UrlResource(filePath.toUri());
+
+        if (!resource.exists()) {
+            return ResponseEntity.notFound().build();
+        }
+
+        String resourceFilename = resource.getFilename();
+        String lowerFileName = resourceFilename == null ? "" : resourceFilename.toLowerCase();
+
+        // Prefer the name actually uploaded over the sanitized/timestamp-prefixed storage
+        // name, so the browser's save dialog and inline viewer both show the real file name
+        // instead of a generic one.
+        String displayFilename = originalFileName != null && !originalFileName.isBlank()
+                ? originalFileName
+                : resourceFilename;
+
+        MediaType mediaType = MediaType.APPLICATION_OCTET_STREAM;
+
+        if (lowerFileName.endsWith(".pdf")) {
+            mediaType = MediaType.APPLICATION_PDF;
+        } else if (lowerFileName.endsWith(".doc")) {
+            mediaType = MediaType.parseMediaType("application/msword");
+        } else if (lowerFileName.endsWith(".docx")) {
+            mediaType = MediaType.parseMediaType(
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+        }
+
+        return ResponseEntity.ok()
+                .contentType(mediaType)
+                .header(
+                        HttpHeaders.CONTENT_DISPOSITION,
+                        "inline; filename=\"" + (displayFilename != null ? displayFilename : fileName) + "\"")
+                .body(resource);
     }
 
     @GetMapping({"/extract", "/extract-text"})
