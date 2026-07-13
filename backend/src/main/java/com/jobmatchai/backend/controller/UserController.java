@@ -17,6 +17,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -39,6 +40,10 @@ public class UserController {
 
     @Autowired
     private AuthService authService;
+
+    private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
+
+    public record DeleteAccountRequest(String currentPassword) {}
 
     private static void stripPassword(User user) {
         if (user != null) {
@@ -254,7 +259,11 @@ public class UserController {
     }
 
     @DeleteMapping("/{id}")
-    public ResponseEntity<Map<String, Object>> deleteUser(@PathVariable long id, Authentication authentication) {
+    public ResponseEntity<Map<String, Object>> deleteUser(
+            @PathVariable long id,
+            @RequestBody(required = false) DeleteAccountRequest request,
+            Authentication authentication
+    ) {
         Map<String, Object> response = new HashMap<>();
 
         try {
@@ -270,6 +279,26 @@ public class UserController {
                 response.put("success", false);
                 response.put("message", "You can only delete your own account");
                 return ResponseEntity.status(HttpStatus.FORBIDDEN).body(response);
+            }
+
+            // Company deletion cascades through every job the company posted and every
+            // application against those jobs (see UserDeletionService) - far more destructive
+            // than a candidate deleting their own account, so it's the one role gated behind
+            // re-entering the current password rather than just the ownership check above.
+            if ("company".equalsIgnoreCase(existingUser.getRole())) {
+                String currentPassword = request != null ? request.currentPassword() : null;
+
+                if (currentPassword == null || currentPassword.isBlank()) {
+                    response.put("success", false);
+                    response.put("message", "Current password is required to delete your account.");
+                    return ResponseEntity.badRequest().body(response);
+                }
+
+                if (!passwordEncoder.matches(currentPassword, existingUser.getPassword())) {
+                    response.put("success", false);
+                    response.put("message", "Current password is incorrect.");
+                    return ResponseEntity.badRequest().body(response);
+                }
             }
 
             userDeletionService.deleteUserAccount(existingUser.getEmail());
