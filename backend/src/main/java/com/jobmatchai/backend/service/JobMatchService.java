@@ -17,6 +17,8 @@ import com.jobmatchai.backend.util.MatchScoreCalculator.WeightedResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -28,9 +30,12 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
 @Service
@@ -55,7 +60,25 @@ public class JobMatchService {
     @Autowired
     private OpenAICVAnalysisService openAICVAnalysisService;
 
+    @Autowired
+    private EmbeddingService embeddingService;
+
+    @Value("${matching.embedding.prefilter.enabled:false}")
+    private boolean prefilterEnabled;
+
+    @Value("${matching.embedding.prefilter.threshold:0.15}")
+    private float prefilterThreshold;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
+
+    // Guards against two overlapping requests for the same candidate+job both hitting a cache
+    // miss and both firing an AI call - a real risk once scoring moves off one self-serializing
+    // blocking HTTP request (see computeMatchScoresStreaming): a second request for a key
+    // already being computed joins the SAME CompletableFuture instead of duplicating work. Only
+    // protects within this one JVM - jobMatchScoreRepositorySafeSave is the cross-process
+    // backstop for the same race.
+    private final ConcurrentHashMap<String, CompletableFuture<JobMatchScore>> inFlightComputations =
+            new ConcurrentHashMap<>();
 
     // Bump this whenever the AI prompt/response schema for computeJobMatches changes, OR
     // whenever a fix could change what the AI decides for an already-cached candidate+job pair
@@ -80,7 +103,41 @@ public class JobMatchService {
     // certificationMatchPercent=100, since licensesEvidence doesn't record WHICH profession the
     // license is for. Now scoreCertification discounts a "specific_license" match heavily unless
     // fieldRelationCloseness is same_role/same_specialization (see sameSpecificRole).
-    private static final String MATCH_SCHEMA_VERSION = "v12-license-specificity";
+    //
+    // v13: fixed a live-data finding - two real internal jobs titled/described "doctor" (skills
+    // field left as stale "React, TypeScript" copy-pasted from a different posting template)
+    // were coming back fieldRelationCloseness="unrelated" against a doctor CV, because the
+    // computeJobMatches prompt let the job's own (wrong) skills field outweigh its own
+    // unambiguous title/description. The prompt now explicitly treats a job's Title/Description
+    // as authoritative over a contradictory skills field for this judgment.
+    //
+    // v14: fixed a live-data finding - external postings "Director, Delivery (EMEA)" (a senior
+    // service-delivery leadership role) and "...Delivery Station Customer Support" were both
+    // force-boosted to 85% for a doctor CV, because isGeneralVocationalRole matched the bare
+    // substring "delivery" - a keyword meant for actual delivery-driver jobs, not "service
+    // delivery" as a business term. Tightened several keywords that were ambiguous as bare
+    // substrings ("delivery" -> "delivery driver"/"delivery associate", "driver" removed
+    // entirely since "driver" alone also false-matches unrelated titles like "Device Driver
+    // Engineer", "warehouse"/"stock" narrowed to specific role phrases) and added a seniority
+    // guard: a title carrying a clear leadership/strategic-scope word (director, manager, head
+    // of, VP, chief, principal, executive, president) is never treated as a general/vocational
+    // role even if it also contains one of these keywords, since "anyone can do this job
+    // regardless of background" is definitionally false for a director-level role.
+    // v15: experience credit is now discounted one rank whenever fieldRelationCloseness is only
+    // same_broad_field (not the candidate's own specific role/specialization) - the candidate's
+    // experienceLevel is a single blanket seniority bucket that doesn't record which field it
+    // was earned in, so e.g. senior-level Customer Service experience was getting counted at
+    // full seniority credit against a QA Engineer posting just because some broad-field
+    // relation existed. See MatchScoreCalculator#scoreExperience's sameSpecificRole parameter -
+    // same discount pattern scoreCertification already used for licenses.
+    // v16: fixed a live-testing finding - a doctor's CV was scoring 83-85% overall against a
+    // Cashier posting. The general-vocational-role override (see GENERAL_VOCATIONAL_ROLE_KEYWORDS
+    // below) was scoring fieldRelevance at 85 - higher than even same_specialization's 80 - and
+    // still fully scoring experience, so a senior candidate's unrelated-field seniority trivially
+    // cleared the entry-level requirement. Field relevance for this case is now 25 (see
+    // MatchScoreCalculator#scoreFieldRelevance), and experience is excluded entirely for
+    // vocational roles, same as education already was.
+    private static final String MATCH_SCHEMA_VERSION = "v16-vocational-role-score-capped";
 
     // General/entry-level/vocational roles - ones that don't require specialized prior training,
     // a degree, or domain-specific tools to perform. Two separate backend overrides key off this
@@ -92,11 +149,29 @@ public class JobMatchService {
     // cleaning supervisor CV against "Office Cleaner"/"Customer Service Representative" postings
     // came back fieldRelated=false, contradicting this exact design intent - the prompt alone
     // didn't reliably carry the exception, so it's enforced here instead of trusted to the model.
+    //
+    // Deliberately specific phrases rather than single ambiguous words (see v14 above) - a bare
+    // "delivery", "driver", "warehouse", or "stock" is a substring of plenty of skilled/senior
+    // titles ("Director, Delivery", "Device Driver Engineer", "Warehouse Operations Manager",
+    // "Senior Stock Analyst") that have nothing to do with an entry-level vocational role.
     private static final List<String> GENERAL_VOCATIONAL_ROLE_KEYWORDS = List.of(
             "cashier", "sales assistant", "sales associate", "cleaner", "cleaning",
-            "warehouse", "driver", "delivery", "waiter", "waitress", "barista",
-            "security guard", "courier", "stock", "retail assistant", "housekeeping",
-            "kitchen porter", "dishwasher", "receptionist", "customer service representative"
+            "warehouse associate", "warehouse worker", "delivery driver", "delivery associate",
+            "food delivery", "waiter", "waitress", "barista",
+            "security guard", "courier", "stock associate", "stock clerk", "retail assistant",
+            "housekeeping", "kitchen porter", "dishwasher", "receptionist",
+            "customer service representative"
+    );
+
+    // A leadership/strategic-scope title is never "anyone can do this regardless of background" -
+    // it overrides a keyword match above (see isGeneralVocationalRole), catching cases the
+    // narrower phrases in that list alone wouldn't (e.g. "Customer Service Manager" still
+    // contains "customer service representative"? no - but a future keyword addition might
+    // reintroduce this exact false-positive shape, so this guard is a general-purpose backstop,
+    // not just a fix for the one "Director, Delivery" case that surfaced it).
+    private static final List<String> SENIORITY_EXCLUSION_KEYWORDS = List.of(
+            "director", "manager", "head of", " vp ", "vp,", "vice president", "chief",
+            "principal", "executive", "president"
     );
 
     private static boolean isGeneralVocationalRole(String jobTitle) {
@@ -104,8 +179,48 @@ public class JobMatchService {
             return false;
         }
 
-        String lowerTitle = jobTitle.toLowerCase(Locale.ROOT);
+        String lowerTitle = " " + jobTitle.toLowerCase(Locale.ROOT) + " ";
+
+        if (SENIORITY_EXCLUSION_KEYWORDS.stream().anyMatch(lowerTitle::contains)) {
+            return false;
+        }
+
         return GENERAL_VOCATIONAL_ROLE_KEYWORDS.stream().anyMatch(lowerTitle::contains);
+    }
+
+    // The deterministic, keyword-free pre-filter gate (see EmbeddingService): decides whether a
+    // job is even worth an AI classification call, using ONLY cosine similarity between two
+    // already-computed embedding vectors - never a job title/skills substring. isGeneralVocationalRole
+    // is consulted here strictly as a one-way backstop that FORCES AI-eligibility (a vocational
+    // role must never be silently skipped by a semantic-distance heuristic); it can never be the
+    // reason a job gets excluded, which is what keeps the exclusion decision itself keyword-free.
+    // Fails open on every axis: disabled flag, missing profile vector, or missing job vector all
+    // return false (send to AI) rather than guessing.
+    private boolean shouldSkipAiViaPrefilter(Job job, float[] profileVector, float[] jobVector) {
+        if (!prefilterEnabled || profileVector == null || jobVector == null) {
+            return false;
+        }
+        if (isGeneralVocationalRole(job.getTitle())) {
+            return false;
+        }
+        return EmbeddingService.cosineSimilarity(profileVector, jobVector) < prefilterThreshold;
+    }
+
+    // Persists a pre-filter skip through the exact same code path an AI "unrelated" verdict
+    // already uses (applyParsedMatchToScore) via a synthetic ParsedMatch, instead of duplicating
+    // persistence logic - the resulting JobMatchScore row (fieldRelated=false, matchPercent=null)
+    // is indistinguishable from, and just as cache-valid as, one the AI itself produced.
+    private void applyPrefilteredUnrelatedVerdict(
+            JobMatchScore score, Job job, CVAnalysis analysis, String email, long jobId,
+            String cvFingerprint, String jobFingerprint, String jobContentFingerprint) {
+
+        ParsedMatch synthetic = new ParsedMatch(
+                jobId, job.getTitle(), jobContentFingerprint, "unrelated",
+                "Based on your profile, this role appears to be in a different field.",
+                List.of(), List.of(), List.of(), List.of(), null, null, null);
+
+        applyParsedMatchToScore(score, synthetic, job, analysis, email, jobId,
+                cvFingerprint, jobFingerprint, jobContentFingerprint);
     }
 
     public record MatchScoresResult(boolean hasAnalysis, List<Map<String, Object>> matches) {}
@@ -153,30 +268,210 @@ public class JobMatchService {
             if (score == null) {
                 continue;
             }
-
-            Map<String, Object> match = new LinkedHashMap<>();
-            match.put("jobId", score.getJobId());
-            // fieldRelated is left as-is (including null) rather than coerced to true - null is
-            // the honest "we couldn't compute this, please retry" sentinel from ensureCoreScores,
-            // and collapsing it into true would misrepresent a failed computation as a real,
-            // AI-decided verdict.
-            match.put("fieldRelated", score.getFieldRelated());
-            match.put("matchPercent", score.getMatchPercent());
-            match.put("matchReason", score.getMatchReason());
-            match.put("matchedSkills", splitSkillsString(score.getMatchedSkills()));
-            match.put("missingSkills", splitSkillsString(score.getMissingSkills()));
-            match.put("missingRequiredSkills", splitSkillsString(score.getMissingRequiredSkills()));
-            match.put("missingPreferredSkills", splitSkillsString(score.getMissingPreferredSkills()));
-            match.put("fieldRelevancePercent", score.getFieldRelevancePercent());
-            match.put("skillsMatchPercent", score.getSkillsMatchPercent());
-            match.put("experienceMatchPercent", score.getExperienceMatchPercent());
-            match.put("educationMatchPercent", score.getEducationMatchPercent());
-            match.put("certificationMatchPercent", score.getCertificationMatchPercent());
-            match.put("locationMatchPercent", score.getLocationMatchPercent());
-            matches.add(match);
+            matches.add(scoreToPayload(score));
         }
 
         return new MatchScoresResult(true, matches);
+    }
+
+    // Shared by getMatchScores (the synchronous list) and computeMatchScoresStreaming (progressive
+    // per-job SSE payloads) - one place that defines what a "match" looks like over the wire.
+    private Map<String, Object> scoreToPayload(JobMatchScore score) {
+        Map<String, Object> match = new LinkedHashMap<>();
+        match.put("jobId", score.getJobId());
+        // fieldRelated is left as-is (including null) rather than coerced to true - null is
+        // the honest "we couldn't compute this, please retry" sentinel, and collapsing it into
+        // true would misrepresent a failed computation as a real, AI-decided verdict.
+        match.put("fieldRelated", score.getFieldRelated());
+        match.put("matchPercent", score.getMatchPercent());
+        match.put("matchReason", score.getMatchReason());
+        match.put("matchedSkills", splitSkillsString(score.getMatchedSkills()));
+        match.put("missingSkills", splitSkillsString(score.getMissingSkills()));
+        match.put("missingRequiredSkills", splitSkillsString(score.getMissingRequiredSkills()));
+        match.put("missingPreferredSkills", splitSkillsString(score.getMissingPreferredSkills()));
+        match.put("fieldRelevancePercent", score.getFieldRelevancePercent());
+        match.put("skillsMatchPercent", score.getSkillsMatchPercent());
+        match.put("experienceMatchPercent", score.getExperienceMatchPercent());
+        match.put("educationMatchPercent", score.getEducationMatchPercent());
+        match.put("certificationMatchPercent", score.getCertificationMatchPercent());
+        match.put("locationMatchPercent", score.getLocationMatchPercent());
+        return match;
+    }
+
+    private Map<String, Object> errorPayload(long jobId) {
+        Map<String, Object> match = new LinkedHashMap<>();
+        match.put("jobId", jobId);
+        match.put("fieldRelated", null);
+        match.put("matchPercent", null);
+        match.put("matchReason", "We couldn't calculate a match for this job right now. Please try again.");
+        match.put("matchedSkills", List.of());
+        match.put("missingSkills", List.of());
+        match.put("missingRequiredSkills", List.of());
+        match.put("missingPreferredSkills", List.of());
+        match.put("fieldRelevancePercent", null);
+        match.put("skillsMatchPercent", null);
+        match.put("experienceMatchPercent", null);
+        match.put("educationMatchPercent", null);
+        match.put("certificationMatchPercent", null);
+        match.put("locationMatchPercent", null);
+        return match;
+    }
+
+    // True as soon as a candidate has ANY persisted CVAnalysis - lets a streaming caller (see
+    // ExternalJobController) emit its "no-analysis" event up front without needing to duplicate
+    // the lookup ensureCoreScores/computeMatchScoresStreaming already do internally.
+    public boolean hasAnalysis(String email) {
+        return cvAnalysisRepository.findByUserEmail(email).isPresent();
+    }
+
+    // Transport-agnostic progressive scoring entry point (nothing SSE/HTTP-specific in this
+    // signature - a BiConsumer/Runnable pair), built generically so it's reusable for internal
+    // jobs later even though only the external-jobs streaming endpoint calls it today. Emits
+    // exactly one terminal onJobResult call per requested job - instantly for cache hits and
+    // pre-filter skips, asynchronously as each AI-scored job's own call finishes - so a caller
+    // (see ExternalJobController's SSE endpoint) can never be left waiting on a job that silently
+    // never resolves; onComplete fires once every job has been accounted for. jobEmbeddings may
+    // be empty (internal jobs, or an unbackfilled external job) - the pre-filter simply never
+    // fires for those, exactly like today's AI-only behavior.
+    public void computeMatchScoresStreaming(
+            String email, List<Job> jobs, String language, Map<Long, float[]> jobEmbeddings,
+            BiConsumer<Long, Map<String, Object>> onJobResult, Runnable onComplete) {
+
+        CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(email).orElse(null);
+        if (analysis == null || jobs == null || jobs.isEmpty()) {
+            onComplete.run();
+            return;
+        }
+
+        String cvFingerprint = fingerprintCv(analysis);
+
+        List<Long> jobIds = jobs.stream().map(Job::getId).toList();
+        Map<Long, JobMatchScore> cachedByJobId = new HashMap<>();
+        for (JobMatchScore score : jobMatchScoreRepository.findByCandidateEmailAndJobIdIn(email, jobIds)) {
+            cachedByJobId.put(score.getJobId(), score);
+        }
+
+        Map<Long, String> jobFingerprints = new HashMap<>();
+        Map<Long, String> jobContentFingerprints = new HashMap<>();
+        List<Job> jobsNeedingComputation = new ArrayList<>();
+
+        for (Job job : jobs) {
+            String jobFingerprint = fingerprintJob(job);
+            jobFingerprints.put(job.getId(), jobFingerprint);
+            jobContentFingerprints.put(job.getId(), buildJobContentFingerprint(job, jobFingerprint));
+
+            JobMatchScore cached = cachedByJobId.get(job.getId());
+            boolean isStale = cached == null
+                    || !cvFingerprint.equals(cached.getCvFingerprint())
+                    || !jobFingerprint.equals(cached.getJobFingerprint());
+
+            if (isStale) {
+                jobsNeedingComputation.add(job);
+            } else {
+                onJobResult.accept(job.getId(), scoreToPayload(cached));
+            }
+        }
+
+        if (jobsNeedingComputation.isEmpty()) {
+            onComplete.run();
+            return;
+        }
+
+        // Only bother computing/loading the candidate's own profile vector if the caller
+        // actually supplied any job vectors to compare it against - avoids a wasted embeddings
+        // call for a caller that never wires up jobEmbeddings at all (e.g. internal jobs today).
+        boolean anyJobEmbeddings = jobEmbeddings != null && !jobEmbeddings.isEmpty();
+        float[] profileVector = anyJobEmbeddings
+                ? embeddingService.ensureProfileEmbedding(analysis, cvAnalysisRepository)
+                : null;
+
+        List<Job> jobsSentToAi = new ArrayList<>();
+        Map<Long, Float> similarityByJobId = new HashMap<>();
+
+        for (Job job : jobsNeedingComputation) {
+            float[] jobVector = jobEmbeddings == null ? null : jobEmbeddings.get(job.getId());
+            if (profileVector != null && jobVector != null) {
+                similarityByJobId.put(job.getId(), EmbeddingService.cosineSimilarity(profileVector, jobVector));
+            }
+
+            if (shouldSkipAiViaPrefilter(job, profileVector, jobVector)) {
+                JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
+                applyPrefilteredUnrelatedVerdict(score, job, analysis, email, job.getId(),
+                        cvFingerprint, jobFingerprints.get(job.getId()), jobContentFingerprints.get(job.getId()));
+                score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
+                onJobResult.accept(job.getId(), scoreToPayload(score));
+            } else {
+                jobsSentToAi.add(job);
+            }
+        }
+
+        if (jobsSentToAi.isEmpty()) {
+            onComplete.run();
+            return;
+        }
+
+        Semaphore limiter = new Semaphore(MAX_CONCURRENT_MATCH_CALLS);
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        AtomicInteger remaining = new AtomicInteger(jobsSentToAi.size());
+
+        for (Job job : jobsSentToAi) {
+            String inFlightKey = email + "|" + job.getId();
+
+            CompletableFuture<JobMatchScore> future = inFlightComputations.computeIfAbsent(inFlightKey, k -> {
+                CompletableFuture<JobMatchScore> f = CompletableFuture.supplyAsync(() -> {
+                    JsonNode matches = computeChunkWithRetry(analysis, List.of(job), jobFingerprints, language, limiter);
+                    JsonNode match = firstMatchForJob(matches, job.getId());
+                    if (match == null) {
+                        return null;
+                    }
+
+                    ParsedMatch parsed = parseMatch(match);
+                    JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
+                    applyParsedMatchToScore(score, parsed, job, analysis, email, job.getId(),
+                            cvFingerprint, jobFingerprints.get(job.getId()), jobContentFingerprints.get(job.getId()));
+                    score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
+                    maybeNotifyHighMatch(email, job, score);
+                    return score;
+                }, executor);
+
+                f.whenComplete((result, ex) -> inFlightComputations.remove(k, f));
+                return f;
+            });
+
+            future.whenComplete((score, ex) -> {
+                Float similarity = similarityByJobId.get(job.getId());
+                if (similarity != null) {
+                    // Shadow-calibration signal: logged for every job that actually reached the
+                    // AI (whether because the prefilter is disabled, or scored above threshold),
+                    // so the threshold in application.properties can be validated against real
+                    // (similarity, AI verdict) pairs before - and after - it's trusted to skip
+                    // AI calls outright. See matching.embedding.prefilter.* config.
+                    Boolean fieldRelated = score != null ? score.getFieldRelated() : null;
+                    log.info("prefilter-shadow email={} jobId={} similarity={} fieldRelated={}",
+                            email, job.getId(), similarity, fieldRelated);
+                }
+
+                Map<String, Object> payload = (score != null) ? scoreToPayload(score) : errorPayload(job.getId());
+                onJobResult.accept(job.getId(), payload);
+
+                if (remaining.decrementAndGet() == 0) {
+                    executor.shutdown();
+                    onComplete.run();
+                }
+            });
+        }
+    }
+
+    private JsonNode firstMatchForJob(JsonNode matches, long jobId) {
+        if (matches == null) {
+            return null;
+        }
+        for (JsonNode match : matches) {
+            if (match.hasNonNull("jobId") && match.path("jobId").asLong() == jobId) {
+                return match;
+            }
+        }
+        return null;
     }
 
     // The single source of truth for matchPercent/fieldRelated/matchReason/matchedSkills/
@@ -238,20 +533,11 @@ public class JobMatchService {
                     applyParsedMatchToScore(score, parsed, job, analysis, email, jobId,
                             cvFingerprint, jobFingerprints.get(jobId), jobContentFingerprints.get(jobId));
 
-                    score = jobMatchScoreRepository.save(score);
+                    score = jobMatchScoreRepositorySafeSave(score, email, jobId);
                     cachedByJobId.put(jobId, score);
                     succeededJobIds.add(jobId);
 
-                    Integer matchPercent = score.getMatchPercent();
-                    if (matchPercent != null && matchPercent >= HIGH_MATCH_NOTIFICATION_THRESHOLD) {
-                        notificationService.createNotificationOnce(
-                                email,
-                                "Great Job Match Found",
-                                "You're a " + matchPercent + "% match for " + job.getTitle() + ".",
-                                "JOB_MATCH_HIGH",
-                                jobId
-                        );
-                    }
+                    maybeNotifyHighMatch(email, job, score);
                 } catch (Exception e) {
                     // A DB save or notification hiccup on ONE job must not take out the rest of
                     // the batch - only THIS job falls through to the sentinel below.
@@ -280,6 +566,34 @@ public class JobMatchService {
         }
 
         return cachedByJobId;
+    }
+
+    private void maybeNotifyHighMatch(String email, Job job, JobMatchScore score) {
+        Integer matchPercent = score.getMatchPercent();
+        if (matchPercent != null && matchPercent >= HIGH_MATCH_NOTIFICATION_THRESHOLD) {
+            notificationService.createNotificationOnce(
+                    email,
+                    "Great Job Match Found",
+                    "You're a " + matchPercent + "% match for " + job.getTitle() + ".",
+                    "JOB_MATCH_HIGH",
+                    job.getId()
+            );
+        }
+    }
+
+    // Two overlapping requests for the same candidate+job can both hit a cache MISS and both
+    // attempt to INSERT a new JobMatchScore row for the same (candidateEmail, jobId) unique
+    // constraint - the in-memory inFlightComputations guard prevents this within one JVM, but
+    // this is the cross-process backstop (also relevant even today: two browser tabs hitting the
+    // existing synchronous endpoint at once). Someone else's concurrently-saved row for the exact
+    // same CV+job+schema is equally valid - there's no "which one is right" question - so just
+    // re-read and use theirs instead of surfacing an error.
+    private JobMatchScore jobMatchScoreRepositorySafeSave(JobMatchScore score, String email, long jobId) {
+        try {
+            return jobMatchScoreRepository.save(score);
+        } catch (DataIntegrityViolationException e) {
+            return jobMatchScoreRepository.findByCandidateEmailAndJobId(email, jobId).orElseThrow(() -> e);
+        }
     }
 
     // This is the ONE place a percentage is ever produced. The AI's job (parsed above) is
@@ -346,12 +660,20 @@ public class JobMatchService {
         boolean isVocationalRole = isGeneralVocationalRole(job.getTitle());
         String requiredEducationLevel = isVocationalRole ? null : parsed.requiredEducationLevel();
 
+        boolean sameSpecificRole = "same_role".equals(effectiveCloseness) || "same_specialization".equals(effectiveCloseness);
+
         Integer fieldRelevanceScore = MatchScoreCalculator.scoreFieldRelevance(effectiveCloseness);
-        Integer experienceScore = parsed.requiredExperienceLevel() == null ? null
-                : MatchScoreCalculator.scoreExperience(analysis.getExperienceLevel(), parsed.requiredExperienceLevel());
+        // Backend override: never score experience for a general/vocational role either - the
+        // candidate's seniority was earned in a field this job doesn't require, so it isn't real
+        // evidence of fit for a role "almost any reliable adult can do." Without this, a senior
+        // candidate's blanket experience level trivially clears any entry-level requirement,
+        // which combined with the old fieldRelevance=85 was how a doctor's CV scored 83-85%
+        // against a Cashier posting.
+        Integer experienceScore = (isVocationalRole || parsed.requiredExperienceLevel() == null) ? null
+                : MatchScoreCalculator.scoreExperience(
+                        analysis.getExperienceLevel(), parsed.requiredExperienceLevel(), sameSpecificRole);
         Integer educationScore = requiredEducationLevel == null ? null
                 : MatchScoreCalculator.scoreEducation(analysis.getEducationEvidence(), requiredEducationLevel);
-        boolean sameSpecificRole = "same_role".equals(effectiveCloseness) || "same_specialization".equals(effectiveCloseness);
         Integer certificationScore = parsed.requiredCertificationLevel() == null ? null
                 : MatchScoreCalculator.scoreCertification(
                         analysis.getCertificationsEvidence(), analysis.getLicensesEvidence(),

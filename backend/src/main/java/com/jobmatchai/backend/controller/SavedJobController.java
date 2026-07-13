@@ -2,6 +2,8 @@ package com.jobmatchai.backend.controller;
 
 import com.jobmatchai.backend.model.SavedJob;
 import com.jobmatchai.backend.repository.SavedJobRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
@@ -16,6 +18,8 @@ import java.util.Map;
 @RestController
 @RequestMapping("/api/saved-jobs")
 public class SavedJobController {
+
+    private static final Logger log = LoggerFactory.getLogger(SavedJobController.class);
 
     @Autowired
     private SavedJobRepository savedJobRepository;
@@ -62,8 +66,9 @@ public class SavedJobController {
 
             return response;
         } catch (Exception e) {
+            log.error("Failed to save job for candidate={} jobId={}", savedJob.getCandidateEmail(), savedJob.getJobId(), e);
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Failed to save job. Please try again.");
             return response;
         }
     }
@@ -79,8 +84,9 @@ public class SavedJobController {
             response.put("message", "Job removed from favorites");
             return response;
         } catch (Exception e) {
+            log.error("Failed to unsave job for candidate={} jobId={} jobType={}", authentication.getName(), jobId, jobType, e);
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Failed to remove job. Please try again.");
             return response;
         }
     }

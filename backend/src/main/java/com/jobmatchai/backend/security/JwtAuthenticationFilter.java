@@ -20,6 +20,9 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     @Autowired
     private JwtService jwtService;
 
+    @Autowired
+    private TokenRevocationService tokenRevocationService;
+
     @Override
     protected void doFilterInternal(
             HttpServletRequest request,
@@ -39,8 +42,11 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                 // requests combined, on every single authenticated call in the app.
                 String email = jwtService.extractEmail(token);
                 String role = jwtService.extractRole(token);
+                boolean revoked = email != null
+                        && tokenRevocationService.isRevoked(email, jwtService.extractIssuedAt(token));
 
-                if (email != null && role != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+                if (!revoked && email != null && role != null
+                        && SecurityContextHolder.getContext().getAuthentication() == null) {
                     String authority = "ROLE_" + role.toUpperCase();
 
                     UsernamePasswordAuthenticationToken authentication = new UsernamePasswordAuthenticationToken(

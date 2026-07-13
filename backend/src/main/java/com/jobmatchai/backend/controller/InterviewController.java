@@ -40,7 +40,13 @@ public class InterviewController {
                 ? null
                 : applicationRepository.findById(request.applicationId()).orElse(null);
 
-        if (application == null || application.getCandidateEmail() == null) {
+        // Without this check, any authenticated company could schedule an interview against
+        // ANY application by guessing/enumerating its numeric id - including another company's
+        // applicant - and the resulting row + candidate-facing notification would misrepresent
+        // it as coming from the job's real owning company. Same ownership check update() already
+        // enforces below, just applied at creation time too.
+        if (application == null || application.getCandidateEmail() == null
+                || !authentication.getName().equals(application.getCompanyEmail())) {
             response.put("success", false);
             response.put("message", "Application not found");
             return response;

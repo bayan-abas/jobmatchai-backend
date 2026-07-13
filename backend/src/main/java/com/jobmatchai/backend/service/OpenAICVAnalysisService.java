@@ -7,6 +7,10 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.jobmatchai.backend.model.CVAnalysis;
 import com.jobmatchai.backend.model.Job;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.stereotype.Service;
@@ -22,6 +26,8 @@ import java.util.Set;
 
 @Service
 public class OpenAICVAnalysisService {
+
+    private static final Logger log = LoggerFactory.getLogger(OpenAICVAnalysisService.class);
 
     @Value("${openai.api.key:}")
     private String apiKey;
@@ -42,9 +48,9 @@ public class OpenAICVAnalysisService {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    private final RestClient restClient = RestClient.builder()
-            .baseUrl("https://api.openai.com")
-            .build();
+    @Autowired
+    @Qualifier("openAIRestClient")
+    private RestClient restClient;
 
     public String analyzeCV(String cvText, String language) {
         try {
@@ -473,6 +479,8 @@ This asks ONLY how closely related the candidate's documented professional field
 
 Weigh the candidate's ENTIRE structured profile - Profession title, Candidate field, Previous job titles, Technical/soft skills, Education evidence, Certifications evidence, Licenses evidence, and the free-text summary/strengths - together. Never decide this from a single data point in isolation.
 
+On the JOB side, the posting's Title (and its Description, when the description actually describes real duties) is the authoritative signal for what profession the job IS - not its "Required skills" field. Real job postings are frequently filled out sloppily: a company may leave a stale, copy-pasted, or wrong "Required skills" list that has nothing to do with the role (e.g. a job titled "Doctor" or "Registered Nurse" listing "React, TypeScript" as its skills, left over from a different posting template). When a job's Title/Description clearly indicate one profession but its skills/requirements text looks unrelated or contradictory to that profession, trust the Title/Description for fieldRelationCloseness and treat the mismatched skills text as a data-entry error on the posting, not as evidence the job is secretly a different profession. That mismatch belongs entirely in STEP 2 (it will show up there as missing/unmatched skills, correctly penalizing a poorly-specified posting) - it must never by itself flip fieldRelationCloseness to "unrelated" when the Title/Description alone would clearly put the job in the candidate's field.
+
 Choose exactly one of:
 - "same_role": the job is the same specific profession/title as the candidate's (e.g. a licensed doctor CV against a "Physician" job).
 - "same_specialization": same specific profession, different seniority or sub-specialty (e.g. doctor CV against a specific medical specialty role, or a general "Healthcare"/clinical support role for a doctor).
@@ -534,7 +542,7 @@ Rules:
             // retries on the next request), but log it - otherwise a transient OpenAI failure
             // (rate limit, timeout, truncated JSON) silently drops every job in this batch
             // with zero trace of why.
-            e.printStackTrace();
+            log.error("computeJobMatches failed against OpenAI", e);
             return "{\"matches\":[]}";
         }
     }
@@ -630,6 +638,81 @@ Rules:
         }
     }
 
+    // Purely a readability transform of the posting's OWN text for the "About this job" display
+    // - never a scoring input (match scoring always reads the full raw description directly, see
+    // buildJobsBlock/buildSingleJobBlock) and never a substitute for it. Grounded strictly in the
+    // given description; every field must come back empty/"" rather than invented when the
+    // posting doesn't mention it - this is presenting the posting, not embellishing it. Cached by
+    // the caller (see ExternalJobService#getOrGenerateAboutSummary) so this only runs once per
+    // job per language, not on every view.
+    public String summarizeJobDescription(String title, String companyName, String description, String language) {
+        try {
+            String languageInstruction = switch (language == null ? "en" : language) {
+                case "ar" -> "Write every text value entirely in Arabic.";
+                case "he" -> "Write every text value entirely in Hebrew.";
+                default -> "Write every text value in English.";
+            };
+
+            String prompt = """
+Return ONLY a raw valid JSON object. No markdown. No explanations outside the JSON.
+""" + languageInstruction + """
+
+You are reformatting ONE job posting into a clean, scannable summary for a candidate reading it on a job board. You are NOT evaluating a candidate and NOT judging the job - just reorganizing THIS posting's own content into a clear structure.
+
+JOB POSTING:
+Title: """ + nullToNA(title) + """
+
+Company: """ + nullToNA(companyName) + """
+
+Full description:
+""" + nullToNA(description) + """
+
+
+CRITICAL RULE: use ONLY information that actually appears in the description above. Never invent, assume, or infer anything not stated or clearly implied by the text. If the posting doesn't mention something, leave that field empty ("" for text, [] for a list) - an empty field is the correct, honest answer, not a failure.
+
+Return exactly this JSON structure:
+{
+  "roleOverview": "",
+  "responsibilities": ["", ""],
+  "requiredQualifications": ["", ""],
+  "preferredQualifications": ["", ""],
+  "experienceLevel": "",
+  "workArrangement": "",
+  "importantConditions": ["", ""]
+}
+
+Field instructions:
+- roleOverview: 2-4 sentences explaining what this role is and what the team/product/company does, based only on the description.
+- responsibilities: the main duties/what the person will actually do day-to-day, as concise bullet points using the posting's own details (not restating the title).
+- requiredQualifications: mandatory/must-have skills, qualifications, or experience as stated in the posting - one bullet per distinct requirement.
+- preferredQualifications: nice-to-have/bonus/preferred items explicitly marked as such in the posting. Empty array if the posting draws no must-have/nice-to-have distinction.
+- experienceLevel: a short phrase (e.g. "5+ years", "Senior-level", "Entry-level / no experience required") ONLY if the posting states or clearly implies one - otherwise "".
+- workArrangement: the posting's own stated work location/arrangement (e.g. "Fully remote", "Hybrid, 3 days/week in office", "On-site in Tel Aviv") - otherwise "".
+- importantConditions: other conditions worth flagging - e.g. visa/work-authorization requirements, travel expectations, on-call/shift requirements, contract vs. full-time, salary/equity notes NOT already shown elsewhere. Empty array if none.
+""";
+
+            Map<String, Object> body = Map.of(
+                    "model", model,
+                    "input", prompt,
+                    "store", false,
+                    "temperature", 0,
+                    "text", Map.of("format", Map.of("type", "json_object"))
+            );
+
+            Map<String, Object> response = callOpenAI(body);
+            String result = extractTextFromOpenAIResponse(response);
+
+            if (result == null || result.isBlank()) {
+                return "{}";
+            }
+
+            return result;
+
+        } catch (Exception e) {
+            return "{}";
+        }
+    }
+
     public String computeCandidateSummary(CVAnalysis analysis, Job job, String language) {
         try {
             String languageInstruction = switch (language == null ? "en" : language) {
@@ -700,10 +783,9 @@ Field instructions:
     }
 
     private String buildSingleJobBlock(Job job) {
+        // No truncation - this explanation call must be grounded in the same complete
+        // posting the match score itself was computed from (see buildJobsBlock).
         String description = job.getDescription();
-        if (description != null && description.length() > 1500) {
-            description = description.substring(0, 1500);
-        }
 
         return """
 Title: %s
@@ -820,10 +902,14 @@ Overall CV score: %s
         StringBuilder sb = new StringBuilder();
 
         for (Job job : jobs) {
+            // No truncation here anymore - match scoring must see the COMPLETE posting.
+            // External jobs have no separate skills/requirements field from any provider (see
+            // JobicyJobProvider#resolveDescription), so the description is the only source of
+            // real requirement signal; truncating it was found via live testing to cut off
+            // requirements sections that start well past character 2000. The one remaining
+            // safety ceiling lives at ingestion time (ExternalJob#description is TEXT, capped
+            // only defensively at 20,000 chars in JobicyJobProvider).
             String description = job.getDescription();
-            if (description != null && description.length() > 500) {
-                description = description.substring(0, 500);
-            }
 
             String fingerprint = jobFingerprints == null ? null : jobFingerprints.get(job.getId());
 

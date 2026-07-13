@@ -92,6 +92,21 @@ public class CVAnalysis {
     @Column(name = "cv_text_hash")
     private String cvTextHash;
 
+    // Cached OpenAI embedding of this candidate's profile (professionTitle + candidateField +
+    // skills + summary) - backs the deterministic, keyword-free pre-filter in JobMatchService
+    // that decides whether a job is even worth an AI classification call. Lazily computed and
+    // fingerprinted the same way cvTextHash is: profileEmbeddingHash/-Model only match (and this
+    // vector only gets reused) when the underlying profile text and embedding model/dimensions
+    // are both unchanged - see EmbeddingService#ensureProfileEmbedding.
+    @Column(name = "profile_embedding", columnDefinition = "TEXT")
+    private String profileEmbedding;
+
+    @Column(name = "profile_embedding_hash")
+    private String profileEmbeddingHash;
+
+    @Column(name = "profile_embedding_model")
+    private String profileEmbeddingModel;
+
     public CVAnalysis() {
     }
 
@@ -189,6 +204,30 @@ public class CVAnalysis {
 
     public void setCvTextHash(String cvTextHash) {
         this.cvTextHash = cvTextHash;
+    }
+
+    public String getProfileEmbedding() {
+        return profileEmbedding;
+    }
+
+    public void setProfileEmbedding(String profileEmbedding) {
+        this.profileEmbedding = profileEmbedding;
+    }
+
+    public String getProfileEmbeddingHash() {
+        return profileEmbeddingHash;
+    }
+
+    public void setProfileEmbeddingHash(String profileEmbeddingHash) {
+        this.profileEmbeddingHash = profileEmbeddingHash;
+    }
+
+    public String getProfileEmbeddingModel() {
+        return profileEmbeddingModel;
+    }
+
+    public void setProfileEmbeddingModel(String profileEmbeddingModel) {
+        this.profileEmbeddingModel = profileEmbeddingModel;
     }
 
     public String getProfessionTitle() {

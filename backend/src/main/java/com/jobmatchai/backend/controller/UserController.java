@@ -4,12 +4,15 @@ import com.jobmatchai.backend.dto.RegisterRequest;
 import com.jobmatchai.backend.exception.EmailAlreadyExistsException;
 import com.jobmatchai.backend.exception.InvalidCredentialsException;
 import com.jobmatchai.backend.exception.InvalidRoleException;
+import com.jobmatchai.backend.exception.InvalidVerificationCodeException;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.AuthService;
 import com.jobmatchai.backend.service.UserDeletionService;
 import com.jobmatchai.backend.service.UserRegistrationService;
 import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -17,12 +20,13 @@ import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 @RestController
 @RequestMapping("/api/users")
 public class UserController {
+
+    private static final Logger log = LoggerFactory.getLogger(UserController.class);
 
     @Autowired
     private UserRepository userRepository;
@@ -69,13 +73,6 @@ public class UserController {
         return "Backend users API is working";
     }
 
-    @GetMapping("/all")
-    public List<User> getAllUsers() {
-        List<User> users = userRepository.findAll();
-        users.forEach(UserController::stripPassword);
-        return users;
-    }
-
     @PostMapping("/register")
     public ResponseEntity<Map<String, Object>> registerUser(@Valid @RequestBody RegisterRequest request) {
         Map<String, Object> response = new HashMap<>();
@@ -88,15 +85,15 @@ public class UserController {
             response.put("user", savedUser);
             return ResponseEntity.status(HttpStatus.CREATED).body(response);
 
-        } catch (EmailAlreadyExistsException | InvalidRoleException e) {
+        } catch (EmailAlreadyExistsException | InvalidRoleException | InvalidVerificationCodeException e) {
             response.put("success", false);
             response.put("message", e.getMessage());
             return ResponseEntity.badRequest().body(response);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("User registration failed", e);
 
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Registration failed. Please try again.");
             return ResponseEntity.internalServerError().body(response);
         }
     }
@@ -119,19 +116,24 @@ public class UserController {
             response.put("message", e.getMessage());
             return ResponseEntity.badRequest().body(response);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Login failed", e);
 
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Login failed. Please try again.");
             return ResponseEntity.internalServerError().body(response);
         }
     }
 
+    // Unused by the frontend today, but reachable by any authenticated user with no role/
+    // ownership check at all - a candidate could enumerate /api/users/1, /2, ... and read every
+    // other user's full profile (email, phone, location, company details). Scoped to the caller's
+    // own record only, mirroring the ownership check updateUser/deleteUser below already enforce.
     @GetMapping("/{id}")
-    public ResponseEntity<Map<String, Object>> getUserById(@PathVariable long id) {
+    public ResponseEntity<Map<String, Object>> getUserById(@PathVariable long id, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
 
         return userRepository.findById(id)
+                .filter(user -> user.getEmail().equals(authentication.getName()))
                 .map(user -> {
                     stripPassword(user);
                     response.put("success", true);
@@ -244,8 +246,9 @@ public class UserController {
             return ResponseEntity.ok(response);
 
         } catch (Exception e) {
+            log.error("Failed to update user id={}", id, e);
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Failed to update user. Please try again.");
             return ResponseEntity.internalServerError().body(response);
         }
     }
@@ -276,8 +279,9 @@ public class UserController {
             return ResponseEntity.ok(response);
 
         } catch (Exception e) {
+            log.error("Failed to delete user id={}", id, e);
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Failed to delete user. Please try again.");
             return ResponseEntity.internalServerError().body(response);
         }
     }

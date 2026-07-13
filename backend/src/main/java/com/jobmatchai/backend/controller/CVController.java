@@ -12,6 +12,8 @@ import com.jobmatchai.backend.util.HashUtil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
@@ -20,6 +22,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -33,6 +36,8 @@ import java.util.Optional;
 @RestController
 @RequestMapping("/api/cv")
 public class CVController {
+
+    private static final Logger log = LoggerFactory.getLogger(CVController.class);
 
     @Autowired
     private UserRepository userRepository;
@@ -177,12 +182,17 @@ public class CVController {
             return ResponseEntity.ok(Map.of("fileName", fileName, "originalFileName", originalFileName));
 
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Failed to upload CV", e);
             return ResponseEntity.internalServerError()
-                    .body("Failed to upload CV: " + e.getMessage());
+                    .body("Failed to upload CV. Please try again.");
         }
     }
 
+    // Transactional so the user-record update and the CVAnalysis delete either both
+    // commit or both roll back - otherwise a failure between the two could clear
+    // cvFileName while leaving a stale CVAnalysis row behind, letting match scores
+    // keep showing for a candidate who believes they have no CV on file.
+    @Transactional
     @DeleteMapping("/delete")
     public ResponseEntity<?> deleteCV(Authentication authentication) {
         try {
@@ -224,9 +234,9 @@ public class CVController {
             return ResponseEntity.ok("CV deleted successfully");
 
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Failed to delete CV", e);
             return ResponseEntity.internalServerError()
-                    .body("Failed to delete CV: " + e.getMessage());
+                    .body("Failed to delete CV. Please try again.");
         }
     }
 
@@ -330,9 +340,9 @@ public class CVController {
                     .body(resource);
 
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Failed to download CV fileName={}", fileName, e);
             return ResponseEntity.internalServerError()
-                    .body("Failed to download CV: " + e.getMessage());
+                    .body("Failed to download CV. Please try again.");
         }
     }
 
@@ -374,9 +384,9 @@ public class CVController {
                     .body(text);
 
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Failed to extract CV text for user={}", email, e);
             return ResponseEntity.internalServerError()
-                    .body("Failed to extract CV text: " + e.getMessage());
+                    .body("Failed to extract CV text. Please try again.");
         }
     }
 
@@ -537,9 +547,9 @@ public class CVController {
             return ResponseEntity.ok(analysis);
 
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Failed to analyze CV for user={}", email, e);
             return ResponseEntity.internalServerError()
-                    .body("Failed to analyze CV: " + e.getMessage());
+                    .body("Failed to analyze CV. Please try again.");
         }
     }
 

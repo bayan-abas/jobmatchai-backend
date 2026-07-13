@@ -4,13 +4,18 @@ import com.jobmatchai.backend.dto.RegisterRequest;
 import com.jobmatchai.backend.exception.EmailAlreadyExistsException;
 import com.jobmatchai.backend.exception.InvalidCredentialsException;
 import com.jobmatchai.backend.exception.InvalidRoleException;
+import com.jobmatchai.backend.exception.InvalidVerificationCodeException;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.AuthService;
+import com.jobmatchai.backend.service.EmailVerificationService;
 import com.jobmatchai.backend.service.NotificationService;
 import com.jobmatchai.backend.service.PasswordResetService;
 import com.jobmatchai.backend.service.UserRegistrationService;
+import com.jobmatchai.backend.security.TokenRevocationService;
 import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -18,6 +23,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.regex.Pattern;
@@ -25,6 +31,8 @@ import java.util.regex.Pattern;
 @RestController
 @RequestMapping("/api/auth")
 public class AuthController {
+
+    private static final Logger log = LoggerFactory.getLogger(AuthController.class);
 
     private static final int MIN_PASSWORD_LENGTH = 6;
 
@@ -47,6 +55,12 @@ public class AuthController {
     @Autowired
     private AuthService authService;
 
+    @Autowired
+    private TokenRevocationService tokenRevocationService;
+
+    @Autowired
+    private EmailVerificationService emailVerificationService;
+
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     public record LoginRequest(String email, String password) {}
@@ -54,6 +68,28 @@ public class AuthController {
     public record ForgotPasswordRequest(String email) {}
 
     public record ResetPasswordRequest(String token, String newPassword) {}
+
+    public record SendVerificationCodeRequest(String email) {}
+
+    @PostMapping("/send-verification-code")
+    public ResponseEntity<Map<String, Object>> sendVerificationCode(@RequestBody SendVerificationCodeRequest request) {
+        Map<String, Object> response = new HashMap<>();
+
+        if (request.email() == null || request.email().isBlank()) {
+            response.put("success", false);
+            response.put("message", "Email is required.");
+            return ResponseEntity.badRequest().body(response);
+        }
+
+        String devCode = emailVerificationService.requestCode(request.email().trim().toLowerCase());
+
+        response.put("success", true);
+        response.put("message", "A verification code has been sent to your email.");
+        if (devCode != null) {
+            response.put("devCode", devCode);
+        }
+        return ResponseEntity.ok(response);
+    }
 
     @PostMapping("/register")
     public ResponseEntity<Map<String, Object>> register(@Valid @RequestBody RegisterRequest request) {
@@ -66,13 +102,14 @@ public class AuthController {
             response.put("message", "User registered successfully");
             response.put("user", savedUser);
             return ResponseEntity.status(HttpStatus.CREATED).body(response);
-        } catch (EmailAlreadyExistsException | InvalidRoleException e) {
+        } catch (EmailAlreadyExistsException | InvalidRoleException | InvalidVerificationCodeException e) {
             response.put("success", false);
             response.put("message", e.getMessage());
             return ResponseEntity.badRequest().body(response);
         } catch (Exception e) {
+            log.error("Registration failed (via /api/auth/register)", e);
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Registration failed. Please try again.");
             return ResponseEntity.internalServerError().body(response);
         }
     }
@@ -94,8 +131,9 @@ public class AuthController {
             response.put("message", e.getMessage());
             return ResponseEntity.badRequest().body(response);
         } catch (Exception e) {
+            log.error("Login failed (via /api/auth/login)", e);
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Login failed. Please try again.");
             return ResponseEntity.internalServerError().body(response);
         }
     }
@@ -186,6 +224,10 @@ public class AuthController {
 
         user.setPassword(passwordEncoder.encode(request.newPassword()));
         userRepository.save(user);
+
+        // A token issued before this change (e.g. a hijacked session that prompted the change)
+        // must stop working immediately rather than staying valid until it naturally expires.
+        tokenRevocationService.revokeTokensIssuedBefore(user.getEmail(), Instant.now());
 
         notificationService.createNotification(
                 user.getEmail(),

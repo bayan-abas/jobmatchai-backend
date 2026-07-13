@@ -9,6 +9,8 @@ import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.service.JobMatchService;
 import com.jobmatchai.backend.util.MatchLabelUtil;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -22,6 +24,8 @@ import java.util.Map;
 @RestController
 @RequestMapping("/api/jobs")
 public class JobController {
+
+    private static final Logger log = LoggerFactory.getLogger(JobController.class);
 
     @Autowired
     private JobRepository jobRepository;
@@ -245,8 +249,9 @@ public class JobController {
 
             return response;
         } catch (Exception e) {
+            log.error("Failed to add job for company={}", authentication.getName(), e);
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Failed to add job. Please try again.");
             return response;
         }
     }
@@ -308,8 +313,9 @@ public class JobController {
                     });
 
         } catch (Exception e) {
+            log.error("Failed to update job id={} for company={}", id, authentication.getName(), e);
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Failed to update job. Please try again.");
             return response;
         }
     }
@@ -344,8 +350,9 @@ public class JobController {
                     });
 
         } catch (Exception e) {
+            log.error("Failed to delete job id={} for company={}", id, authentication.getName(), e);
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Failed to delete job. Please try again.");
             return response;
         }
     }
@@ -366,8 +373,8 @@ public class JobController {
             return ResponseEntity.ok(response);
 
         } catch (Exception e) {
-            e.printStackTrace();
-            return ResponseEntity.internalServerError().body("Failed to compute match scores: " + e.getMessage());
+            log.error("Failed to compute match scores for candidate={}", authentication.getName(), e);
+            return ResponseEntity.internalServerError().body("Failed to compute match scores. Please try again.");
         }
     }
 
@@ -412,8 +419,8 @@ public class JobController {
             return ResponseEntity.ok(response);
 
         } catch (Exception e) {
-            e.printStackTrace();
-            return ResponseEntity.internalServerError().body("Failed to compute match detail: " + e.getMessage());
+            log.error("Failed to compute match detail for candidate={} jobId={}", authentication.getName(), request.jobId(), e);
+            return ResponseEntity.internalServerError().body("Failed to compute match detail. Please try again.");
         }
     }
 }

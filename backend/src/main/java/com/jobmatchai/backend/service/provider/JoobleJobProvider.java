@@ -59,13 +59,15 @@ public class JoobleJobProvider implements ExternalJobProvider {
                 return List.of();
             }
 
+            boolean israelScoped = "Israel".equals(resolveLocation(country));
+
             List<ExternalJobData> jobs = new ArrayList<>();
             int count = 0;
             for (JsonNode result : response.get("jobs")) {
                 if (count >= maxResults) {
                     break;
                 }
-                jobs.add(mapResult(result));
+                jobs.add(mapResult(result, israelScoped));
                 count++;
             }
 
@@ -83,20 +85,34 @@ public class JoobleJobProvider implements ExternalJobProvider {
         return country;
     }
 
-    private ExternalJobData mapResult(JsonNode result) {
+    // ExternalJobService.isIsraelOrRemote decides whether a job is even shown to candidates by
+    // checking whether its location/type text literally contains "israel" or "remote" - it only
+    // trusts Jobicy's sourceName outright because Jobicy always sets it to the literal string
+    // "Jobicy". Jooble's sourceName (joobleSourceLabel below) is instead whatever underlying job
+    // board Jooble aggregated the listing from, so it can't be trusted the same way. Since this
+    // fetch was ALREADY scoped to Israel (resolveLocation above) whenever israelScoped is true,
+    // appending "Israel" onto the location text here is what lets isIsraelOrRemote's existing
+    // substring check pass honestly instead of silently dropping every on-site Israel job this
+    // provider returns (Jooble's own "location" field, e.g. "Tel Aviv", never contains the word
+    // "israel").
+    private ExternalJobData mapResult(JsonNode result, boolean israelScoped) {
         String applyUrl = textOrNull(result, "link");
         String externalId = textOrNull(result, "id");
         if (externalId == null || externalId.isBlank()) {
             externalId = applyUrl;
         }
+        String rawLocation = textOrNull(result, "location");
+        String location = (israelScoped && (rawLocation == null || !rawLocation.toLowerCase().contains("israel")))
+                ? (rawLocation == null ? "Israel" : rawLocation + ", Israel")
+                : rawLocation;
 
         return new ExternalJobData(
                 externalId,
                 textOrNull(result, "title"),
                 textOrNull(result, "company"),
-                textOrNull(result, "location"),
+                location,
                 "IL",
-                textOrNull(result, "location"),
+                location,
                 textOrNull(result, "type"),
                 textOrNull(result, "salary"),
                 textOrNull(result, "snippet"),

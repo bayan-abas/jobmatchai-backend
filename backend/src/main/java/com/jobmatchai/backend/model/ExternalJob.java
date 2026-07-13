@@ -31,8 +31,28 @@ public class ExternalJob {
     private String type;
     private String salary;
 
-    @Column(length = 2000)
+    // TEXT (not a bounded VARCHAR) - match scoring must see the posting's COMPLETE description,
+    // not a truncated excerpt (found via live testing that a real posting's requirements section
+    // can start well past character 2000, after a long company-intro paragraph). See
+    // JobicyJobProvider#resolveDescription for the one remaining safety ceiling (a generous
+    // upper bound against a pathologically huge response, not a normal-case truncation).
+    @Column(columnDefinition = "TEXT")
     private String description;
+
+    // AI-generated structured summary of the full description (JSON: roleOverview,
+    // responsibilities, requiredQualifications, preferredQualifications, experienceLevel,
+    // workArrangement, importantConditions - see OpenAICVAnalysisService#summarizeJobDescription)
+    // shown in the frontend's "About this job" section instead of the long raw description,
+    // which stays available in full for match scoring. Generated lazily on first request and
+    // cached here rather than regenerated on every view - see
+    // ExternalJobService#getOrGenerateAboutSummary.
+    @Column(columnDefinition = "TEXT")
+    private String aboutSummary;
+
+    // sha256(description + "|" + language) at the time aboutSummary was generated - a mismatch
+    // (description changed on re-import, or a different language was requested) means the cached
+    // summary is stale and must be regenerated.
+    private String aboutSummaryContentHash;
 
     private String requirements;
     private String skills;
@@ -50,6 +70,19 @@ public class ExternalJob {
     private String externalJobId;
 
     private LocalDateTime importedAt;
+
+    // Cached OpenAI embedding of this job's title+description, computed once at import time (see
+    // ExternalJobService) - backs the deterministic, keyword-free pre-filter in JobMatchService
+    // that decides whether a job is even worth an AI classification call, by cosine similarity
+    // against the candidate's own profile embedding (CVAnalysis#profileEmbedding).
+    @Column(name = "content_embedding", columnDefinition = "TEXT")
+    private String contentEmbedding;
+
+    @Column(name = "content_embedding_hash")
+    private String contentEmbeddingHash;
+
+    @Column(name = "content_embedding_model")
+    private String contentEmbeddingModel;
 
     public ExternalJob() {}
 
@@ -183,5 +216,45 @@ public class ExternalJob {
 
     public void setImportedAt(LocalDateTime importedAt) {
         this.importedAt = importedAt;
+    }
+
+    public String getContentEmbedding() {
+        return contentEmbedding;
+    }
+
+    public void setContentEmbedding(String contentEmbedding) {
+        this.contentEmbedding = contentEmbedding;
+    }
+
+    public String getContentEmbeddingHash() {
+        return contentEmbeddingHash;
+    }
+
+    public void setContentEmbeddingHash(String contentEmbeddingHash) {
+        this.contentEmbeddingHash = contentEmbeddingHash;
+    }
+
+    public String getContentEmbeddingModel() {
+        return contentEmbeddingModel;
+    }
+
+    public void setContentEmbeddingModel(String contentEmbeddingModel) {
+        this.contentEmbeddingModel = contentEmbeddingModel;
+    }
+
+    public String getAboutSummary() {
+        return aboutSummary;
+    }
+
+    public void setAboutSummary(String aboutSummary) {
+        this.aboutSummary = aboutSummary;
+    }
+
+    public String getAboutSummaryContentHash() {
+        return aboutSummaryContentHash;
+    }
+
+    public void setAboutSummaryContentHash(String aboutSummaryContentHash) {
+        this.aboutSummaryContentHash = aboutSummaryContentHash;
     }
 }

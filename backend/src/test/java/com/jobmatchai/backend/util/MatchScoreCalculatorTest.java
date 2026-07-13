@@ -102,24 +102,35 @@ class MatchScoreCalculatorTest {
         assertThat(MatchScoreCalculator.scoreFieldRelevance("same_specialization")).isEqualTo(80);
         assertThat(MatchScoreCalculator.scoreFieldRelevance("same_broad_field")).isEqualTo(55);
         assertThat(MatchScoreCalculator.scoreFieldRelevance("SAME_ROLE")).isEqualTo(95); // case-insensitive
-        assertThat(MatchScoreCalculator.scoreFieldRelevance("general_vocational_role")).isEqualTo(85);
+        assertThat(MatchScoreCalculator.scoreFieldRelevance("general_vocational_role")).isEqualTo(25);
     }
 
     @Test
     void experienceScore_meetingOrExceedingRequiredLevel_isPerfect() {
-        assertThat(MatchScoreCalculator.scoreExperience("senior_level", "senior")).isEqualTo(100);
-        assertThat(MatchScoreCalculator.scoreExperience("senior_level", "entry")).isEqualTo(100);
-        assertThat(MatchScoreCalculator.scoreExperience("mid_level", "mid")).isEqualTo(100);
+        assertThat(MatchScoreCalculator.scoreExperience("senior_level", "senior", true)).isEqualTo(100);
+        assertThat(MatchScoreCalculator.scoreExperience("senior_level", "entry", true)).isEqualTo(100);
+        assertThat(MatchScoreCalculator.scoreExperience("mid_level", "mid", true)).isEqualTo(100);
     }
 
     @Test
     void experienceScore_shortfallCostsFixedPenaltyPerRank() {
         // entry_level (rank 1) vs required senior (rank 3): shortfall 2 * 40 = 80 -> 20.
-        assertThat(MatchScoreCalculator.scoreExperience("entry_level", "senior")).isEqualTo(20);
+        assertThat(MatchScoreCalculator.scoreExperience("entry_level", "senior", true)).isEqualTo(20);
         // none (rank 0) vs required entry (rank 1): shortfall 1 * 40 = 40 -> 60.
-        assertThat(MatchScoreCalculator.scoreExperience("none", "entry")).isEqualTo(60);
+        assertThat(MatchScoreCalculator.scoreExperience("none", "entry", true)).isEqualTo(60);
         // none (rank 0) vs required senior (rank 3): shortfall 3 * 40 = 120 -> clamped to 0.
-        assertThat(MatchScoreCalculator.scoreExperience("none", "senior")).isEqualTo(0);
+        assertThat(MatchScoreCalculator.scoreExperience("none", "senior", true)).isEqualTo(0);
+    }
+
+    @Test
+    void experienceScore_discountsOneRankWhenNotCandidatesOwnSpecificRole() {
+        // sameSpecificRole=false (only same_broad_field): senior_level experience is credited as
+        // mid_level - genuinely related experience still counts, but not at full seniority value
+        // for a field that isn't the candidate's own specific role.
+        assertThat(MatchScoreCalculator.scoreExperience("senior_level", "senior", false)).isEqualTo(60);
+        assertThat(MatchScoreCalculator.scoreExperience("senior_level", "mid", false)).isEqualTo(100);
+        // entry_level discounts to "none": a shortfall of 1 rank against a required entry level.
+        assertThat(MatchScoreCalculator.scoreExperience("entry_level", "entry", false)).isEqualTo(60);
     }
 
     @Test

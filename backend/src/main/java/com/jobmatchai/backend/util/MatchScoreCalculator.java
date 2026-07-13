@@ -103,8 +103,14 @@ public final class MatchScoreCalculator {
             // Backend-assigned (never chosen by the AI directly) when JobMatchService's
             // general-vocational-role override fires: a candidate's specialized field is simply
             // irrelevant to a cashier/cleaner/retail-type role - almost any reliable adult can
-            // do it - so this is scored as a solid, not perfect, fit rather than 0.
-            case "general_vocational_role" -> 85;
+            // physically do it, so this must not come back "unrelated" (fieldRelated=false, no
+            // score shown at all). But it is deliberately scored BELOW same_broad_field, not
+            // above it: found via live testing that 85 here (once higher than
+            // same_specialization's 80) let a doctor's CV land at 83-85% overall for a Cashier
+            // posting, which is not a meaningful career match just because it's physically
+            // achievable. This only measures "not field-related, but doable" - it should never
+            // outrank an actual field relation.
+            case "general_vocational_role" -> 25;
             default -> 0; // "unrelated" (or anything unrecognized) - should never actually be
                           // scored, since fieldRelated=false already excludes the whole match.
         };
@@ -126,8 +132,23 @@ public final class MatchScoreCalculator {
     // rather than calling this method at all - see JobMatchService). Comparing two fixed-rank
     // vocabularies with a fixed per-rank penalty is what makes "junior applying to a senior
     // posting scores low" a rule anyone can verify, not a number the AI happened to land on.
-    public static int scoreExperience(String candidateExperienceLevel, String requiredLevel) {
+    //
+    // sameSpecificRole (true for fieldRelationCloseness same_role/same_specialization, false for
+    // same_broad_field - same pattern already used by scoreCertification below): experienceLevel
+    // is a single blanket seniority bucket on the candidate's profile - it does NOT record which
+    // field that experience is actually IN. A candidate with senior-level Customer Service
+    // experience applying to a QA Engineer job (same_broad_field at most - both "operations"-
+    // adjacent, but not the same specific role) should not get full seniority credit as if those
+    // years were spent doing QA work. Discounting one rank when the match isn't the candidate's
+    // own specific role/specialization is what keeps years of UNRELATED-field experience from
+    // inflating a job that only shares a broad field, while still crediting genuinely related
+    // (same_role/same_specialization) experience at full value.
+    public static int scoreExperience(String candidateExperienceLevel, String requiredLevel, boolean sameSpecificRole) {
         int candidateRank = rank(candidateExperienceLevel, EXPERIENCE_LEVELS);
+        if (!sameSpecificRole) {
+            candidateRank = Math.max(0, candidateRank - 1);
+        }
+
         // required "entry"/"mid"/"senior" map onto the same 0-3 scale as the candidate's
         // none/entry/mid/senior, shifted by one since there is no "required: none".
         int requiredRank = REQUIRED_EXPERIENCE_LEVELS.indexOf(

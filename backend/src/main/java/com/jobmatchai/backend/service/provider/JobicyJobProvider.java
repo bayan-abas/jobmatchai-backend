@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.util.HtmlUtils;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -72,7 +73,7 @@ public class JobicyJobProvider implements ExternalJobProvider {
                 null,
                 joinArray(result.path("jobType")),
                 formatSalary(result),
-                textOrNull(result, "jobExcerpt"),
+                resolveDescription(result),
                 null,
                 null,
                 applyUrl,
@@ -80,6 +81,40 @@ public class JobicyJobProvider implements ExternalJobProvider {
                 "Jobicy",
                 resolveIndustry(result.path("jobIndustry"))
         );
+    }
+
+    // Jobicy's "jobExcerpt" is a short marketing teaser (a few hundred characters - "About
+    // Company X, we're solving..."), never the posting's actual requirements/duties. The API
+    // separately returns "jobDescription", the full posting as HTML (often 5,000-10,000+
+    // characters, containing the real "Requirements"/"What you'll do" sections) - found via
+    // live testing to be the actual reason almost every external job was scoring the same flat
+    // ~55%: with only the teaser text available, the AI had nothing concrete to extract
+    // required skills/experience/education from, so every component except field relevance came
+    // back null and the score collapsed to field-relevance-alone. Preferring jobDescription
+    // (stripped to plain text) here gives the matching AI the same real signal a human reading
+    // the posting would have. Falls back to jobExcerpt only if jobDescription is missing/blank.
+    private String resolveDescription(JsonNode result) {
+        String html = textOrNull(result, "jobDescription");
+        String plainText = html == null ? null : htmlToPlainText(html);
+
+        if (plainText != null && !plainText.isBlank()) {
+            // The column is now an unbounded TEXT (match scoring needs the COMPLETE posting,
+            // not a truncated excerpt - see ExternalJob#description) - this cap is a defensive
+            // ceiling against a pathologically huge response, not a normal-case truncation. Real
+            // Jobicy postings observed in testing top out well under this (~10,540 raw HTML,
+            // a few thousand plain-text characters after stripping), so it should essentially
+            // never actually trigger.
+            return plainText.length() > 20_000 ? plainText.substring(0, 20_000) : plainText;
+        }
+
+        return textOrNull(result, "jobExcerpt");
+    }
+
+    private String htmlToPlainText(String html) {
+        String withBreaks = html.replaceAll("(?is)<(br|/p|/div|/li|/h[1-6])\\s*/?>", "\n");
+        String stripped = withBreaks.replaceAll("(?s)<[^>]+>", " ");
+        String unescaped = HtmlUtils.htmlUnescape(stripped);
+        return unescaped.replaceAll("[ \\t]+", " ").replaceAll("\\n\\s*\\n+", "\n").trim();
     }
 
     // Jobicy tags every listing with its own category slugs (its "jobIndustry" array - e.g.

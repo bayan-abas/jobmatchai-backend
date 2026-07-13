@@ -54,6 +54,17 @@ public class SecurityConfig {
                 .csrf(csrf -> csrf.disable())
                 .cors(cors -> cors.configurationSource(corsConfigurationSource()))
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                // Without this, an SSE (SseEmitter) response's mandatory Servlet-async completion
+                // dispatch (DispatcherType ASYNC, triggered when the emitter completes on a
+                // background thread after the original request thread already returned) re-enters
+                // the filter chain with no SecurityContext - since this app is STATELESS (no HTTP
+                // session to reload it from), that dispatch sees an unauthenticated request and
+                // throws AuthorizationDeniedException after the SSE body has already been fully
+                // streamed to the client. requireExplicitSave(false) propagates the SecurityContext
+                // via request-scoped attributes across REQUEST/ASYNC/FORWARD/INCLUDE dispatches
+                // within the same HTTP request - no session/state added, just makes the context
+                // survive the async re-dispatch. See ExternalJobController's SSE endpoint.
+                .securityContext(context -> context.requireExplicitSave(false))
                 .formLogin(form -> form.disable())
                 .httpBasic(basic -> basic.disable())
                 .exceptionHandling(ex -> ex.authenticationEntryPoint(
@@ -64,10 +75,18 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.GET, "/api/*/test").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/users/register", "/api/users/login").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/auth/register", "/api/auth/login",
-                                "/api/auth/forgot-password", "/api/auth/reset-password").permitAll()
+                                "/api/auth/forgot-password", "/api/auth/reset-password",
+                                "/api/auth/send-verification-code").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/payments/webhook").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/jobs/all", "/api/jobs/{id}").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/external-jobs/all", "/api/external-jobs/{id}").permitAll()
+                        // Not gated by the app's own candidate/company JWT auth - there's no admin
+                        // role to require, and the intended caller is an operator/cron script, not
+                        // a logged-in user. ExternalJobController itself requires a separately
+                        // configured X-Internal-Api-Key header (closed by default), the same
+                        // "permitAll + its own independent secret check" pattern already used for
+                        // the Stripe webhook above.
+                        .requestMatchers(HttpMethod.POST, "/api/external-jobs/import").permitAll()
                         .anyRequest().authenticated()
                 )
                 .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);

@@ -4,6 +4,7 @@ import com.jobmatchai.backend.model.PasswordResetToken;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.PasswordResetTokenRepository;
 import com.jobmatchai.backend.repository.UserRepository;
+import com.jobmatchai.backend.security.TokenRevocationService;
 import jakarta.mail.internet.MimeMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,6 +17,7 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.util.UUID;
 
@@ -33,6 +35,9 @@ public class PasswordResetService {
 
     @Autowired
     private NotificationService notificationService;
+
+    @Autowired
+    private TokenRevocationService tokenRevocationService;
 
     @Autowired(required = false)
     private JavaMailSender mailSender;
@@ -132,6 +137,10 @@ public class PasswordResetService {
 
         user.setPassword(passwordEncoder.encode(newPassword));
         userRepository.save(user);
+
+        // Same reasoning as AuthController#changePassword - a token issued before this reset
+        // must stop working immediately.
+        tokenRevocationService.revokeTokensIssuedBefore(user.getEmail(), Instant.now());
 
         resetToken.setUsed(true);
         passwordResetTokenRepository.save(resetToken);

@@ -32,8 +32,40 @@ public class Application {
     private Boolean viewedByCompany;
     private LocalDateTime viewedAt;
 
-    @Lob
+    // TEXT, not @Lob - see contactMessage's comment below: @Lob on a String maps to a Postgres
+    // oid (large object reference), and reading any row with a real value back throws
+    // "Large Objects may not be used in auto-commit mode" at the JDBC level. Reproduced live:
+    // this field was the SECOND instance of the exact mistake contactMessage/rejectionReason
+    // were already fixed for - it broke the company's own applications list (500) the moment a
+    // candidate submitted real pre-interview answers. See ApplicationSchemaConfig for the
+    // migration of any rows already written under the old oid-backed column.
+    @Column(columnDefinition = "TEXT")
     private String preInterviewAnswersJson;
+
+    // Set only when a company accepts the application (see
+    // ApplicationController#updateStatus) - one of ApplicationController's
+    // ALLOWED_CONTACT_METHODS ("phone_call", "email", "whatsapp", "linkedin",
+    // "in_person_meeting", "other"). contactMethodOther holds the company's custom text when
+    // contactMethod is "other"; null in every other case. contactMessage is an optional free-text
+    // note from the company (e.g. when they'll reach out, next steps, interview/onboarding
+    // instructions) - shown to the candidate and included in the acceptance notification.
+    private String contactMethod;
+    private String contactMethodOther;
+
+    // TEXT, not @Lob - found via live testing that @Lob on a String maps to a Postgres oid
+    // (large object reference) here rather than plain text, and reading any row with a real
+    // value back throws at the JDBC level. columnDefinition = "TEXT" is the pattern already
+    // used correctly elsewhere in this codebase (ExternalJob#description/aboutSummary,
+    // EmailVerificationCode) - this field was the one inconsistency.
+    @Column(columnDefinition = "TEXT")
+    private String contactMessage;
+
+    // Set only when a company rejects the application (see ApplicationController#updateStatus) -
+    // mandatory, company-written free text, never AI-generated or a generic template. Preserved
+    // exactly as entered - shown to the candidate under "Reason for rejection" and included in
+    // the rejection notification. TEXT, matching contactMessage's own fix above.
+    @Column(columnDefinition = "TEXT")
+    private String rejectionReason;
 
     public Application() {}
 
@@ -146,5 +178,37 @@ public class Application {
 
     public void setPreInterviewAnswersJson(String preInterviewAnswersJson) {
         this.preInterviewAnswersJson = preInterviewAnswersJson;
+    }
+
+    public String getContactMethod() {
+        return contactMethod;
+    }
+
+    public void setContactMethod(String contactMethod) {
+        this.contactMethod = contactMethod;
+    }
+
+    public String getContactMethodOther() {
+        return contactMethodOther;
+    }
+
+    public void setContactMethodOther(String contactMethodOther) {
+        this.contactMethodOther = contactMethodOther;
+    }
+
+    public String getContactMessage() {
+        return contactMessage;
+    }
+
+    public void setContactMessage(String contactMessage) {
+        this.contactMessage = contactMessage;
+    }
+
+    public String getRejectionReason() {
+        return rejectionReason;
+    }
+
+    public void setRejectionReason(String rejectionReason) {
+        this.rejectionReason = rejectionReason;
     }
 }

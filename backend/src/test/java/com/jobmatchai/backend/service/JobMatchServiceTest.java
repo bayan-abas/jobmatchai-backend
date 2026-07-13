@@ -274,7 +274,10 @@ class JobMatchServiceTest {
                 .as("a general/vocational role must never show as a field mismatch, regardless of the candidate's specialized background")
                 .isEqualTo(true);
         assertThat(match.get("matchPercent")).isNotNull();
-        assertThat((Integer) match.get("fieldRelevancePercent")).isEqualTo(85);
+        assertThat((Integer) match.get("fieldRelevancePercent")).isEqualTo(25);
+        assertThat(match.get("experienceMatchPercent"))
+                .as("experience earned in an unrelated field must not count as evidence of fit for a vocational role")
+                .isNull();
     }
 
     // ---- scenario 4: Information Systems graduate against a junior automation job -> related ----
@@ -315,11 +318,12 @@ class JobMatchServiceTest {
         assertThat(match.get("matchPercent")).isNotNull();
     }
 
-    // ---- scenario 6: junior candidate against a senior job in the SAME field -> related, but
-    // the experience component (and so the overall score) should be pulled down, not fieldRelated ----
+    // ---- scenario 6: junior candidate against a senior job in only a BROAD (not their own
+    // specific) field -> related, but the experience component (and so the overall score) should
+    // be pulled down further than a plain seniority shortfall, not fieldRelated ----
 
     @Test
-    void juniorCandidate_vsSeniorJobSameField_isRelatedWithLowExperienceComponent() {
+    void juniorCandidate_vsSeniorJobBroadFieldOnly_isRelatedWithFurtherDiscountedExperienceComponent() {
         when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(infoSystemsGradAnalysis()));
         Job seniorJob = job(6L, "Senior Software Architect", "Java, System design", "10+ years required.");
 
@@ -331,8 +335,12 @@ class JobMatchServiceTest {
 
         Map<String, Object> match = result.matches().get(0);
         assertThat(match.get("fieldRelated")).isEqualTo(true);
-        // entry_level candidate (rank 1) vs required "senior" (rank 3): 100 - 2*40 = 20.
-        assertThat(match.get("experienceMatchPercent")).isEqualTo(20);
+        // same_broad_field (not the candidate's own specific role) discounts entry_level
+        // (rank 1) down to "none" (rank 0) before comparing against required "senior" (rank 3):
+        // 100 - 3*40 = -20, clamped to 0. See MatchScoreCalculator#scoreExperience's
+        // sameSpecificRole discount - broad-field-only experience isn't credited as if it were
+        // directly in this specific role.
+        assertThat(match.get("experienceMatchPercent")).isEqualTo(0);
     }
 
     // ---- scenario 7: candidate missing one mandatory (certification-flavored) requirement ->

@@ -1,11 +1,16 @@
 package com.jobmatchai.backend.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import com.jobmatchai.backend.model.ExternalJob;
 import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.repository.ExternalJobRepository;
 import com.jobmatchai.backend.service.provider.ExternalJobData;
 import com.jobmatchai.backend.service.provider.ExternalJobProvider;
+import com.jobmatchai.backend.util.HashUtil;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -16,12 +21,18 @@ import org.springframework.stereotype.Service;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 
 @Service
 public class ExternalJobService {
+
+    private static final Logger log = LoggerFactory.getLogger(ExternalJobService.class);
 
     /**
      * Offset added to an ExternalJob's real id when building a transient Job wrapper for
@@ -43,6 +54,14 @@ public class ExternalJobService {
 
     @Autowired
     private JobMatchService jobMatchService;
+
+    @Autowired
+    private EmbeddingService embeddingService;
+
+    @Autowired
+    private OpenAICVAnalysisService openAICVAnalysisService;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     // The full set of categories imported every cycle (see importAllCategories) - covers the
     // general Israeli job market broadly, not just tech, plus explicit remote/work-from-home
@@ -134,62 +153,337 @@ public class ExternalJobService {
     private ImportResult importFromProviders(List<ExternalJobProvider> providers, String keywords, String country) {
         List<ExternalJobData> fetched = new ArrayList<>();
         for (ExternalJobProvider provider : providers) {
-            fetched.addAll(provider.fetchJobs(keywords, country, 50));
+            // Defensive per-provider isolation: every current ExternalJobProvider already
+            // catches its own exceptions internally and returns an empty list on failure (see
+            // e.g. JobicyJobProvider#fetchJobs), but this guards against a future provider that
+            // doesn't - one provider's outage/bug must never abort the whole import cycle (and
+            // the other providers' results already fetched) for every other category too.
+            try {
+                fetched.addAll(provider.fetchJobs(keywords, country, 50));
+            } catch (Exception e) {
+                log.warn("Provider {} failed to fetch jobs (keywords='{}', country='{}') - continuing with "
+                        + "remaining providers.", provider.getClass().getSimpleName(), keywords, country, e);
+            }
         }
 
-        int imported = 0;
-        int skipped = 0;
+        int updated = 0;
+        int unchanged = 0;
+        int crossProviderDuplicates = 0;
+        List<ExternalJob> newJobs = new ArrayList<>();
+        List<ExternalJob> changedJobs = new ArrayList<>();
+        List<ExternalJob> touchedExisting = new ArrayList<>();
+
+        // Batch-load every existing row that could possibly match ANY job in this fetch in one
+        // (or two, via the OR-in-SQL single query) round trip, instead of one
+        // findByExternalJobIdOrApplyUrl query per fetched job - against a remote database, a
+        // 50-job-per-provider fetch used to mean 50+ individual round trips here every cycle.
+        Map<String, ExternalJob> existingByExternalId = new HashMap<>();
+        Map<String, ExternalJob> existingByApplyUrl = new HashMap<>();
+        loadExistingJobs(fetched, existingByExternalId, existingByApplyUrl);
+
+        // Cross-provider dedup signal, scoped to this single import batch only: two different
+        // providers can aggregate the exact same real-world posting under two different external
+        // ids/apply urls (e.g. Jobicy's own id vs. JSearch re-aggregating the same LinkedIn/Indeed
+        // posting), which the id/url lookup above can never catch since neither value matches.
+        // Deliberately conservative - only an exact, case-insensitive, trimmed title+company match
+        // within the same cycle counts as a duplicate, never fuzzy matching, to avoid merging two
+        // genuinely different postings that simply share a common title (e.g. "Software Engineer"
+        // at two unrelated companies would have different companyName and NOT match).
+        Set<String> seenTitleCompanyKeys = new HashSet<>();
 
         for (ExternalJobData data : fetched) {
-            boolean alreadyExists = externalJobRepository.existsByExternalJobIdOrApplyUrl(
-                    data.externalId(), data.applyUrl());
+            ExternalJob existing = existingByExternalId.get(data.externalId());
+            if (existing == null) {
+                existing = existingByApplyUrl.get(data.applyUrl());
+            }
 
-            if (alreadyExists) {
-                skipped++;
+            if (existing != null) {
+                // Reappearing in a fresh fetch confirms the posting is still live, regardless of
+                // whether its content changed - this is what keeps a still-open job from being
+                // silently pruned by retention just because it hasn't needed a content update.
+                existing.setImportedAt(LocalDateTime.now());
+                touchedExisting.add(existing);
+                addTitleCompanyKey(seenTitleCompanyKeys, existing.getTitle(), existing.getCompanyName());
+
+                if (contentChanged(existing, data)) {
+                    applyJobData(existing, data);
+                    changedJobs.add(existing);
+                    updated++;
+                } else {
+                    unchanged++;
+                }
+                continue;
+            }
+
+            String titleCompanyKey = titleCompanyKey(data.title(), data.companyName());
+            if (titleCompanyKey != null && !seenTitleCompanyKeys.add(titleCompanyKey)) {
+                log.debug("Skipping likely cross-provider duplicate job (title='{}', company='{}') - already "
+                        + "seen in this import batch.", data.title(), data.companyName());
+                crossProviderDuplicates++;
                 continue;
             }
 
             ExternalJob job = new ExternalJob();
             job.setExternalJobId(data.externalId());
-            job.setTitle(data.title());
-            job.setCompanyName(data.companyName());
-            job.setLocation(data.location());
-            job.setType(data.type());
-            job.setSalary(data.salary());
-            job.setDescription(data.description());
-            job.setRequirements(data.requirements());
-            job.setSkills(data.skills());
-            job.setIndustry(data.industry());
-            job.setApplyUrl(data.applyUrl());
-            job.setSourceUrl(data.sourceUrl());
-            job.setSourceName(data.sourceName());
+            applyJobData(job, data);
             job.setImportedAt(LocalDateTime.now());
-
-            externalJobRepository.save(job);
-            imported++;
+            newJobs.add(job);
         }
 
-        return new ImportResult(imported, skipped, fetched.size());
+        // One batch embeddings call per import cycle covering every new AND changed job, instead
+        // of one API call per job - this is the entire reason job embeddings are computed at
+        // import time rather than lazily per match request: the cost is paid once per job
+        // (again only when its content actually changes), off the user-facing request path.
+        // Fails open on any embeddings-API problem (embedBatch returns an empty list) - jobs are
+        // still saved without an embedding and simply always go through the AI match path until
+        // a later startup backfill fills them in.
+        List<ExternalJob> needingEmbeddings = new ArrayList<>(newJobs);
+        needingEmbeddings.addAll(changedJobs);
+        attachEmbeddings(needingEmbeddings);
+
+        externalJobRepository.saveAll(newJobs);
+        // Covers both changed and unchanged existing rows in one call - every touched row needs
+        // its bumped importedAt persisted regardless of whether its content also changed.
+        externalJobRepository.saveAll(touchedExisting);
+
+        return new ImportResult(newJobs.size(), updated + unchanged + crossProviderDuplicates, fetched.size());
+    }
+
+    // Fills the two lookup maps from a single batch query covering every fetched job's
+    // externalId/applyUrl, so the per-job loop in importFromProviders is pure in-memory map
+    // lookups afterward. A row can legitimately land in both maps (its externalId matches one map
+    // entry and its applyUrl matches another) - that's fine, both maps just point at the same
+    // persisted ExternalJob instance in that case.
+    private void loadExistingJobs(List<ExternalJobData> fetched,
+                                   Map<String, ExternalJob> existingByExternalId,
+                                   Map<String, ExternalJob> existingByApplyUrl) {
+        if (fetched.isEmpty()) {
+            return;
+        }
+
+        List<String> externalIds = fetched.stream()
+                .map(ExternalJobData::externalId)
+                .filter(id -> id != null && !id.isBlank())
+                .distinct()
+                .toList();
+        List<String> applyUrls = fetched.stream()
+                .map(ExternalJobData::applyUrl)
+                .filter(url -> url != null && !url.isBlank())
+                .distinct()
+                .toList();
+
+        if (externalIds.isEmpty() && applyUrls.isEmpty()) {
+            return;
+        }
+
+        // JPA's derived "In...In" query still needs both collections non-empty to build a
+        // sensible WHERE clause; pass a single impossible sentinel value for whichever side has
+        // nothing to match instead of an empty IN(), which some JPA providers reject outright.
+        List<String> externalIdsParam = externalIds.isEmpty() ? List.of("\0none") : externalIds;
+        List<String> applyUrlsParam = applyUrls.isEmpty() ? List.of("\0none") : applyUrls;
+
+        List<ExternalJob> existingRows =
+                externalJobRepository.findByExternalJobIdInOrApplyUrlIn(externalIdsParam, applyUrlsParam);
+
+        for (ExternalJob row : existingRows) {
+            if (row.getExternalJobId() != null) {
+                existingByExternalId.put(row.getExternalJobId(), row);
+            }
+            if (row.getApplyUrl() != null) {
+                existingByApplyUrl.put(row.getApplyUrl(), row);
+            }
+        }
+    }
+
+    private String titleCompanyKey(String title, String companyName) {
+        if (title == null || companyName == null || title.isBlank() || companyName.isBlank()) {
+            // No confident signal without both fields present - never treat as a duplicate on
+            // partial data, to stay conservative.
+            return null;
+        }
+        return title.trim().toLowerCase() + "||" + companyName.trim().toLowerCase();
+    }
+
+    private void addTitleCompanyKey(Set<String> keys, String title, String companyName) {
+        String key = titleCompanyKey(title, companyName);
+        if (key != null) {
+            keys.add(key);
+        }
+    }
+
+    private void applyJobData(ExternalJob job, ExternalJobData data) {
+        job.setTitle(data.title());
+        job.setCompanyName(data.companyName());
+        job.setLocation(data.location());
+        job.setType(data.type());
+        job.setSalary(data.salary());
+        job.setDescription(data.description());
+        job.setRequirements(data.requirements());
+        job.setSkills(data.skills());
+        job.setIndustry(data.industry());
+        job.setApplyUrl(data.applyUrl());
+        job.setSourceUrl(data.sourceUrl());
+        job.setSourceName(data.sourceName());
+    }
+
+    // Only the fields that would actually change the candidate-facing content (and therefore
+    // warrant a fresh embedding) - salary/location/type churn is common on some providers'
+    // re-fetches even when the role itself is unchanged, but title/description are the real
+    // signal something meaningfully changed.
+    private boolean contentChanged(ExternalJob existing, ExternalJobData data) {
+        return !nullToEmpty(existing.getTitle()).equals(nullToEmpty(data.title()))
+                || !nullToEmpty(existing.getDescription()).equals(nullToEmpty(data.description()));
+    }
+
+    private void attachEmbeddings(List<ExternalJob> jobs) {
+        if (jobs.isEmpty()) {
+            return;
+        }
+
+        List<String> texts = jobs.stream().map(this::embeddingText).toList();
+        List<float[]> vectors = embeddingService.embedBatch(texts);
+
+        if (vectors.size() != jobs.size()) {
+            return;
+        }
+
+        String modelKey = embeddingService.modelKey();
+        for (int i = 0; i < jobs.size(); i++) {
+            ExternalJob job = jobs.get(i);
+            job.setContentEmbedding(embeddingService.toJson(vectors.get(i)));
+            job.setContentEmbeddingHash(HashUtil.sha256(texts.get(i)));
+            job.setContentEmbeddingModel(modelKey);
+        }
+    }
+
+    private String embeddingText(ExternalJob job) {
+        String description = job.getDescription();
+        if (description != null && description.length() > 1500) {
+            description = description.substring(0, 1500);
+        }
+        return nullToEmpty(job.getTitle()) + ". " + nullToEmpty(description);
+    }
+
+    private String nullToEmpty(String value) {
+        return value == null ? "" : value;
     }
 
     public List<ExternalJob> getAllExternalJobs() {
         List<ExternalJob> jobs = externalJobRepository.findAllByOrderByImportedAtDesc();
         jobs.forEach(this::populateTransientLocationFields);
-        return jobs;
+        return jobs.stream().filter(this::isIsraelOrRemote).toList();
     }
 
-    public java.util.Optional<ExternalJob> getExternalJobById(Long id) {
+    // "country" isn't real per-job data (see populateTransientLocationFields - it's always just
+    // the single configured import country, "IL", copied onto every row regardless of the
+    // job's actual scope), so it can't be used to filter. Jobicy (currently the only working
+    // provider - see JoobleJobProvider/JSearchJobProvider doc comments) always calls its
+    // /remote-jobs endpoint with geo=israel, which Jobicy itself resolves server-side into jobs
+    // actually eligible for Israel-based remote candidates - every Jobicy-sourced job is
+    // therefore remote AND Israel-eligible BY CONSTRUCTION, regardless of what its displayed
+    // location text says (Jobicy jobs commonly show broad region tags like "EMEA" or "APAC,
+    // EMEA, LATAM, Canada, USA", which read as "a job in other countries" even though the
+    // posting is actually open to remote Israeli applicants). Trusting the provider's own
+    // contract here is far more reliable than trying to parse an open-ended region-list string.
+    // Any other/future provider falls back to checking its own location text for "israel" or
+    // "remote".
+    private boolean isIsraelOrRemote(ExternalJob job) {
+        if ("Jobicy".equalsIgnoreCase(job.getSourceName())) {
+            return true;
+        }
+
+        String combined = (nullToEmpty(job.getLocation()) + " " + nullToEmpty(job.getType())).toLowerCase();
+        return combined.contains("israel") || combined.contains("remote");
+    }
+
+    public Optional<ExternalJob> getExternalJobById(Long id) {
         return externalJobRepository.findById(id).map(job -> {
             populateTransientLocationFields(job);
             return job;
         });
     }
 
+    // Lazily generates (on first request per job+language) and caches a structured AI summary
+    // of the posting's full description for the frontend's "About this job" section - never
+    // used for match scoring, which always reads the raw description directly (see
+    // getMatchScoresForExternalJobs/getMatchDetailForExternalJob above). Cached in
+    // ExternalJob#aboutSummary, keyed by a hash of description+language so a re-import that
+    // actually changes the description (or a candidate viewing in a different language)
+    // correctly regenerates instead of serving a stale/wrong-language summary.
+    //
+    // Returns a plain Map (not the JsonNode it's built from) - a JsonNode embedded directly in a
+    // Map<String,Object> controller response gets serialized via bean introspection (its own
+    // isArray()/isObject()/... predicate methods) instead of as JSON, since the map's value type
+    // erases to Object. Converting here, once, is what makes the response actually come back as
+    // real JSON instead of a dump of JsonNode's internal accessors.
+    public Map<String, Object> getOrGenerateAboutSummary(Long externalJobId, String language) {
+        ExternalJob job = externalJobRepository.findById(externalJobId).orElse(null);
+        if (job == null) {
+            return Map.of();
+        }
+
+        String description = nullToEmpty(job.getDescription());
+        if (description.isBlank()) {
+            return Map.of();
+        }
+
+        String effectiveLanguage = language == null ? "en" : language;
+        String contentHash = HashUtil.sha256(description + "|" + effectiveLanguage);
+
+        if (contentHash.equals(job.getAboutSummaryContentHash()) && job.getAboutSummary() != null) {
+            Map<String, Object> cached = parseJsonToMap(job.getAboutSummary());
+            if (cached != null) {
+                return cached;
+            }
+        }
+
+        String rawSummary = openAICVAnalysisService.summarizeJobDescription(
+                job.getTitle(), job.getCompanyName(), description, effectiveLanguage);
+        Map<String, Object> parsed = parseJsonToMap(rawSummary);
+
+        if (parsed == null || parsed.isEmpty()) {
+            // Generation failed (or the AI returned nothing usable) - don't cache a failure,
+            // so the next view retries instead of getting stuck on a blank summary forever.
+            return Map.of();
+        }
+
+        job.setAboutSummary(rawSummary);
+        job.setAboutSummaryContentHash(contentHash);
+        externalJobRepository.save(job);
+
+        return parsed;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> parseJsonToMap(String json) {
+        if (json == null || json.isBlank()) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(json, Map.class);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     // country/city aren't stored (see ExternalJob) - filled in here from the single import
     // config value and the location string, so every read path returns the same shape the
-    // API always has.
+    // API always has. Mutates the loaded (already-detached, no active transaction on these
+    // read-only methods) entity in memory only - never re-persisted, exactly like the
+    // country/city transient fields below.
     private void populateTransientLocationFields(ExternalJob job) {
         job.setCountry(defaultCountry.toUpperCase());
+
+        // Jobicy's own "jobGeo" text (e.g. "EMEA", "EMEA, LATAM", "Cochia, Europe, Germany,
+        // Israel, Netherlands, UK") is real data, but reads as "this job is based in other
+        // countries" to a candidate scanning the list - even though isIsraelOrRemote already
+        // established every Jobicy job is remote AND Israel-eligible by construction. Showing
+        // the plain, unambiguous "Remote" label here is what makes that fact visible instead of
+        // silently correct-but-confusing.
+        if ("Jobicy".equalsIgnoreCase(job.getSourceName())) {
+            job.setLocation("Remote");
+        }
+
         job.setCity(job.getLocation());
     }
 
@@ -243,6 +537,12 @@ public class ExternalJobService {
         );
     }
 
+    // Thin delegate so ExternalJobController's streaming endpoint can emit its "no-analysis"
+    // event up front without needing JobMatchService/CVAnalysisRepository injected directly.
+    public boolean hasAnalysis(String email) {
+        return jobMatchService.hasAnalysis(email);
+    }
+
     public JobMatchService.MatchScoresResult getMatchScoresForExternalJobs(
             String email, List<Long> externalJobIds, String language) {
 
@@ -287,18 +587,116 @@ public class ExternalJobService {
         return new JobMatchService.MatchScoresResult(true, remappedMatches);
     }
 
-    @Scheduled(cron = "${externaljobs.import.schedule-cron:0 0 */6 * * *}")
-    public void scheduledImport() {
-        importJobs(null, defaultCountry);
-        pruneExpiredJobs();
+    // Streaming counterpart of getMatchScoresForExternalJobs (see ExternalJobController's SSE
+    // endpoint) - same transient-Job-wrapper/EXTERNAL_ID_OFFSET pattern, but additionally passes
+    // each job's cached content embedding through to JobMatchService's pre-filter, and remaps the
+    // offset id back down to the real external id on every callback instead of on a whole
+    // response at once.
+    public void streamMatchScoresForExternalJobs(
+            String email, List<Long> externalJobIds, String language,
+            java.util.function.BiConsumer<Long, Map<String, Object>> onJobResult, Runnable onComplete) {
+
+        List<ExternalJob> externalJobs = externalJobIds == null || externalJobIds.isEmpty()
+                ? List.of()
+                : externalJobRepository.findAllById(externalJobIds);
+
+        List<Job> transientJobs = new ArrayList<>();
+        Map<Long, float[]> jobEmbeddings = new HashMap<>();
+
+        for (ExternalJob externalJob : externalJobs) {
+            Job job = new Job(
+                    externalJob.getTitle(),
+                    externalJob.getCompanyName(),
+                    null,
+                    externalJob.getLocation(),
+                    externalJob.getType(),
+                    externalJob.getSalary(),
+                    externalJob.getDescription(),
+                    externalJob.getRequirements(),
+                    externalJob.getSkills()
+            );
+            long offsetId = EXTERNAL_ID_OFFSET + externalJob.getId();
+            job.setId(offsetId);
+            transientJobs.add(job);
+
+            float[] vector = embeddingService.fromJson(externalJob.getContentEmbedding());
+            if (vector != null) {
+                jobEmbeddings.put(offsetId, vector);
+            }
+        }
+
+        jobMatchService.computeMatchScoresStreaming(email, transientJobs, language, jobEmbeddings,
+                (offsetId, payload) -> {
+                    Map<String, Object> remapped = new LinkedHashMap<>(payload);
+                    remapped.put("jobId", offsetId - EXTERNAL_ID_OFFSET);
+                    onJobResult.accept(offsetId - EXTERNAL_ID_OFFSET, remapped);
+                },
+                onComplete);
     }
 
-    private void pruneExpiredJobs() {
+    // Unattended, unmonitored entry point (no controller/caller to report a failure to) - unlike
+    // ExternalJobController's /import endpoint, which returns its failure straight to whoever
+    // triggered it, an uncaught exception here would only ever surface as a generic
+    // "TaskUtils$LoggingErrorHandler" log line with no indication of which country/cycle failed
+    // or whether pruning still ran. This wraps the whole cycle so a failure is diagnosable from
+    // logs alone, and mirrors the /import endpoint's own try/catch (see
+    // ExternalJobController#importJobs) but with the specific context (country, result counts)
+    // that only matters for an unattended run.
+    @Scheduled(cron = "${externaljobs.import.schedule-cron:0 0 */6 * * *}")
+    public void scheduledImport() {
+        ImportResult result;
+        try {
+            result = importJobs(null, defaultCountry);
+            log.info("Scheduled external job import complete (country={}): imported={} skipped={} total={}",
+                    defaultCountry, result.imported(), result.skipped(), result.total());
+        } catch (Exception e) {
+            log.error("Scheduled external job import failed (country={}) - skipping retention pruning for this "
+                    + "cycle since it's unclear which postings actually got a chance to reappear.", defaultCountry, e);
+            return;
+        }
+
+        try {
+            pruneExpiredJobs(result);
+        } catch (Exception e) {
+            log.error("Scheduled external job retention pruning failed (country={})", defaultCountry, e);
+        }
+    }
+
+    // A job's importedAt only refreshes when it reappears in a fresh fetch (see
+    // importFromProviders), so naive age-based pruning has a real false-positive risk: a job that
+    // temporarily falls out of a provider's top-50 ranked results for a few cycles - or a cycle
+    // where a provider call transiently fails - gets treated exactly like a genuinely expired
+    // posting, even though it may still be live. Two mitigations, deliberately simple rather than
+    // adding per-job "missed cycle" tracking:
+    //   1. retentionDays itself is generous (21 days by default) relative to the import cadence
+    //      (every 6 hours = ~84 cycles) - a job has to be absent from every single fetch for the
+    //      entire retention window, not just a handful of cycles, before it's ever a pruning
+    //      candidate at all.
+    //   2. If this cycle's import fetched suspiciously few results overall (a strong signal of a
+    //      broad outage - e.g. every provider failing, or a network-level problem this cycle),
+    //      skip pruning entirely this run rather than pruning against a fetch that had little
+    //      chance to confirm which postings are still live. Pruning simply waits for the next,
+    //      hopefully-healthy cycle instead.
+    private static final int MIN_FETCHED_TO_TRUST_PRUNING = 1;
+
+    private void pruneExpiredJobs(ImportResult result) {
         if (retentionDays <= 0) {
             return;
         }
+
+        if (result.total() < MIN_FETCHED_TO_TRUST_PRUNING) {
+            log.warn("Skipping retention pruning this cycle - the import fetched 0 jobs total across every "
+                    + "provider/category, which looks like a broad provider outage rather than a real empty "
+                    + "result set. Pruning against this cycle could wrongly delete still-live postings that "
+                    + "simply had no chance to reappear.");
+            return;
+        }
+
         LocalDateTime cutoff = LocalDateTime.now().minusDays(retentionDays);
-        externalJobRepository.deleteByImportedAtBefore(cutoff);
+        long deleted = externalJobRepository.deleteByImportedAtBefore(cutoff);
+        if (deleted > 0) {
+            log.info("Retention pruning removed {} external job(s) not re-imported since before {}.", deleted, cutoff);
+        }
     }
 
     /**
@@ -311,5 +709,20 @@ public class ExternalJobService {
         if (externalJobRepository.count() == 0) {
             importJobs(null, defaultCountry);
         }
+    }
+
+    /**
+     * One-time-per-boot catch-up for rows imported before the embedding pre-filter existed (or
+     * any row whose embedding call failed at import time) - cheap no-op once nothing is missing,
+     * so it's safe to run on every startup rather than only once ever.
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void backfillMissingEmbeddingsOnStartup() {
+        List<ExternalJob> missing = externalJobRepository.findByContentEmbeddingIsNull();
+        if (missing.isEmpty()) {
+            return;
+        }
+        attachEmbeddings(missing);
+        externalJobRepository.saveAll(missing);
     }
 }

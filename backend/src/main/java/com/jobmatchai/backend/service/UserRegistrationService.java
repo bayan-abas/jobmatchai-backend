@@ -3,6 +3,7 @@ package com.jobmatchai.backend.service;
 import com.jobmatchai.backend.dto.RegisterRequest;
 import com.jobmatchai.backend.exception.EmailAlreadyExistsException;
 import com.jobmatchai.backend.exception.InvalidRoleException;
+import com.jobmatchai.backend.exception.InvalidVerificationCodeException;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.UserRepository;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -24,6 +25,9 @@ public class UserRegistrationService {
     @Autowired
     private UserRepository userRepository;
 
+    @Autowired
+    private EmailVerificationService emailVerificationService;
+
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     public User register(RegisterRequest request) {
@@ -37,11 +41,19 @@ public class UserRegistrationService {
             throw new InvalidRoleException();
         }
 
+        // Must be checked (and consumed - a code can only ever create one account) before the
+        // account is created, never after - there is no account to roll back to if this were
+        // checked last and failed.
+        if (!emailVerificationService.verifyAndConsume(request.email(), request.verificationCode())) {
+            throw new InvalidVerificationCodeException();
+        }
+
         User user = new User();
         user.setName(request.name());
         user.setEmail(request.email());
         user.setPassword(passwordEncoder.encode(request.password()));
         user.setRole(role);
+        user.setPhone(request.phone());
         user.setPremium(false);
 
         User saved = userRepository.save(user);

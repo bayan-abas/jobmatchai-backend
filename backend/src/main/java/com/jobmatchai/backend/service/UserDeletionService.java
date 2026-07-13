@@ -5,6 +5,7 @@ import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
+import com.jobmatchai.backend.repository.EmailVerificationCodeRepository;
 import com.jobmatchai.backend.repository.InterviewRepository;
 import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.repository.JobRepository;
@@ -14,6 +15,7 @@ import com.jobmatchai.backend.repository.PasswordResetTokenRepository;
 import com.jobmatchai.backend.repository.RecentlyViewedJobRepository;
 import com.jobmatchai.backend.repository.SavedJobRepository;
 import com.jobmatchai.backend.repository.UserRepository;
+import com.jobmatchai.backend.security.TokenRevocationService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -22,6 +24,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.io.File;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Instant;
 import java.util.List;
 
 @Service
@@ -61,7 +64,13 @@ public class UserDeletionService {
     private PasswordResetTokenRepository passwordResetTokenRepository;
 
     @Autowired
+    private EmailVerificationCodeRepository emailVerificationCodeRepository;
+
+    @Autowired
     private JobRepository jobRepository;
+
+    @Autowired
+    private TokenRevocationService tokenRevocationService;
 
     @Value("${app.upload.dir:uploads/cvs/}")
     private String uploadDir;
@@ -74,6 +83,10 @@ public class UserDeletionService {
             return;
         }
 
+        // A token issued for this account before deletion must stop authenticating immediately,
+        // not linger until it naturally expires (see TokenRevocationService).
+        tokenRevocationService.revokeTokensIssuedBefore(email, Instant.now());
+
         deleteCvFile(user.getCvFileName());
 
         cvAnalysisRepository.deleteByUserEmail(email);
@@ -85,6 +98,7 @@ public class UserDeletionService {
         messageRepository.deleteByRecipientEmail(email);
         recentlyViewedJobRepository.deleteByCandidateEmail(email);
         passwordResetTokenRepository.deleteByEmail(email);
+        emailVerificationCodeRepository.deleteByEmail(email);
 
         if ("company".equalsIgnoreCase(user.getRole())) {
             List<Job> jobs = jobRepository.findByCompanyEmail(email);

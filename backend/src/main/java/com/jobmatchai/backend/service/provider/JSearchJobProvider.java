@@ -75,7 +75,7 @@ public class JSearchJobProvider implements ExternalJobProvider {
                 if (count >= maxResults) {
                     break;
                 }
-                jobs.add(mapResult(result));
+                jobs.add(mapResult(result, countryCode));
                 count++;
             }
 
@@ -85,16 +85,30 @@ public class JSearchJobProvider implements ExternalJobProvider {
         }
     }
 
-    private ExternalJobData mapResult(JsonNode result) {
+    // ExternalJobService.isIsraelOrRemote decides whether a job is even shown to candidates by
+    // checking whether its location/type text literally contains "israel" or "remote" - it only
+    // trusts Jobicy's sourceName outright because Jobicy always sets sourceName to the literal
+    // string "Jobicy". JSearch's sourceName is instead the underlying job board (LinkedIn,
+    // Indeed, ...) via joinPublishers below, so it can't be trusted the same way. Since this
+    // query was ALREADY server-side scoped to Israel (query text "in Israel" + country=il above)
+    // whenever countryCode is "il", appending "Israel" onto the location text here is what lets
+    // isIsraelOrRemote's existing substring check pass honestly instead of silently dropping
+    // every on-site Israel job this provider returns (job_city alone, e.g. "Tel Aviv", never
+    // contains the word "israel").
+    private ExternalJobData mapResult(JsonNode result, String countryCode) {
         String skills = joinArray(result.path("job_required_skills"));
+        String city = textOrNull(result, "job_city");
+        String location = "il".equalsIgnoreCase(countryCode)
+                ? (city == null ? "Israel" : city + ", Israel")
+                : city;
 
         return new ExternalJobData(
                 textOrNull(result, "job_id"),
                 textOrNull(result, "job_title"),
                 textOrNull(result, "employer_name"),
-                textOrNull(result, "job_city"),
+                location,
                 "IL",
-                textOrNull(result, "job_city"),
+                city,
                 textOrNull(result, "job_employment_type"),
                 formatSalary(result),
                 textOrNull(result, "job_description"),

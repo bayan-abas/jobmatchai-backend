@@ -1,6 +1,8 @@
 package com.jobmatchai.backend.controller;
 
 import com.jobmatchai.backend.service.SkillExplanationService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -10,6 +12,8 @@ import java.util.Map;
 @RestController
 @RequestMapping("/api/skills")
 public class SkillController {
+
+    private static final Logger log = LoggerFactory.getLogger(SkillController.class);
 
     @Autowired
     private SkillExplanationService skillExplanationService;
@@ -28,8 +32,8 @@ public class SkillController {
 
             return ResponseEntity.ok(response);
         } catch (Exception e) {
-            e.printStackTrace();
-            return ResponseEntity.internalServerError().body("Failed to explain skill: " + e.getMessage());
+            log.error("Failed to explain skill '{}'", request.skillName(), e);
+            return ResponseEntity.internalServerError().body("Failed to explain skill. Please try again.");
         }
     }
 }

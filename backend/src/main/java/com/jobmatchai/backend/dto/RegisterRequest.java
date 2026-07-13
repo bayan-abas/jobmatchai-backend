@@ -20,5 +20,11 @@ public record RegisterRequest(
         String password,
 
         @NotBlank(message = "Role is required")
-        String role
+        String role,
+
+        @NotBlank(message = "Phone number is required")
+        String phone,
+
+        @NotBlank(message = "Verification code is required")
+        String verificationCode
 ) {}

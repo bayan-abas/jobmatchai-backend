@@ -37,6 +37,13 @@ public class ApplicationController {
 
     private static final Set<String> ALLOWED_COMPANY_STATUSES = Set.of("Accepted", "Rejected");
 
+    // Fixed vocabulary for how the company will contact an accepted candidate - "other" is the
+    // one value that requires the accompanying free-text contactMethodOther to be non-blank
+    // (validated in updateStatus). Keys are what the API accepts; buildContactMethodLabel maps
+    // each to the human-readable text used in the acceptance notification.
+    private static final Set<String> ALLOWED_CONTACT_METHODS =
+            Set.of("phone_call", "email", "whatsapp", "linkedin", "in_person_meeting", "other");
+
     private static final int FREE_PLAN_MONTHLY_APPLICATION_LIMIT = 10;
 
     @Autowired
@@ -64,11 +71,6 @@ public class ApplicationController {
         return "Applications API is working";
     }
 
-    @GetMapping("/all")
-    public List<Application> getAllApplications() {
-        return applicationRepository.findAll();
-    }
-
     @GetMapping("/candidate/{email}")
     public List<Application> getApplicationsByCandidate(Authentication authentication) {
         return applicationRepository.findByCandidateEmail(authentication.getName());
@@ -85,7 +87,11 @@ public class ApplicationController {
             Integer matchPercent,
             String matchLabel,
             boolean viewedByCompany,
-            Map<String, String> preInterviewAnswers
+            Map<String, String> preInterviewAnswers,
+            String contactMethod,
+            String contactMethodOther,
+            String contactMessage,
+            String rejectionReason
     ) {}
 
     private Map<String, String> parsePreInterviewAnswers(String json) {
@@ -153,7 +159,11 @@ public class ApplicationController {
                             summary != null ? summary.getMatchScore() : null,
                             summary != null ? MatchLabelUtil.fromScore(summary.getMatchScore()) : null,
                             application.isViewedByCompany(),
-                            parsePreInterviewAnswers(application.getPreInterviewAnswersJson())
+                            parsePreInterviewAnswers(application.getPreInterviewAnswersJson()),
+                            application.getContactMethod(),
+                            application.getContactMethodOther(),
+                            application.getContactMessage(),
+                            application.getRejectionReason()
                     );
                 })
                 .toList();
@@ -260,13 +270,37 @@ public class ApplicationController {
             response.put("message", "You already applied to this job");
             return response;
         } catch (Exception e) {
+            log.error("Failed to submit application for candidate={} jobId={}",
+                    candidateEmail, request.jobId(), e);
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Failed to submit application. Please try again.");
             return response;
         }
     }
 
-    public record StatusUpdateRequest(String status) {}
+    // contactMethod/contactMethodOther/contactMessage are only meaningful (and only validated -
+    // see updateStatus) when status is "Accepted"; rejectionReason is only meaningful (and
+    // mandatory) when status is "Rejected". Each is a harmless no-op for the other status.
+    public record StatusUpdateRequest(
+            String status, String contactMethod, String contactMethodOther, String contactMessage,
+            String rejectionReason) {}
+
+    private static final Map<String, String> CONTACT_METHOD_LABELS = Map.of(
+            "phone_call", "Phone call",
+            "email", "Email",
+            "whatsapp", "WhatsApp",
+            "linkedin", "LinkedIn",
+            "in_person_meeting", "In-person meeting"
+    );
+
+    // "other" resolves to the company's own custom text rather than a fixed label - every other
+    // key has a fixed, known label.
+    private String buildContactMethodLabel(String contactMethod, String contactMethodOther) {
+        if ("other".equals(contactMethod)) {
+            return contactMethodOther;
+        }
+        return CONTACT_METHOD_LABELS.getOrDefault(contactMethod, contactMethod);
+    }
 
     @PutMapping("/{id}/status")
     @PreAuthorize("hasRole('COMPANY')")
@@ -279,6 +313,35 @@ public class ApplicationController {
             return response;
         }
 
+        boolean accepting = "Accepted".equalsIgnoreCase(request.status());
+        boolean rejecting = "Rejected".equalsIgnoreCase(request.status());
+
+        // Contact info is meaningless for a rejection - only required (and only validated) when
+        // actually accepting a candidate, matching the feature's whole purpose: an accepted
+        // candidate must always know how the company will reach them.
+        if (accepting) {
+            if (request.contactMethod() == null || !ALLOWED_CONTACT_METHODS.contains(request.contactMethod())) {
+                response.put("success", false);
+                response.put("message", "A valid contact method is required to accept an application");
+                return response;
+            }
+            if ("other".equals(request.contactMethod())
+                    && (request.contactMethodOther() == null || request.contactMethodOther().isBlank())) {
+                response.put("success", false);
+                response.put("message", "Please specify the custom contact method");
+                return response;
+            }
+        }
+
+        // A rejection reason must be the company's own written feedback, never a
+        // system-generated fallback - so a blank/missing value is rejected outright rather than
+        // silently defaulted to a generic message.
+        if (rejecting && (request.rejectionReason() == null || request.rejectionReason().isBlank())) {
+            response.put("success", false);
+            response.put("message", "A rejection reason is required to reject an application");
+            return response;
+        }
+
         try {
             Application existing = applicationRepository.findById(id).orElse(null);
 
@@ -288,9 +351,31 @@ public class ApplicationController {
                 return response;
             }
 
+            // Accepted/Rejected is a final decision - without this check, a company could flip an
+            // already-accepted application to rejected (or vice versa) any number of times, each
+            // time firing a fresh, contradictory notification to the candidate, while leftover
+            // fields from the earlier decision (e.g. contactMethod from an old acceptance) stayed
+            // on the row instead of being cleared by the new one.
+            if (ALLOWED_COMPANY_STATUSES.contains(existing.getStatus())) {
+                response.put("success", false);
+                response.put("message", "This application has already been " + existing.getStatus().toLowerCase()
+                        + " and cannot be changed.");
+                return response;
+            }
+
             return applicationRepository.findById(id)
                     .map(application -> {
                         application.setStatus(request.status());
+
+                        if (accepting) {
+                            application.setContactMethod(request.contactMethod());
+                            application.setContactMethodOther(
+                                    "other".equals(request.contactMethod()) ? request.contactMethodOther().trim() : null);
+                            String message = request.contactMessage();
+                            application.setContactMessage(message != null && !message.isBlank() ? message.trim() : null);
+                        } else if (rejecting) {
+                            application.setRejectionReason(request.rejectionReason().trim());
+                        }
 
                         // A company decision implies the application has been reviewed, even if
                         // the company never separately opened the detail view / mark-viewed call.
@@ -302,17 +387,28 @@ public class ApplicationController {
                         Application saved = applicationRepository.save(application);
 
                         if (saved.getCandidateEmail() != null && !saved.getCandidateEmail().isBlank()) {
-                            boolean accepted = "Accepted".equalsIgnoreCase(request.status());
-                            boolean rejected = "Rejected".equalsIgnoreCase(request.status());
+                            String jobTitle = saved.getJobTitle() != null ? saved.getJobTitle() : "the position";
 
-                            if (accepted || rejected) {
+                            if (accepting) {
+                                String contactLabel = buildContactMethodLabel(
+                                        saved.getContactMethod(), saved.getContactMethodOther());
+                                StringBuilder text = new StringBuilder(
+                                        "Your application for " + jobTitle + " has been accepted! The company will contact you via "
+                                                + contactLabel + ".");
+                                if (saved.getContactMessage() != null && !saved.getContactMessage().isBlank()) {
+                                    text.append(" ").append(saved.getContactMessage());
+                                }
+
                                 notificationService.createNotification(
-                                        saved.getCandidateEmail(),
-                                        accepted ? "Application Accepted" : "Application Rejected",
-                                        "Your application for job ID " + saved.getJobId()
-                                                + (accepted ? " has been accepted." : " has been rejected."),
-                                        accepted ? "APPLICATION_ACCEPTED" : "APPLICATION_REJECTED"
-                                );
+                                        saved.getCandidateEmail(), "Application Accepted", text.toString(), "APPLICATION_ACCEPTED");
+                            } else if (rejecting) {
+                                // The reason is appended verbatim - the company's exact wording,
+                                // never rewritten or replaced with a generic message.
+                                String text = "Your application for " + jobTitle + " has been rejected. Reason: "
+                                        + saved.getRejectionReason();
+
+                                notificationService.createNotification(
+                                        saved.getCandidateEmail(), "Application Rejected", text, "APPLICATION_REJECTED");
                             }
                         }
 
@@ -328,8 +424,9 @@ public class ApplicationController {
                     });
 
         } catch (Exception e) {
+            log.error("Failed to update application status id={} status={}", id, request.status(), e);
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Failed to update application status. Please try again.");
             return response;
         }
     }
@@ -413,8 +510,9 @@ public class ApplicationController {
             return response;
 
         } catch (Exception e) {
+            log.error("Failed to delete application id={}", id, e);
             response.put("success", false);
-            response.put("message", e.getMessage());
+            response.put("message", "Failed to delete application. Please try again.");
             return response;
         }
     }
