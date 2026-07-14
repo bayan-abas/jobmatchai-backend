@@ -56,6 +56,41 @@ CRITICAL RULE: Only use facts found in the "DATA CONTEXT" section below. Never i
 Exception: when suggesting courses, certifications, learning resources, or a career roadmap, you may use your own general professional knowledge, since the system has no course catalog — make clear these are general suggestions, not data from the platform.
 """;
 
+            String responseStyle = switch (mode == null ? "anonymous" : mode) {
+                case "company" -> """
+Response style: you are a fast, professional ATS assistant (like Greenhouse, Lever, or Ashby) — not a general chatbot. Never write long paragraphs.
+
+- Start immediately with the answer. No greetings, no restating the question, no meta phrases like "Based on the data provided" or "Here is a summary" — just the content.
+- Use a short section title (e.g. "Top Candidates") only when it helps, then bullets or a simple card per item — never long prose.
+- Never dump every candidate, application, or job. Rank by relevance and show only the top 3-5, then end with a short line stating how many you showed, e.g. "Showing the top 5 results." Do not offer pagination — just state the count.
+- For each candidate/application shown, include ONLY: name, match score, current status, and one short reason (max one sentence). Do not include full AI analysis, strengths/weaknesses breakdowns, or long explanations by default.
+- Only show a candidate's full AI analysis (detailed strengths/weaknesses, deeper reasoning, etc.) when the user explicitly asks about that one specific candidate in detail.
+- Leave a blank line between sections and between cards so the response never feels crowded.
+- Keep the entire response under ~200 words unless the user explicitly asks for more detail.
+- Example candidate list format:
+
+Top Candidates
+
+🥇 John Smith
+• Match: 94%
+• Status: Under Review
+• Strong backend experience, matches most required skills.
+
+🥈 Sarah Johnson
+• Match: 91%
+• Status: Interview
+• Solid frontend skills, missing one certification.
+
+🥉 Michael Brown
+• Match: 89%
+• Status: New
+• Good generalist profile, limited experience with the core stack.
+
+Showing the top 3 candidates.
+""";
+                default -> "Keep answers clear and practical. Use short paragraphs or bullet points where helpful.";
+            };
+
             String dataSection = (contextBlock == null || contextBlock.isBlank())
                     ? ""
                     : "\n=== DATA CONTEXT ===\n" + contextBlock;
@@ -66,7 +101,7 @@ Exception: when suggesting courses, certifications, learning resources, or a car
                     + "\n"
                     + languageInstruction
                     + "\n"
-                    + "Keep answers clear and practical. Use short paragraphs or bullet points where helpful."
+                    + responseStyle
                     + dataSection;
 
             List<Map<String, Object>> input = new ArrayList<>();
