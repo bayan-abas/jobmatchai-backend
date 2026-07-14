@@ -415,28 +415,8 @@ public class JobMatchService {
         AtomicInteger remaining = new AtomicInteger(jobsSentToAi.size());
 
         for (Job job : jobsSentToAi) {
-            String inFlightKey = email + "|" + job.getId();
-
-            CompletableFuture<JobMatchScore> future = inFlightComputations.computeIfAbsent(inFlightKey, k -> {
-                CompletableFuture<JobMatchScore> f = CompletableFuture.supplyAsync(() -> {
-                    JsonNode matches = computeChunkWithRetry(analysis, List.of(job), jobFingerprints, language, limiter);
-                    JsonNode match = firstMatchForJob(matches, job.getId());
-                    if (match == null) {
-                        return null;
-                    }
-
-                    ParsedMatch parsed = parseMatch(match);
-                    JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
-                    applyParsedMatchToScore(score, parsed, job, analysis, email, job.getId(),
-                            cvFingerprint, jobFingerprints.get(job.getId()), jobContentFingerprints.get(job.getId()));
-                    score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
-                    maybeNotifyHighMatch(email, job, score);
-                    return score;
-                }, executor);
-
-                f.whenComplete((result, ex) -> inFlightComputations.remove(k, f));
-                return f;
-            });
+            CompletableFuture<JobMatchScore> future = singleflightComputeJob(email, job, analysis, language,
+                    cvFingerprint, jobFingerprints, jobContentFingerprints, cachedByJobId, limiter, executor);
 
             future.whenComplete((score, ex) -> {
                 Float similarity = similarityByJobId.get(job.getId());
@@ -460,6 +440,42 @@ public class JobMatchService {
                 }
             });
         }
+    }
+
+    // Singleflight per-job AI computation shared by every caller - the synchronous ensureCoreScores
+    // path (getMatchScores/getMatchDetail) and the streaming path (computeMatchScoresStreaming)
+    // above both route through this exact method/map, so no matter how many concurrent requests
+    // ask about the same candidate+job - same session, different pages, different tabs, sync or
+    // streaming - only one OpenAI call is ever made; every other caller joins the SAME future
+    // instead of starting its own. This is what makes opening the dashboard and the job matches
+    // page around the same time (or two browser tabs) structurally unable to duplicate AI spend.
+    private CompletableFuture<JobMatchScore> singleflightComputeJob(
+            String email, Job job, CVAnalysis analysis, String language, String cvFingerprint,
+            Map<Long, String> jobFingerprints, Map<Long, String> jobContentFingerprints,
+            Map<Long, JobMatchScore> cachedByJobId, Semaphore limiter, ExecutorService executor) {
+
+        String inFlightKey = email + "|" + job.getId();
+
+        return inFlightComputations.computeIfAbsent(inFlightKey, k -> {
+            CompletableFuture<JobMatchScore> f = CompletableFuture.supplyAsync(() -> {
+                JsonNode matches = computeChunkWithRetry(analysis, List.of(job), jobFingerprints, language, limiter);
+                JsonNode match = firstMatchForJob(matches, job.getId());
+                if (match == null) {
+                    return null;
+                }
+
+                ParsedMatch parsed = parseMatch(match);
+                JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
+                applyParsedMatchToScore(score, parsed, job, analysis, email, job.getId(),
+                        cvFingerprint, jobFingerprints.get(job.getId()), jobContentFingerprints.get(job.getId()));
+                score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
+                maybeNotifyHighMatch(email, job, score);
+                return score;
+            }, executor);
+
+            f.whenComplete((result, ex) -> inFlightComputations.remove(k, f));
+            return f;
+        });
     }
 
     private JsonNode firstMatchForJob(JsonNode matches, long jobId) {
@@ -486,11 +502,6 @@ public class JobMatchService {
             cachedByJobId.put(score.getJobId(), score);
         }
 
-        Map<Long, Job> jobById = new HashMap<>();
-        for (Job job : jobs) {
-            jobById.put(job.getId(), job);
-        }
-
         Map<Long, String> jobFingerprints = new HashMap<>();
         Map<Long, String> jobContentFingerprints = new HashMap<>();
         List<Job> jobsNeedingComputation = new ArrayList<>();
@@ -511,56 +522,48 @@ public class JobMatchService {
         }
 
         if (!jobsNeedingComputation.isEmpty()) {
-            List<JsonNode> matchesJson = computeJobMatchesInParallel(
-                    analysis, jobsNeedingComputation, language, jobContentFingerprints);
-            Set<Long> succeededJobIds = new HashSet<>();
+            Semaphore limiter = new Semaphore(MAX_CONCURRENT_MATCH_CALLS);
 
-            for (JsonNode match : matchesJson) {
-                if (!match.hasNonNull("jobId")) {
-                    continue;
+            // Every job's AI call is routed through the same singleflightComputeJob/
+            // inFlightComputations guard the streaming endpoint uses - so a concurrent request
+            // for the same candidate+job (another tab, the streaming endpoint, or a second
+            // synchronous request racing this one) joins this exact computation instead of
+            // triggering a second OpenAI call for it.
+            try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+                Map<Long, CompletableFuture<JobMatchScore>> futuresByJobId = new LinkedHashMap<>();
+                for (Job job : jobsNeedingComputation) {
+                    futuresByJobId.put(job.getId(), singleflightComputeJob(email, job, analysis, language,
+                            cvFingerprint, jobFingerprints, jobContentFingerprints, cachedByJobId, limiter, executor));
                 }
 
-                long jobId = match.path("jobId").asLong();
-                Job job = jobById.get(jobId);
-                if (job == null) {
-                    continue;
-                }
+                for (Job job : jobsNeedingComputation) {
+                    JobMatchScore score;
+                    try {
+                        score = futuresByJobId.get(job.getId()).join();
+                    } catch (Exception e) {
+                        // A DB save or notification hiccup on ONE job must not take out the rest
+                        // of the batch - only THIS job falls through to the sentinel below.
+                        log.error("Failed to compute match score for candidate {} / job {}", email, job.getId(), e);
+                        score = null;
+                    }
 
-                ParsedMatch parsed = parseMatch(match);
-
-                try {
-                    JobMatchScore score = cachedByJobId.getOrDefault(jobId, new JobMatchScore());
-                    applyParsedMatchToScore(score, parsed, job, analysis, email, jobId,
-                            cvFingerprint, jobFingerprints.get(jobId), jobContentFingerprints.get(jobId));
-
-                    score = jobMatchScoreRepositorySafeSave(score, email, jobId);
-                    cachedByJobId.put(jobId, score);
-                    succeededJobIds.add(jobId);
-
-                    maybeNotifyHighMatch(email, job, score);
-                } catch (Exception e) {
-                    // A DB save or notification hiccup on ONE job must not take out the rest of
-                    // the batch - only THIS job falls through to the sentinel below.
-                    log.error("Failed to save match score for candidate {} / job {}", email, jobId, e);
-                }
-            }
-
-            // Any job we asked the AI to score but got no validly-accepted entry back for - even
-            // after the validation-guided retry in computeChunkWithRetry - genuinely failed to
-            // compute. Surface that honestly instead of caching a guessed or malformed verdict.
-            // This is deliberately never saved to the repository, so the very next request
-            // retries the real computation instead of getting stuck on a cached failure.
-            for (Job job : jobsNeedingComputation) {
-                if (!succeededJobIds.contains(job.getId())) {
-                    JobMatchScore errorScore = new JobMatchScore();
-                    errorScore.setCandidateEmail(email);
-                    errorScore.setJobId(job.getId());
-                    errorScore.setFieldRelated(null);
-                    errorScore.setMatchPercent(null);
-                    errorScore.setMatchReason("We couldn't calculate a match for this job right now. Please try again.");
-                    errorScore.setMatchedSkills("");
-                    errorScore.setMissingSkills("");
-                    cachedByJobId.put(job.getId(), errorScore);
+                    if (score != null) {
+                        cachedByJobId.put(job.getId(), score);
+                    } else {
+                        // The AI call failed even after computeChunkWithRetry's validation-guided
+                        // retry - surface that honestly instead of caching a guessed verdict. This
+                        // is deliberately never saved to the repository, so the very next request
+                        // retries the real computation instead of getting stuck on a cached failure.
+                        JobMatchScore errorScore = new JobMatchScore();
+                        errorScore.setCandidateEmail(email);
+                        errorScore.setJobId(job.getId());
+                        errorScore.setFieldRelated(null);
+                        errorScore.setMatchPercent(null);
+                        errorScore.setMatchReason("We couldn't calculate a match for this job right now. Please try again.");
+                        errorScore.setMatchedSkills("");
+                        errorScore.setMissingSkills("");
+                        cachedByJobId.put(job.getId(), errorScore);
+                    }
                 }
             }
         }
@@ -836,52 +839,23 @@ public class JobMatchService {
         }
     }
 
-    // A single OpenAI call scoring a large stale batch is one long blocking round trip, since
-    // latency grows with how many jobs are packed into the prompt/completion. Splitting into
-    // chunks and scoring them concurrently on virtual threads (I/O-bound - just waiting on HTTP
-    // responses) cuts wall-clock time roughly in proportion to how many chunks run at once,
-    // instead of paying for the whole batch serially.
+    // Every job is scored with its own OpenAI call (never batched into one prompt covering
+    // several jobs): asking the model to track multiple numeric jobIds and keep each one's
+    // verdict correctly attached in one response is exactly the kind of bookkeeping large batches
+    // make LLMs more likely to fumble - a real, observed failure was one job in a mixed batch
+    // getting a different job's field-mismatch verdict. One job per request makes that entire
+    // failure mode structurally impossible, not just less likely; the jobFingerprint/jobTitle
+    // cross-check in validateMatch is the remaining defense against the model still garbling its
+    // own single answer. Scoring runs concurrently across jobs on virtual threads (I/O-bound -
+    // just waiting on HTTP responses), capped by MAX_CONCURRENT_MATCH_CALLS below, so wall-clock
+    // time for a whole stale batch scales with how many calls run at once, not the batch size.
     //
-    // Deliberately 1 (was 10, then 5): asking the model to track multiple numeric jobIds and
-    // keep each one's verdict correctly attached in one response is exactly the kind of
-    // bookkeeping large batches make LLMs more likely to fumble - a real, observed failure was
-    // one job in a mixed batch getting a different job's field-mismatch verdict. One job per
-    // request makes that entire failure mode structurally impossible, not just less likely; the
-    // jobFingerprint/jobTitle cross-check in validateMatch is the remaining defense against the
-    // model still garbling its own single answer.
-    private static final int MATCH_CHUNK_SIZE = 1;
-
-    // Firing every chunk at once made concurrent OpenAI calls far more likely to trip a
-    // rate limit or transient error than the old single-call-per-request flow ever was -
-    // a failed chunk silently dropped every job in it (each one showing "no score" to the
-    // candidate) with no retry. Cap how many chunk calls are in flight at once, and retry
-    // a chunk once - with the specific validation errors from the first attempt - before
-    // giving up on it for this request.
+    // Firing every job's call at once made concurrent OpenAI calls far more likely to trip a
+    // rate limit or transient error than the old single-call-per-request flow ever was - a failed
+    // call silently showed "no score" to the candidate with no retry. Cap how many calls are in
+    // flight at once, and retry once - with the specific validation errors from the first attempt
+    // - before giving up on a job for this request.
     private static final int MAX_CONCURRENT_MATCH_CALLS = 5;
-
-    private List<JsonNode> computeJobMatchesInParallel(
-            CVAnalysis analysis, List<Job> jobs, String language, Map<Long, String> jobFingerprints) {
-        List<List<Job>> chunks = new ArrayList<>();
-        for (int i = 0; i < jobs.size(); i += MATCH_CHUNK_SIZE) {
-            chunks.add(jobs.subList(i, Math.min(i + MATCH_CHUNK_SIZE, jobs.size())));
-        }
-
-        Semaphore concurrencyLimiter = new Semaphore(MAX_CONCURRENT_MATCH_CALLS);
-
-        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
-            List<CompletableFuture<JsonNode>> futures = chunks.stream()
-                    .map(chunk -> CompletableFuture.supplyAsync(
-                            () -> computeChunkWithRetry(analysis, chunk, jobFingerprints, language, concurrencyLimiter),
-                            executor))
-                    .toList();
-
-            List<JsonNode> allMatches = new ArrayList<>();
-            for (CompletableFuture<JsonNode> future : futures) {
-                future.join().forEach(allMatches::add);
-            }
-            return allMatches;
-        }
-    }
 
     private record ValidatedBatch(List<JsonNode> validMatches, boolean allValid, Map<Long, List<String>> errorsByJobId) {}
 
