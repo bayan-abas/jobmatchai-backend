@@ -1,5 +1,6 @@
 package com.jobmatchai.backend.controller;
 
+import com.jobmatchai.backend.dto.JobCreateRequest;
 import com.jobmatchai.backend.model.Application;
 import com.jobmatchai.backend.model.CandidateAiSummary;
 import com.jobmatchai.backend.model.Job;
@@ -234,13 +235,28 @@ public class JobController {
         return ResponseEntity.ok(view);
     }
 
+    // Binds a dedicated DTO (never the Job entity itself) so a client can only ever supply the
+    // fields listed here - there is no "id" field to smuggle in, so jobRepository.save() below
+    // always inserts a brand-new row (Job.id stays null) and can never merge into - and thereby
+    // take ownership of - an existing job by id. companyEmail is likewise never taken from the
+    // request; it comes exclusively from the authenticated caller.
     @PostMapping("/add")
     @PreAuthorize("hasRole('COMPANY')")
-    public Map<String, Object> addJob(@RequestBody Job job, Authentication authentication) {
+    public Map<String, Object> addJob(@RequestBody JobCreateRequest request, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
-        job.setCompanyEmail(authentication.getName());
 
         try {
+            Job job = new Job();
+            job.setTitle(request.title());
+            job.setCompanyName(request.companyName());
+            job.setLocation(request.location());
+            job.setType(request.type());
+            job.setSalary(request.salary());
+            job.setDescription(request.description());
+            job.setRequirements(request.requirements());
+            job.setSkills(request.skills());
+            job.setCompanyEmail(authentication.getName());
+
             Job savedJob = jobRepository.save(job);
 
             response.put("success", true);
