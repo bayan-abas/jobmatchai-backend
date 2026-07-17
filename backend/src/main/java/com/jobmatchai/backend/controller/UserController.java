@@ -7,9 +7,17 @@ import com.jobmatchai.backend.exception.InvalidRoleException;
 import com.jobmatchai.backend.exception.InvalidVerificationCodeException;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.UserRepository;
+import com.jobmatchai.backend.security.ratelimit.ClientIpResolver;
+import com.jobmatchai.backend.security.ratelimit.LockoutStatus;
+import com.jobmatchai.backend.security.ratelimit.LoginLockoutService;
+import com.jobmatchai.backend.security.ratelimit.RateLimitProperties;
+import com.jobmatchai.backend.security.ratelimit.RateLimitRule;
+import com.jobmatchai.backend.security.ratelimit.RateLimitSupport;
+import com.jobmatchai.backend.security.ratelimit.RateLimiterService;
 import com.jobmatchai.backend.service.AuthService;
 import com.jobmatchai.backend.service.UserDeletionService;
 import com.jobmatchai.backend.service.UserRegistrationService;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,6 +48,18 @@ public class UserController {
 
     @Autowired
     private AuthService authService;
+
+    @Autowired
+    private RateLimiterService rateLimiterService;
+
+    @Autowired
+    private RateLimitProperties rateLimitProperties;
+
+    @Autowired
+    private ClientIpResolver clientIpResolver;
+
+    @Autowired
+    private LoginLockoutService loginLockoutService;
 
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
@@ -79,8 +99,29 @@ public class UserController {
     }
 
     @PostMapping("/register")
-    public ResponseEntity<Map<String, Object>> registerUser(@Valid @RequestBody RegisterRequest request) {
+    public ResponseEntity<Map<String, Object>> registerUser(
+            @Valid @RequestBody RegisterRequest request,
+            HttpServletRequest httpRequest) {
         Map<String, Object> response = new HashMap<>();
+
+        // Same keys ("verify-code:ip:"/"verify-code:email:") as AuthController#register - this
+        // and /api/auth/register are two routes to the identical registration action, so they
+        // must share one failed-attempt budget. Otherwise an attacker could double their
+        // effective guesses by alternating between the two endpoints. Only wrong verification-
+        // code guesses count against this limit (see the catch block below); the pre-check here
+        // only peeks (never consumes) so a run of successful registrations can't exhaust it.
+        RateLimitRule verifyRule = rateLimitProperties.verifyCode();
+        String ipKey = "verify-code:ip:" + clientIpResolver.resolve(httpRequest);
+        String normalizedEmail = RateLimitSupport.normalizeEmail(request.email());
+        String emailKey = normalizedEmail != null ? "verify-code:email:" + normalizedEmail : null;
+
+        if (rateLimitProperties.isEnabled()) {
+            boolean ipHasCapacity = rateLimiterService.hasCapacity(ipKey, verifyRule);
+            boolean emailHasCapacity = emailKey == null || rateLimiterService.hasCapacity(emailKey, verifyRule);
+            if (!ipHasCapacity || !emailHasCapacity) {
+                return RateLimitSupport.tooManyRequests(verifyRule.window().toSeconds());
+            }
+        }
 
         try {
             User savedUser = userRegistrationService.register(request);
@@ -90,7 +131,17 @@ public class UserController {
             response.put("user", savedUser);
             return ResponseEntity.status(HttpStatus.CREATED).body(response);
 
-        } catch (EmailAlreadyExistsException | InvalidRoleException | InvalidVerificationCodeException e) {
+        } catch (InvalidVerificationCodeException e) {
+            if (rateLimitProperties.isEnabled()) {
+                rateLimiterService.recordFailure(ipKey, verifyRule);
+                if (emailKey != null) {
+                    rateLimiterService.recordFailure(emailKey, verifyRule);
+                }
+            }
+            response.put("success", false);
+            response.put("message", e.getMessage());
+            return ResponseEntity.badRequest().body(response);
+        } catch (EmailAlreadyExistsException | InvalidRoleException e) {
             response.put("success", false);
             response.put("message", e.getMessage());
             return ResponseEntity.badRequest().body(response);
@@ -104,11 +155,37 @@ public class UserController {
     }
 
     @PostMapping("/login")
-    public ResponseEntity<Map<String, Object>> loginUser(@RequestBody Map<String, String> loginData) {
+    public ResponseEntity<Map<String, Object>> loginUser(
+            @RequestBody Map<String, String> loginData,
+            HttpServletRequest httpRequest) {
         Map<String, Object> response = new HashMap<>();
+
+        // Same keys ("login:ip:"/"login:email:") as AuthController#login - this and
+        // /api/auth/login both authenticate through the identical AuthService#login, so they
+        // must share one lockout rather than doubling an attacker's effective attempt budget by
+        // splitting requests across the two endpoints.
+        RateLimitRule loginRule = rateLimitProperties.login();
+        String ipKey = "login:ip:" + clientIpResolver.resolve(httpRequest);
+        String normalizedEmail = RateLimitSupport.normalizeEmail(loginData.get("email"));
+        String emailKey = normalizedEmail != null ? "login:email:" + normalizedEmail : null;
+
+        if (rateLimitProperties.isEnabled()) {
+            LockoutStatus ipStatus = loginLockoutService.check(ipKey);
+            LockoutStatus emailStatus = emailKey != null ? loginLockoutService.check(emailKey) : LockoutStatus.notLockedOut();
+            if (ipStatus.lockedOut() || emailStatus.lockedOut()) {
+                return RateLimitSupport.tooManyRequests(Math.max(ipStatus.retryAfterSeconds(), emailStatus.retryAfterSeconds()));
+            }
+        }
 
         try {
             AuthService.LoginResult result = authService.login(loginData.get("email"), loginData.get("password"));
+
+            if (rateLimitProperties.isEnabled()) {
+                loginLockoutService.recordSuccess(ipKey);
+                if (emailKey != null) {
+                    loginLockoutService.recordSuccess(emailKey);
+                }
+            }
 
             response.put("success", true);
             response.put("message", "Login successful");
@@ -117,6 +194,12 @@ public class UserController {
             return ResponseEntity.ok(response);
 
         } catch (InvalidCredentialsException e) {
+            if (rateLimitProperties.isEnabled()) {
+                loginLockoutService.recordFailure(ipKey, loginRule.capacity(), loginRule.window());
+                if (emailKey != null) {
+                    loginLockoutService.recordFailure(emailKey, loginRule.capacity(), loginRule.window());
+                }
+            }
             response.put("success", false);
             response.put("message", e.getMessage());
             return ResponseEntity.badRequest().body(response);

@@ -109,6 +109,22 @@
             <artifactId>spring-boot-starter-mail</artifactId>
         </dependency>
 
+        <!-- In-memory token-bucket rate limiting for the auth endpoints (see
+             com.jobmatchai.backend.security.ratelimit) - single-instance, non-clustered usage. -->
+        <dependency>
+            <groupId>com.bucket4j</groupId>
+            <artifactId>bucket4j-core</artifactId>
+            <version>8.10.1</version>
+        </dependency>
+
+        <!-- Bounded, self-expiring cache backing the per-IP/per-email rate-limit buckets, so a
+             sustained stream of distinct keys can't grow that state without limit. -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+            <version>3.2.0</version>
+        </dependency>
+
     </dependencies>
 
 <build>

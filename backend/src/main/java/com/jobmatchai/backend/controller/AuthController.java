@@ -13,6 +13,15 @@ import com.jobmatchai.backend.service.NotificationService;
 import com.jobmatchai.backend.service.PasswordResetService;
 import com.jobmatchai.backend.service.UserRegistrationService;
 import com.jobmatchai.backend.security.TokenRevocationService;
+import com.jobmatchai.backend.security.ratelimit.ClientIpResolver;
+import com.jobmatchai.backend.security.ratelimit.LockoutStatus;
+import com.jobmatchai.backend.security.ratelimit.LoginLockoutService;
+import com.jobmatchai.backend.security.ratelimit.RateLimitProperties;
+import com.jobmatchai.backend.security.ratelimit.RateLimitResult;
+import com.jobmatchai.backend.security.ratelimit.RateLimitRule;
+import com.jobmatchai.backend.security.ratelimit.RateLimiterService;
+import com.jobmatchai.backend.security.ratelimit.RateLimitSupport;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,6 +70,18 @@ public class AuthController {
     @Autowired
     private EmailVerificationService emailVerificationService;
 
+    @Autowired
+    private RateLimiterService rateLimiterService;
+
+    @Autowired
+    private RateLimitProperties rateLimitProperties;
+
+    @Autowired
+    private ClientIpResolver clientIpResolver;
+
+    @Autowired
+    private LoginLockoutService loginLockoutService;
+
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     public record LoginRequest(String email, String password) {}
@@ -72,7 +93,9 @@ public class AuthController {
     public record SendVerificationCodeRequest(String email) {}
 
     @PostMapping("/send-verification-code")
-    public ResponseEntity<Map<String, Object>> sendVerificationCode(@RequestBody SendVerificationCodeRequest request) {
+    public ResponseEntity<Map<String, Object>> sendVerificationCode(
+            @RequestBody SendVerificationCodeRequest request,
+            HttpServletRequest httpRequest) {
         Map<String, Object> response = new HashMap<>();
 
         if (request.email() == null || request.email().isBlank()) {
@@ -81,7 +104,19 @@ public class AuthController {
             return ResponseEntity.badRequest().body(response);
         }
 
-        String devCode = emailVerificationService.requestCode(request.email().trim().toLowerCase());
+        String normalizedEmail = RateLimitSupport.normalizeEmail(request.email());
+
+        if (rateLimitProperties.isEnabled()) {
+            RateLimitRule rule = rateLimitProperties.sendVerificationCode();
+            RateLimitResult ipResult = rateLimiterService.tryConsume(
+                    "send-code:ip:" + clientIpResolver.resolve(httpRequest), rule);
+            RateLimitResult emailResult = rateLimiterService.tryConsume("send-code:email:" + normalizedEmail, rule);
+            if (!ipResult.allowed() || !emailResult.allowed()) {
+                return RateLimitSupport.tooManyRequests(Math.max(ipResult.retryAfterSeconds(), emailResult.retryAfterSeconds()));
+            }
+        }
+
+        String devCode = emailVerificationService.requestCode(normalizedEmail);
 
         response.put("success", true);
         response.put("message", "A verification code has been sent to your email.");
@@ -92,8 +127,27 @@ public class AuthController {
     }
 
     @PostMapping("/register")
-    public ResponseEntity<Map<String, Object>> register(@Valid @RequestBody RegisterRequest request) {
+    public ResponseEntity<Map<String, Object>> register(
+            @Valid @RequestBody RegisterRequest request,
+            HttpServletRequest httpRequest) {
         Map<String, Object> response = new HashMap<>();
+
+        // Only wrong verification-code guesses count against this limit (see the catch block
+        // below) - a taken email or an invalid role isn't an attack pattern worth throttling, and
+        // penalizing it would just lock out legitimate retries. The pre-check here only peeks
+        // (never consumes) so a run of successful registrations can't itself exhaust the budget.
+        RateLimitRule verifyRule = rateLimitProperties.verifyCode();
+        String ipKey = "verify-code:ip:" + clientIpResolver.resolve(httpRequest);
+        String normalizedEmail = RateLimitSupport.normalizeEmail(request.email());
+        String emailKey = normalizedEmail != null ? "verify-code:email:" + normalizedEmail : null;
+
+        if (rateLimitProperties.isEnabled()) {
+            boolean ipHasCapacity = rateLimiterService.hasCapacity(ipKey, verifyRule);
+            boolean emailHasCapacity = emailKey == null || rateLimiterService.hasCapacity(emailKey, verifyRule);
+            if (!ipHasCapacity || !emailHasCapacity) {
+                return RateLimitSupport.tooManyRequests(verifyRule.window().toSeconds());
+            }
+        }
 
         try {
             User savedUser = userRegistrationService.register(request);
@@ -102,7 +156,17 @@ public class AuthController {
             response.put("message", "User registered successfully");
             response.put("user", savedUser);
             return ResponseEntity.status(HttpStatus.CREATED).body(response);
-        } catch (EmailAlreadyExistsException | InvalidRoleException | InvalidVerificationCodeException e) {
+        } catch (InvalidVerificationCodeException e) {
+            if (rateLimitProperties.isEnabled()) {
+                rateLimiterService.recordFailure(ipKey, verifyRule);
+                if (emailKey != null) {
+                    rateLimiterService.recordFailure(emailKey, verifyRule);
+                }
+            }
+            response.put("success", false);
+            response.put("message", e.getMessage());
+            return ResponseEntity.badRequest().body(response);
+        } catch (EmailAlreadyExistsException | InvalidRoleException e) {
             response.put("success", false);
             response.put("message", e.getMessage());
             return ResponseEntity.badRequest().body(response);
@@ -115,11 +179,33 @@ public class AuthController {
     }
 
     @PostMapping("/login")
-    public ResponseEntity<Map<String, Object>> login(@RequestBody LoginRequest request) {
+    public ResponseEntity<Map<String, Object>> login(@RequestBody LoginRequest request, HttpServletRequest httpRequest) {
         Map<String, Object> response = new HashMap<>();
+
+        // Same keys ("login:ip:"/"login:email:") as UserController#loginUser - see the comment
+        // there on why the two routes to AuthService#login must share one lockout.
+        RateLimitRule loginRule = rateLimitProperties.login();
+        String ipKey = "login:ip:" + clientIpResolver.resolve(httpRequest);
+        String normalizedEmail = RateLimitSupport.normalizeEmail(request.email());
+        String emailKey = normalizedEmail != null ? "login:email:" + normalizedEmail : null;
+
+        if (rateLimitProperties.isEnabled()) {
+            LockoutStatus ipStatus = loginLockoutService.check(ipKey);
+            LockoutStatus emailStatus = emailKey != null ? loginLockoutService.check(emailKey) : LockoutStatus.notLockedOut();
+            if (ipStatus.lockedOut() || emailStatus.lockedOut()) {
+                return RateLimitSupport.tooManyRequests(Math.max(ipStatus.retryAfterSeconds(), emailStatus.retryAfterSeconds()));
+            }
+        }
 
         try {
             AuthService.LoginResult result = authService.login(request.email(), request.password());
+
+            if (rateLimitProperties.isEnabled()) {
+                loginLockoutService.recordSuccess(ipKey);
+                if (emailKey != null) {
+                    loginLockoutService.recordSuccess(emailKey);
+                }
+            }
 
             response.put("success", true);
             response.put("message", "Login successful");
@@ -127,6 +213,12 @@ public class AuthController {
             response.put("user", result.user());
             return ResponseEntity.ok(response);
         } catch (InvalidCredentialsException e) {
+            if (rateLimitProperties.isEnabled()) {
+                loginLockoutService.recordFailure(ipKey, loginRule.capacity(), loginRule.window());
+                if (emailKey != null) {
+                    loginLockoutService.recordFailure(emailKey, loginRule.capacity(), loginRule.window());
+                }
+            }
             response.put("success", false);
             response.put("message", e.getMessage());
             return ResponseEntity.badRequest().body(response);
@@ -151,8 +243,25 @@ public class AuthController {
     }
 
     @PostMapping("/forgot-password")
-    public ResponseEntity<?> forgotPassword(@RequestBody ForgotPasswordRequest request) {
+    public ResponseEntity<?> forgotPassword(@RequestBody ForgotPasswordRequest request, HttpServletRequest httpRequest) {
         Map<String, Object> response = new HashMap<>();
+
+        if (rateLimitProperties.isEnabled()) {
+            RateLimitRule rule = rateLimitProperties.forgotPassword();
+            RateLimitResult ipResult = rateLimiterService.tryConsume(
+                    "forgot-password:ip:" + clientIpResolver.resolve(httpRequest), rule);
+            String normalizedEmail = RateLimitSupport.normalizeEmail(request.email());
+            RateLimitResult emailResult = normalizedEmail != null
+                    ? rateLimiterService.tryConsume("forgot-password:email:" + normalizedEmail, rule)
+                    : RateLimitResult.allow();
+            // Blocked purely by request volume per IP/email, independent of whether the account
+            // exists - so this 429 can't be used as an oracle the way a distinct "no such user"
+            // response would be.
+            if (!ipResult.allowed() || !emailResult.allowed()) {
+                return RateLimitSupport.tooManyRequests(Math.max(ipResult.retryAfterSeconds(), emailResult.retryAfterSeconds()));
+            }
+        }
+
         response.put("success", true);
         response.put("message", "If an account with that email exists, a reset link has been sent.");
 
@@ -168,8 +277,19 @@ public class AuthController {
     }
 
     @PostMapping("/reset-password")
-    public ResponseEntity<?> resetPassword(@RequestBody ResetPasswordRequest request) {
+    public ResponseEntity<?> resetPassword(@RequestBody ResetPasswordRequest request, HttpServletRequest httpRequest) {
         Map<String, Object> response = new HashMap<>();
+
+        // No email field on this request (it's keyed by an opaque reset token), so only IP-based
+        // limiting applies here.
+        if (rateLimitProperties.isEnabled()) {
+            RateLimitRule rule = rateLimitProperties.resetPassword();
+            RateLimitResult ipResult = rateLimiterService.tryConsume(
+                    "reset-password:ip:" + clientIpResolver.resolve(httpRequest), rule);
+            if (!ipResult.allowed()) {
+                return RateLimitSupport.tooManyRequests(ipResult.retryAfterSeconds());
+            }
+        }
 
         if (request.token() == null || request.newPassword() == null || request.newPassword().isBlank()) {
             response.put("success", false);
