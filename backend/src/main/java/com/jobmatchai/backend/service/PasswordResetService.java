@@ -77,8 +77,13 @@ public class PasswordResetService {
             } catch (Exception e) {
                 log.error("Failed to send password reset email to {}: {}", email, e.getMessage());
             }
-        } else {
+        } else if ("dev".equals(appEnvironment)) {
             log.info("Password reset link for {}: {}", email, resetLink);
+        } else {
+            // Never log the raw token/link (or the email tied to it) outside dev - this branch
+            // means mail isn't configured at all, so unlike the catch block above there's no
+            // delivery failure detail worth trading that off for.
+            log.warn("Password reset email could not be sent because mail is not configured.");
         }
 
         // Only ever hand the raw reset link back in the API response in dev mode -

@@ -65,8 +65,13 @@ public class EmailVerificationService {
             } catch (Exception e) {
                 log.error("Failed to send verification code email to {}: {}", email, e.getMessage());
             }
-        } else {
+        } else if ("dev".equals(appEnvironment)) {
             log.info("Verification code for {}: {}", email, code);
+        } else {
+            // Never log the raw code (or the email tied to it) outside dev - this branch means
+            // mail isn't configured at all, so unlike the catch block above there's no delivery
+            // failure detail worth trading that off for.
+            log.warn("Verification email could not be sent because mail is not configured.");
         }
 
         // Only ever hand the raw code back in the API response in dev mode - a prod deploy
