@@ -56,39 +56,48 @@ CRITICAL RULE: Only use facts found in the "DATA CONTEXT" section below. Never i
 Exception: when suggesting courses, certifications, learning resources, or a career roadmap, you may use your own general professional knowledge, since the system has no course catalog — make clear these are general suggestions, not data from the platform.
 """;
 
-            String responseStyle = switch (mode == null ? "anonymous" : mode) {
-                case "company" -> """
-Response style: you are a fast, professional ATS assistant (like Greenhouse, Lever, or Ashby) — not a general chatbot. Never write long paragraphs.
+            // One fixed structural template for every mode - the frontend chat UI parses these
+            // exact markers ("## Heading" lines, "- " bullets, "**bold**" spans) to render
+            // scannable cards/badges instead of a text block, so the syntax here must stay
+            // stable. Never write long paragraphs; this is a template, not a style suggestion.
+            String responseFormatTemplate = """
+Response format - follow this exact structure, since the UI parses these markers and renders them visually:
+- Always start with a line "## Summary" followed by exactly ONE short sentence (max ~20 words) that answers the question at a glance.
+- After that, add more sections only when relevant to the question - each one a line "## " followed by a short 1-3 word heading. Prefer these when they fit: Candidate, Match Score, Strengths, Missing Skills, Recommendation, Top Candidates, Comparison, Next Steps, Interview Tips. Invent a different short heading only if none of these fit. Never add a section with nothing meaningful in it.
+- A "## Match Score" section must contain nothing but a bolded percentage on its own line, e.g. "**82%**" - no other text in that section.
+- Every other section's content must be short bullet points, one per line starting with "- ", each a single sentence - never a paragraph.
+- Bold (**like this**) every important value: names, percentages, statuses, and technology/skill names.
+- No greetings, no restating the question, no meta phrases like "Based on the data provided".
+- Keep the whole answer under ~200 words unless the user explicitly asks for more detail.
 
-- Start immediately with the answer. No greetings, no restating the question, no meta phrases like "Based on the data provided" or "Here is a summary" — just the content.
-- Use a short section title (e.g. "Top Candidates") only when it helps, then bullets or a simple card per item — never long prose.
-- Never dump every candidate, application, or job. Rank by relevance and show only the top 3-5, then end with a short line stating how many you showed, e.g. "Showing the top 5 results." Do not offer pagination — just state the count.
-- For each candidate/application shown, include ONLY: name, match score, current status, and one short reason (max one sentence). Do not include full AI analysis, strengths/weaknesses breakdowns, or long explanations by default.
-- Only show a candidate's full AI analysis (detailed strengths/weaknesses, deeper reasoning, etc.) when the user explicitly asks about that one specific candidate in detail.
-- Leave a blank line between sections and between cards so the response never feels crowded.
-- Keep the entire response under ~200 words unless the user explicitly asks for more detail.
-- Example candidate list format:
+Example:
 
-Top Candidates
+## Summary
+**Jane Doe** is a **94%** match for Backend Engineer - a strong candidate.
 
-🥇 John Smith
-• Match: 94%
-• Status: Under Review
-• Strong backend experience, matches most required skills.
+## Candidate
+- **Jane Doe** - 5 years experience, current title: Backend Developer.
 
-🥈 Sarah Johnson
-• Match: 91%
-• Status: Interview
-• Solid frontend skills, missing one certification.
+## Match Score
+**94%**
 
-🥉 Michael Brown
-• Match: 89%
-• Status: New
-• Good generalist profile, limited experience with the core stack.
+## Strengths
+- Strong **Java** and **Spring Boot** experience matching the core stack.
+- Proven experience with **PostgreSQL** and REST API design.
 
-Showing the top 3 candidates.
+## Missing Skills
+- No listed experience with **Kubernetes**.
+
+## Recommendation
+- Move forward to interview - strengths clearly outweigh the one gap.
 """;
-                default -> "Keep answers clear and practical. Use short paragraphs or bullet points where helpful.";
+
+            String modeTone = switch (mode == null ? "anonymous" : mode) {
+                case "company" -> """
+Tone: fast, professional ATS assistant (like Greenhouse, Lever, or Ashby) - not a general chatbot. Never dump every candidate, application, or job: rank by relevance, show only the top 3-5 under one "## Top Candidates" (or similarly named) section as bullets - each bullet bolding the name, match percentage, and status, plus one short reason - then end with a plain line stating how many were shown, e.g. "Showing the top 3 candidates." Only show a candidate's full strengths/missing-skills/recommendation breakdown when the user explicitly asks about that one specific candidate.
+""";
+                case "candidate" -> "Tone: supportive career coach - encouraging but honest.";
+                default -> "Tone: friendly and general - no personalized data is available yet.";
             };
 
             String dataSection = (contextBlock == null || contextBlock.isBlank())
@@ -101,7 +110,9 @@ Showing the top 3 candidates.
                     + "\n"
                     + languageInstruction
                     + "\n"
-                    + responseStyle
+                    + responseFormatTemplate
+                    + "\n"
+                    + modeTone
                     + dataSection;
 
             List<Map<String, Object>> input = new ArrayList<>();
