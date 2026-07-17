@@ -12,6 +12,7 @@ import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.CVTextExtractorService;
 import com.jobmatchai.backend.service.OpenAICVAnalysisService;
+import com.jobmatchai.backend.util.CvFileValidator;
 import com.jobmatchai.backend.util.HashUtil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -32,11 +33,14 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/cv")
@@ -76,6 +80,10 @@ public class CVController {
 
     @Value("${app.upload.dir:uploads/cvs/}")
     private String uploadDir;
+
+    @Value("${app.cv.upload.max-size-bytes:10485760}")
+    private long maxCvUploadSizeBytes;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @GetMapping("/test")
@@ -91,6 +99,13 @@ public class CVController {
         };
     }
 
+    // JSON (not a bare String, which Spring serializes as text/plain) so the frontend's
+    // apiFetch can actually read "message" out of the error body and show it to the user,
+    // instead of falling back to a generic "Request failed with status 400".
+    private ResponseEntity<Map<String, Object>> badRequest(String message) {
+        return ResponseEntity.badRequest().body(Map.of("success", false, "message", message));
+    }
+
     @PostMapping("/upload")
     public ResponseEntity<?> uploadCV(
             @RequestParam("file") MultipartFile file,
@@ -103,7 +118,62 @@ public class CVController {
             User user = userRepository.findByEmail(resolvedEmail);
 
             if (user == null) {
-                return ResponseEntity.badRequest().body("User not found");
+                return badRequest("User not found");
+            }
+
+            String originalFileName = file.getOriginalFilename();
+
+            if (originalFileName == null || originalFileName.isBlank()) {
+                return badRequest(pickByLanguage(language,
+                        "Invalid file name.",
+                        "اسم الملف غير صالح.",
+                        "שם קובץ לא תקין."));
+            }
+
+            // Extension allowlist first (cheap, no I/O) - the actual content is verified below,
+            // this just rejects obviously-wrong files fast and with a targeted message.
+            String extension = CvFileValidator.extensionOf(originalFileName);
+
+            if (extension == null) {
+                return badRequest(pickByLanguage(language,
+                        "Only PDF and DOCX files are allowed.",
+                        "يُسمح فقط بملفات PDF وDOCX.",
+                        "מותרים רק קבצי PDF ו-DOCX."));
+            }
+
+            if (file.isEmpty()) {
+                return badRequest(pickByLanguage(language,
+                        "The uploaded file is empty.",
+                        "الملف الذي تم رفعه فارغ.",
+                        "הקובץ שהועלה ריק."));
+            }
+
+            if (file.getSize() > maxCvUploadSizeBytes) {
+                String maxSizeMb = String.valueOf(maxCvUploadSizeBytes / (1024 * 1024));
+                return badRequest(pickByLanguage(language,
+                        "File exceeds the maximum allowed size of " + maxSizeMb + "MB.",
+                        "حجم الملف يتجاوز الحد الأقصى المسموح به وهو " + maxSizeMb + " ميجابايت.",
+                        "הקובץ חורג מהגודל המרבי המותר של " + maxSizeMb + "MB."));
+            }
+
+            // Verify the actual bytes, not just the claimed extension - a renamed executable or
+            // script has an allowed extension but the wrong detected content type, and is
+            // rejected either way. Runs before anything is written to disk.
+            String detectedContentType;
+            try (InputStream fileStream = file.getInputStream()) {
+                detectedContentType = cvTextExtractorService.detectContentType(fileStream);
+            } catch (IOException readException) {
+                return badRequest(pickByLanguage(language,
+                        "The uploaded file could not be read.",
+                        "تعذر قراءة الملف الذي تم رفعه.",
+                        "לא ניתן היה לקרוא את הקובץ שהועלה."));
+            }
+
+            if (!CvFileValidator.contentMatchesExtension(extension, detectedContentType)) {
+                return badRequest(pickByLanguage(language,
+                        "The uploaded file's content does not match a valid PDF or DOCX document.",
+                        "محتوى الملف الذي تم رفعه لا يتطابق مع مستند PDF أو DOCX صالح.",
+                        "תוכן הקובץ שהועלה אינו תואם למסמך PDF או DOCX תקין."));
             }
 
             // Path.resolve (unlike the legacy File(parent, child) constructor) correctly
@@ -116,22 +186,12 @@ public class CVController {
                 folder.mkdirs();
             }
 
-            String originalFileName = file.getOriginalFilename();
-
-            if (originalFileName == null || originalFileName.isBlank()) {
-                return ResponseEntity.badRequest().body("Invalid file name");
-            }
-
-            String lowerFileName = originalFileName.toLowerCase();
-
-            if (!lowerFileName.endsWith(".pdf")
-                    && !lowerFileName.endsWith(".doc")
-                    && !lowerFileName.endsWith(".docx")) {
-                return ResponseEntity.badRequest().body("Only PDF, DOC, and DOCX files are allowed");
-            }
-
-            String safeFileName = originalFileName.replaceAll("[^a-zA-Z0-9._-]", "_");
-            String fileName = System.currentTimeMillis() + "_" + safeFileName;
+            // Fully server-generated - none of the uploaded filename's content ends up in the
+            // storage key, so there's nothing in it left to sanitize or exploit (unusual
+            // encodings, excessive length, path-traversal tricks). The original name the user
+            // uploaded is preserved separately as originalCvFileName purely for display/download,
+            // exactly as before.
+            String fileName = UUID.randomUUID() + "." + extension;
 
             File destination = new File(folder, fileName);
             file.transferTo(destination);
@@ -144,20 +204,18 @@ public class CVController {
                 // otherwise be written to disk and left there forever, unassociated with any
                 // user - clean it up the same as the "no readable text" case below.
                 destination.delete();
-                return ResponseEntity.badRequest()
-                        .body(pickByLanguage(language,
-                                "The uploaded file does not contain readable CV text.",
-                                "الملف الذي تم رفعه لا يحتوي على نص سيرة ذاتية قابل للقراءة.",
-                                "הקובץ שהועלה אינו מכיל טקסט קורות חיים קריא."));
+                return badRequest(pickByLanguage(language,
+                        "The uploaded file does not contain readable CV text.",
+                        "الملف الذي تم رفعه لا يحتوي على نص سيرة ذاتية قابل للقراءة.",
+                        "הקובץ שהועלה אינו מכיל טקסט קורות חיים קריא."));
             }
 
             if (extractedText == null || extractedText.isBlank()) {
                 destination.delete();
-                return ResponseEntity.badRequest()
-                        .body(pickByLanguage(language,
-                                "The uploaded file does not contain readable CV text.",
-                                "الملف الذي تم رفعه لا يحتوي على نص سيرة ذاتية قابل للقراءة.",
-                                "הקובץ שהועלה אינו מכיל טקסט קורות חיים קריא."));
+                return badRequest(pickByLanguage(language,
+                        "The uploaded file does not contain readable CV text.",
+                        "الملف الذي تم رفعه لا يحتوي على نص سيرة ذاتية قابل للقراءة.",
+                        "הקובץ שהועלה אינו מכיל טקסט קורות חיים קריא."));
             }
 
             String validationResult = openAICVAnalysisService.validateCV(extractedText, language);
@@ -172,11 +230,10 @@ public class CVController {
 
             if (!isCV || confidence < 75) {
                 destination.delete();
-                return ResponseEntity.badRequest()
-                        .body(pickByLanguage(language,
-                                "Invalid CV file: ",
-                                "ملف السيرة الذاتية غير صالح: ",
-                                "קובץ קורות החיים אינו תקין: ") + reason);
+                return badRequest(pickByLanguage(language,
+                        "Invalid CV file: ",
+                        "ملف السيرة الذاتية غير صالح: ",
+                        "קובץ קורות החיים אינו תקין: ") + reason);
             }
 
             // Drop the previous CV file now that the new one is validated and about to
@@ -195,7 +252,7 @@ public class CVController {
         } catch (Exception e) {
             log.error("Failed to upload CV", e);
             return ResponseEntity.internalServerError()
-                    .body("Failed to upload CV. Please try again.");
+                    .body(Map.of("success", false, "message", "Failed to upload CV. Please try again."));
         }
     }
 

@@ -5,6 +5,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.util.HtmlUtils;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.util.regex.Pattern;
 
@@ -12,6 +14,14 @@ import java.util.regex.Pattern;
 public class CVTextExtractorService {
 
     private final Tika tika = new Tika();
+
+    // Sniffs the actual file format from its content (magic bytes / container structure), not
+    // from any filename - deliberately does NOT pass a filename hint to Tika, since a hint would
+    // let a mismatched-but-plausible extension influence detection for ambiguous content,
+    // defeating the point of checking real content instead of the claimed extension.
+    public String detectContentType(InputStream inputStream) throws IOException {
+        return tika.detect(inputStream);
+    }
 
     private static final Pattern HTML_COMMENT_PATTERN = Pattern.compile("(?is)<!--.*?-->");
     private static final Pattern HTML_SCRIPT_STYLE_PATTERN = Pattern.compile("(?is)<(script|style|head|xml)[^>]*>.*?</\\1>");
