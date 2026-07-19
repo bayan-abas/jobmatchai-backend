@@ -99,7 +99,20 @@ public final class MatchScoreCalculator {
         return switch (closeness.trim().toLowerCase()) {
             case "same_role" -> 95;
             case "same_specialization" -> 80;
+            // Backend-assigned (never chosen by the AI directly) from JobMatchService's
+            // profession-taxonomy gate, for a curated CLOSELY_RELATED/RELATED edge between two
+            // DIFFERENT professions - e.g. Software Engineer <-> QA Automation Engineer, or
+            // DevOps Engineer <-> Cloud Engineer. Deliberately below same_specialization (still
+            // the candidate's own profession) but above the generic same_broad_field fallback
+            // (an AI-judged "shares an industry" guess for professions the taxonomy doesn't
+            // cover) - a curated, human-reviewed edge is more trustworthy than that guess.
+            case "closely_related" -> 65;
             case "same_broad_field" -> 55;
+            // Same taxonomy origin as closely_related above, for the weaker RELATED tier - e.g.
+            // Data Analyst <-> Financial Analyst, or Teacher <-> Special Education Teacher's
+            // reverse direction. Real transferable skills exist, but less directly than
+            // closely_related.
+            case "related" -> 40;
             // Backend-assigned (never chosen by the AI directly) when JobMatchService's
             // general-vocational-role override fires: a candidate's specialized field is simply
             // irrelevant to a cashier/cleaner/retail-type role - almost any reliable adult can

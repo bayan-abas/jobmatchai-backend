@@ -194,7 +194,16 @@ public class JobMatchService {
     // declared first in NODES. Added earliest-word-position tie-breaking (job titles
     // conventionally lead with the defining term) plus a standalone "qa" alias, verified live
     // against the same real postings that exposed v18.1's gap.
-    private static final String MATCH_SCHEMA_VERSION = "v18.2-profession-taxonomy-tiebreak-fix";
+    // v19: profession compatibility is now a HIERARCHICAL model (SAME_ROLE / CLOSELY_RELATED /
+    // RELATED / DIFFERENT_LICENSED_PROFESSION / UNRELATED - see ProfessionTaxonomy.
+    // CompatibilityTier), not the binary compatible/incompatible model v18 introduced. Different
+    // LICENSED professions (Doctor vs Nurse/Pharmacist/Dentist, Accountant vs Auditor, etc.) are
+    // still hard-blocked exactly as before - but a curated CLOSELY_RELATED or RELATED pair (e.g.
+    // Software Engineer vs QA Automation Engineer, Backend vs Full Stack Developer, Data Analyst
+    // vs BI Analyst, DevOps vs Cloud Engineer) now gets a real, reduced score instead of being
+    // rejected outright, reflecting genuine real-world career adjacency/transferability that a
+    // strict binary model was over-blocking.
+    private static final String MATCH_SCHEMA_VERSION = "v19-hierarchical-profession-compatibility";
 
     // General/entry-level/vocational roles - ones that don't require specialized prior training,
     // a degree, or domain-specific tools to perform. Two separate backend overrides key off this
@@ -419,58 +428,62 @@ public class JobMatchService {
         score.setImprovementSuggestions(null);
     }
 
-    enum ProfessionCompatibility { COMPATIBLE, INCOMPATIBLE, UNKNOWN }
-
     // The HIGHEST-priority gate in the whole matching pipeline (see ProfessionTaxonomy's own
     // documentation for the full rationale) - checked before the insufficient-data gate's sibling
-    // checks, before the embedding prefilter, and before any AI call. Two professions that BOTH
-    // resolve in the taxonomy, to DIFFERENT nodes, are incompatible full stop, regardless of
-    // shared industry, keywords, or anything else - this is what stops e.g. a Software Engineer
-    // CV from ever scoring against a QA Engineer posting, or a doctor CV against a nurse posting,
-    // just because both sides happen to share a broad field label. UNKNOWN (either side didn't
-    // resolve to any taxonomy node) is the honest "no opinion" result - the caller falls back to
-    // the existing AI-judged fieldRelationCloseness for that pair rather than guessing; this gate
-    // does not need to cover every possible profession to be safe, only to be correct where it
-    // does have an opinion.
+    // checks, before the embedding prefilter, and before any AI call. A HIERARCHICAL result, not
+    // binary: SAME_ROLE/CLOSELY_RELATED/RELATED all still proceed to AI scoring (with the field-
+    // relevance component driven by this taxonomy rather than the AI's own judgment for the
+    // latter two - see applyParsedMatchToScore); only DIFFERENT_LICENSED_PROFESSION and UNRELATED
+    // are hard-blocked here with zero AI spend. UNKNOWN (either side didn't resolve to any
+    // taxonomy node) is the honest "no opinion" result - the caller falls back to the existing
+    // AI-judged fieldRelationCloseness for that pair rather than guessing; this gate does not need
+    // to cover every possible profession to be safe, only to be correct where it does have an
+    // opinion.
     //
     // Vocational/general roles (cashier, cleaner, security guard, etc.) are exempted entirely -
     // they're handled by the separate isGeneralVocationalRole override, which already makes them
     // compatible with any candidate's background regardless of profession, and must never be
     // blocked by this gate.
-    ProfessionCompatibility checkProfessionCompatibility(CVAnalysis analysis, Job job) {
+    ProfessionTaxonomy.CompatibilityTier checkProfessionCompatibility(CVAnalysis analysis, Job job) {
         if (isGeneralVocationalRole(job.getTitle())) {
-            return ProfessionCompatibility.UNKNOWN;
+            return ProfessionTaxonomy.CompatibilityTier.UNKNOWN;
         }
 
         ProfessionTaxonomy.ProfessionNode jobProfession = ProfessionTaxonomy.resolve(job.getTitle());
         if (jobProfession == null) {
-            return ProfessionCompatibility.UNKNOWN;
+            return ProfessionTaxonomy.CompatibilityTier.UNKNOWN;
         }
 
         // Resolves every profession the candidate might genuinely be qualified in (professionTitle
-        // + previous job titles + AI-recommended roles), not just the single primary title - a
-        // job matching ANY one of these is profession-compatible, preserving the existing "a
-        // candidate can be qualified in more than one field at once" support (career changers,
-        // dual-qualified candidates).
+        // + previous job titles + AI-recommended roles), not just the single primary title - the
+        // job is judged against whichever of these fits best, preserving the existing "a candidate
+        // can be qualified in more than one field at once" support (career changers, dual-
+        // qualified candidates).
         Set<ProfessionTaxonomy.ProfessionNode> candidateProfessions = ProfessionTaxonomy.resolveAll(
                 analysis.getProfessionTitle(), analysis.getPreviousJobTitles(), analysis.getRecommendedRoles());
         if (candidateProfessions.isEmpty()) {
-            return ProfessionCompatibility.UNKNOWN;
+            return ProfessionTaxonomy.CompatibilityTier.UNKNOWN;
         }
 
-        return candidateProfessions.contains(jobProfession)
-                ? ProfessionCompatibility.COMPATIBLE
-                : ProfessionCompatibility.INCOMPATIBLE;
+        return ProfessionTaxonomy.classifyBest(candidateProfessions, jobProfession);
+    }
+
+    private static boolean isHardBlockedProfessionTier(ProfessionTaxonomy.CompatibilityTier tier) {
+        return tier == ProfessionTaxonomy.CompatibilityTier.DIFFERENT_LICENSED_PROFESSION
+                || tier == ProfessionTaxonomy.CompatibilityTier.UNRELATED;
     }
 
     // Persisted (cacheable, deterministic, zero AI spend) verdict for a taxonomy-confirmed
-    // profession mismatch - same synthetic-ParsedMatch/applyParsedMatchToScore mechanism
-    // applyPrefilteredUnrelatedVerdict below uses, but names both actual professions (the
-    // taxonomy knows what they both are, unlike the embedding prefilter, which only has a bare
-    // similarity number to go on).
+    // profession mismatch (DIFFERENT_LICENSED_PROFESSION or UNRELATED only - CLOSELY_RELATED/
+    // RELATED are never hard-blocked, see applyParsedMatchToScore's override instead). Same
+    // synthetic-ParsedMatch/applyParsedMatchToScore mechanism applyPrefilteredUnrelatedVerdict
+    // below uses, but names both actual professions (the taxonomy knows what they both are,
+    // unlike the embedding prefilter, which only has a bare similarity number to go on) and
+    // explains WHY when it's specifically a licensing mismatch, not just an unrelated field.
     private void applyProfessionIncompatibleVerdict(
             JobMatchScore score, Job job, CVAnalysis analysis, String email, long jobId,
-            String cvFingerprint, String jobFingerprint, String jobContentFingerprint) {
+            String cvFingerprint, String jobFingerprint, String jobContentFingerprint,
+            ProfessionTaxonomy.CompatibilityTier tier) {
 
         ProfessionTaxonomy.ProfessionNode jobProfession = ProfessionTaxonomy.resolve(job.getTitle());
         String candidateProfessionLabel = analysis.getProfessionTitle() != null && !analysis.getProfessionTitle().isBlank()
@@ -478,11 +491,16 @@ public class JobMatchService {
                 : nullToEmpty(analysis.getCandidateField());
         String jobProfessionLabel = jobProfession != null ? jobProfession.displayName() : nullToEmpty(job.getTitle());
 
-        ParsedMatch synthetic = new ParsedMatch(
-                jobId, job.getTitle(), jobContentFingerprint, "unrelated",
-                "Your background is in " + candidateProfessionLabel + ", and this " + jobProfessionLabel
+        String reason = tier == ProfessionTaxonomy.CompatibilityTier.DIFFERENT_LICENSED_PROFESSION
+                ? "Your background is in " + candidateProfessionLabel + ", and this " + jobProfessionLabel
+                        + " role requires its own separate professional license or credential - the two are "
+                        + "different regulated professions, so experience in one does not carry over to practicing the other."
+                : "Your background is in " + candidateProfessionLabel + ", and this " + jobProfessionLabel
                         + " role is a different profession - even though it may share an industry or a few "
-                        + "keywords with your field, the core job itself calls for different training and experience.",
+                        + "keywords with your field, the core job itself calls for different training and experience.";
+
+        ParsedMatch synthetic = new ParsedMatch(
+                jobId, job.getTitle(), jobContentFingerprint, "unrelated", reason,
                 List.of(), List.of(), List.of(), List.of(), null, null, null);
 
         applyParsedMatchToScore(score, synthetic, job, analysis, email, jobId,
@@ -668,11 +686,12 @@ public class JobMatchService {
                         cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()));
                 score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
                 onJobResult.accept(job.getId(), scoreToPayload(score));
-            } else if (checkProfessionCompatibility(analysis, job) == ProfessionCompatibility.INCOMPATIBLE) {
+            } else if (isHardBlockedProfessionTier(checkProfessionCompatibility(analysis, job))) {
+                ProfessionTaxonomy.CompatibilityTier tier = checkProfessionCompatibility(analysis, job);
                 matchMetrics.recordProfessionIncompatible();
                 JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
                 applyProfessionIncompatibleVerdict(score, job, analysis, email, job.getId(),
-                        cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()));
+                        cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()), tier);
                 score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
                 onJobResult.accept(job.getId(), scoreToPayload(score));
             } else {
@@ -857,11 +876,12 @@ public class JobMatchService {
                 applyInsufficientDataVerdict(score, email, job.getId(),
                         cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()));
                 cachedByJobId.put(job.getId(), jobMatchScoreRepositorySafeSave(score, email, job.getId()));
-            } else if (isStale && checkProfessionCompatibility(analysis, job) == ProfessionCompatibility.INCOMPATIBLE) {
+            } else if (isStale && isHardBlockedProfessionTier(checkProfessionCompatibility(analysis, job))) {
+                ProfessionTaxonomy.CompatibilityTier tier = checkProfessionCompatibility(analysis, job);
                 matchMetrics.recordProfessionIncompatible();
                 JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
                 applyProfessionIncompatibleVerdict(score, job, analysis, email, job.getId(),
-                        cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()));
+                        cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()), tier);
                 cachedByJobId.put(job.getId(), jobMatchScoreRepositorySafeSave(score, email, job.getId()));
             } else if (isStale) {
                 jobsNeedingComputation.add(job);
@@ -977,13 +997,36 @@ public class JobMatchService {
         // explicitly false here, never left null/ambiguous in a persisted row.
         score.setInsufficientData(false);
 
-        // Backend override: a general/vocational role must never come back "unrelated" for the
-        // candidate's specialized background - see GENERAL_VOCATIONAL_ROLE_KEYWORDS. Only
-        // overrides an "unrelated" verdict; a candidate whose own field genuinely IS this role
-        // (e.g. a cleaner CV against a cleaning job) keeps whatever closeness the AI gave them.
         String effectiveCloseness = parsed.fieldRelationCloseness();
-        if ("unrelated".equalsIgnoreCase(effectiveCloseness) && isGeneralVocationalRole(job.getTitle())) {
+        String overrideMatchReason = null;
+
+        // Backend override: the profession-taxonomy gate already ran before this job was ever
+        // sent to the AI (see checkProfessionCompatibility) - only jobs it judged SAME_ROLE,
+        // CLOSELY_RELATED, RELATED, or UNKNOWN ever reach here (DIFFERENT_LICENSED_PROFESSION/
+        // UNRELATED are hard-blocked earlier, with zero AI spend). CLOSELY_RELATED/RELATED
+        // override the AI's own field-relevance judgment with the taxonomy's - it has a curated,
+        // deterministic opinion for this exact pair (e.g. Software Engineer <-> QA Automation
+        // Engineer) that is more reliable than asking the AI to freely judge closeness itself.
+        // SAME_ROLE/UNKNOWN are deliberately NOT overridden here - SAME_ROLE still lets the AI
+        // choose between "same_role" and "same_specialization" for that within-profession nuance,
+        // and UNKNOWN means the taxonomy has no opinion for this pair at all.
+        ProfessionTaxonomy.CompatibilityTier tier = checkProfessionCompatibility(analysis, job);
+        if (tier == ProfessionTaxonomy.CompatibilityTier.CLOSELY_RELATED) {
+            effectiveCloseness = "closely_related";
+            overrideMatchReason = "This is a closely related profession to your background - the core skills "
+                    + "transfer well even though it isn't your exact role, so you're still a meaningful candidate for it.";
+        } else if (tier == ProfessionTaxonomy.CompatibilityTier.RELATED) {
+            effectiveCloseness = "related";
+            overrideMatchReason = "This is a related profession to your background - some skills and context "
+                    + "transfer, though it's a distinctly different specific role from your own.";
+        } else if ("unrelated".equalsIgnoreCase(effectiveCloseness) && isGeneralVocationalRole(job.getTitle())) {
+            // A general/vocational role must never come back "unrelated" for the candidate's
+            // specialized background - see GENERAL_VOCATIONAL_ROLE_KEYWORDS. Only overrides an
+            // "unrelated" verdict; a candidate whose own field genuinely IS this role (e.g. a
+            // cleaner CV against a cleaning job) keeps whatever closeness the AI gave them.
             effectiveCloseness = "general_vocational_role";
+            overrideMatchReason = "This role doesn't require specialized experience in your field, so your background and"
+                    + " work history are a reasonable fit.";
         }
 
         boolean fieldRelated = !"unrelated".equalsIgnoreCase(effectiveCloseness);
@@ -991,10 +1034,7 @@ public class JobMatchService {
         score.setCandidateEmail(email);
         score.setJobId(jobId);
         score.setFieldRelated(fieldRelated);
-        score.setMatchReason(effectiveCloseness.equals(parsed.fieldRelationCloseness())
-                ? parsed.matchReason()
-                : "This role doesn't require specialized experience in your field, so your background and"
-                        + " work history are a reasonable fit.");
+        score.setMatchReason(overrideMatchReason != null ? overrideMatchReason : parsed.matchReason());
         score.setCvFingerprint(cvFingerprint);
         score.setJobFingerprint(jobFingerprint);
         score.setJobContentFingerprint(jobContentFingerprint);

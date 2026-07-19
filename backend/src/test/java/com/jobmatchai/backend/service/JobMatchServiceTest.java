@@ -266,9 +266,10 @@ class JobMatchServiceTest {
         verifyNoInteractions(openAICVAnalysisService);
     }
 
-    // ---- scenario 3b: the exact pairs the product requirement names explicitly - none of these
-    // may receive a real score just because they share an industry, and none of them should ever
-    // reach the AI (the taxonomy gate is deterministic and free) ----
+    // ---- scenario 3b: pairs that are genuinely UNRELATED (no curated edge at all) or DIFFERENT
+    // LICENSED PROFESSIONS - these may never receive a real score just because they share an
+    // industry, and never reach the AI (the taxonomy gate is deterministic and free). Distinct
+    // from CLOSELY_RELATED/RELATED pairs (see the next test), which DO get a real, reduced score. ----
 
     @Test
     void explicitlyNamedIncompatibleProfessionPairs_areAllRejectedWithoutAnyAiCall() {
@@ -278,11 +279,15 @@ class JobMatchServiceTest {
         CVAnalysis teacher = professionOnlyAnalysis("Teacher");
         CVAnalysis mechanicalEngineer = professionOnlyAnalysis("Mechanical Engineer");
 
-        assertIncompatible(softwareEngineer, job(100L, "QA Engineer", "Manual testing, Test plans", "Experience with test automation."));
-        assertIncompatible(softwareEngineer, job(101L, "DevOps Engineer", "Kubernetes, CI/CD", "AWS experience required."));
+        // Genuinely unrelated - no curated relationship exists between these professions at all.
         assertIncompatible(softwareEngineer, job(102L, "Data Analyst", "SQL, Excel, dashboards", "Reporting experience required."));
         assertIncompatible(softwareEngineer, job(103L, "Cybersecurity Engineer", "Penetration testing, SIEM", "Security clearance preferred."));
         assertIncompatible(softwareEngineer, job(104L, "IT Support Specialist", "Help desk, troubleshooting", "Customer-facing role."));
+        // Different licensed professions - hard-blocked regardless of any relatedness, per the
+        // explicit product requirement. Accountant/Auditor in particular has a curated `related`
+        // edge in the data (real-world, many auditors ARE accountants) that the licensing check
+        // must still override - this specifically verifies that override, not just the absence
+        // of any edge.
         assertIncompatible(accountant, job(105L, "Financial Advisor", "Portfolio management, client advising", "Series 7 license preferred."));
         assertIncompatible(accountant, job(106L, "Auditor", "Internal controls, risk assessment", "CPA preferred."));
         assertIncompatible(lawyer, job(107L, "Police Officer", "Law enforcement, patrol", "Police academy graduate required."));
@@ -292,12 +297,65 @@ class JobMatchServiceTest {
         verifyNoInteractions(openAICVAnalysisService);
     }
 
+    // ---- scenario 3c: CLOSELY_RELATED and RELATED pairs must NOT be rejected outright - they
+    // still reach the AI for a full skills/experience breakdown, but the field-relevance
+    // component is driven by the taxonomy's own tier (65 for closely related, 40 for related)
+    // rather than the AI's free judgment, reflecting real-world career transitions. ----
+
+    @Test
+    void explicitlyNamedCloselyRelatedAndRelatedPairs_getReducedButRealScoresAndStillCallAi() {
+        CVAnalysis softwareEngineer = professionOnlyAnalysis("Software Engineer");
+        CVAnalysis backendDeveloper = professionOnlyAnalysis("Backend Developer");
+        CVAnalysis dataAnalyst = professionOnlyAnalysis("Data Analyst");
+        CVAnalysis devopsEngineer = professionOnlyAnalysis("DevOps Engineer");
+
+        // Stubbed ONCE, generically, rather than per-call: re-registering a thenAnswer stub on
+        // the same mock method mid-test re-invokes the PREVIOUS stub as a side effect of Mockito
+        // recording the new one (the same pitfall documented on cvChanged_whileOldScoreCached
+        // above) - one generic stub that answers based on whatever job it's actually called with
+        // avoids that entirely.
+        when(openAICVAnalysisService.computeJobMatches(any(), anyList(), anyMap(), any(), any()))
+                .thenAnswer(invocation -> {
+                    List<Job> jobs = invocation.getArgument(1);
+                    Map<Long, String> fingerprints = invocation.getArgument(2);
+                    Job requestedJob = jobs.get(0);
+                    // Empty skill claims deliberately - this test is about the taxonomy-driven
+                    // fieldRelevancePercent override, not skill-evidence validation, and the
+                    // matched/missing skill text would need to differ per job (see
+                    // JobMatchServiceTest's other scenarios for that coverage).
+                    return buildResponseJson(requestedJob, fingerprints.get(requestedJob.getId()),
+                            relatedFixture("same_broad_field", List.of(), List.of(), "mid", null, null));
+                });
+
+        assertReducedButReal(softwareEngineer,
+                job(200L, "QA Automation Engineer", "Selenium, Playwright, CI/CD", "Automation scripting experience required."),
+                65, "closely related");
+        assertReducedButReal(backendDeveloper,
+                job(201L, "Full Stack Developer", "React, Node.js, PostgreSQL", "Frontend and backend experience required."),
+                65, "closely related");
+        assertReducedButReal(dataAnalyst,
+                job(202L, "Business Intelligence Analyst", "Power BI, SQL, dashboards", "BI tooling experience required."),
+                65, "closely related");
+        assertReducedButReal(devopsEngineer,
+                job(203L, "Cloud Engineer", "AWS, Terraform, cloud architecture", "Cloud certification preferred."),
+                65, "closely related");
+        assertReducedButReal(softwareEngineer,
+                job(204L, "QA Engineer", "Manual testing, test plans, bug tracking", "QA methodology experience required."),
+                40, "related");
+    }
+
     private CVAnalysis professionOnlyAnalysis(String professionTitle) {
         CVAnalysis a = new CVAnalysis();
         a.setUserEmail(EMAIL);
         a.setProfessionTitle(professionTitle);
         a.setCandidateField("other");
         a.setExperienceLevel("mid_level");
+        // Gives validateMatch something to evidence a matched-skill claim against - the hard-
+        // block scenarios never reach validateMatch at all (no AI call), but the CLOSELY_RELATED/
+        // RELATED scenarios do, and an empty skills profile would fail validation on ANY matched
+        // skill the AI stub claims, which is a validation-logic concern unrelated to what these
+        // tests are actually about.
+        a.setTechnicalSkills("CI/CD, general technical skills");
         a.setCvTextHash(professionTitle + "-hash");
         return a;
     }
@@ -310,6 +368,27 @@ class JobMatchServiceTest {
                 .as(analysis.getProfessionTitle() + " vs " + incompatibleJob.getTitle() + " must be incompatible")
                 .isEqualTo(false);
         assertThat(match.get("matchPercent")).isNull();
+    }
+
+    // Stubs the AI to return a real (non-"unrelated") verdict with a genuine skills breakdown -
+    // reflecting that the AI still fully participates for CLOSELY_RELATED/RELATED pairs, unlike
+    // the hard-blocked tiers above. The taxonomy overrides only the field-relevance component
+    // (fieldRelevancePercent), not the skills/experience analysis itself.
+    private void assertReducedButReal(CVAnalysis analysis, Job relatedJob, int expectedFieldRelevance, String label) {
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(analysis));
+
+        JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(relatedJob), "en");
+
+        Map<String, Object> match = result.matches().get(0);
+        assertThat(match.get("fieldRelated"))
+                .as(analysis.getProfessionTitle() + " vs " + relatedJob.getTitle() + " (" + label + ") must stay field-related")
+                .isEqualTo(true);
+        assertThat(match.get("matchPercent"))
+                .as(analysis.getProfessionTitle() + " vs " + relatedJob.getTitle() + " (" + label + ") must get a real score")
+                .isNotNull();
+        assertThat(match.get("fieldRelevancePercent"))
+                .as(analysis.getProfessionTitle() + " vs " + relatedJob.getTitle() + " field relevance")
+                .isEqualTo(expectedFieldRelevance);
     }
 
     // ---- regression (found via live verification): a doctor CV against a general/vocational
