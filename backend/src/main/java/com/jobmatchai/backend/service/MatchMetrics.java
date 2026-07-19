@@ -52,6 +52,14 @@ public class MatchMetrics {
                 .increment();
     }
 
+    public void recordProfessionIncompatible() {
+        Counter.builder("matchscore.profession_incompatible")
+                .description("Jobs rejected by the profession-taxonomy compatibility gate before any AI call - "
+                        + "e.g. a Software Engineer CV against a QA Engineer posting")
+                .register(meterRegistry)
+                .increment();
+    }
+
     public void recordOpenAiCall(String model, String outcome, long elapsedMs) {
         Timer.builder("openai.calls")
                 .tag("model", model)

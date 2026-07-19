@@ -169,7 +169,32 @@ public class JobMatchService {
     // essentially four words of real content. See validateMatch's self-contradictory-missing-
     // skill check and OpenAICVAnalysisService's computeJobMatchDetail prompt/validateDetailClaims
     // for the rest of this fix.
-    private static final String MATCH_SCHEMA_VERSION = "v17-insufficient-data-gate-and-stricter-evidence";
+    // v18: added the profession-taxonomy compatibility gate (see ProfessionTaxonomy and
+    // checkProfessionCompatibility) - the highest-priority check in the pipeline, run before
+    // fieldRelationCloseness is ever asked about. Previously "same_broad_field" let a candidate
+    // score a real, reduced-but-present match against ANY job sharing their broad industry label,
+    // even a genuinely different profession (a Software Engineer CV against a QA Engineer
+    // posting, a doctor CV against a nurse posting) - both scored real percentages under the old
+    // logic. Two professions that both resolve in the taxonomy, to DIFFERENT nodes, are now
+    // deterministically "unrelated" (no score) regardless of shared industry/keywords, full stop
+    // - profession/role compatibility is checked first and is authoritative, before
+    // specialization, licenses, seniority, skills, industry, or anything else. Professions the
+    // taxonomy doesn't recognize still fall back to the existing AI-judged closeness, unchanged.
+    //
+    // v18.1: ProfessionTaxonomy#resolve switched from substring matching to word-set matching -
+    // found via live verification that real postings titled "QA Automation Software Engineer"
+    // and "QA Backend Test Role" don't contain the exact phrase "qa engineer" or "automation
+    // engineer" as one contiguous substring (extra/reordered words in between), so they slipped
+    // past the gate entirely and scored a normal 56-58% match against a Senior Software Engineer
+    // CV - exactly the failure mode v18 was meant to close. Word-set matching (every word of the
+    // alias present somewhere in the title, any order) catches these.
+    // v18.2: fixed a tie-break bug in v18.1's word-set matcher - "QA Automation Software Engineer"
+    // matched BOTH qa_engineer's "qa engineer" alias AND software_engineer's "software engineer"
+    // alias (same 2-word length), and the tie silently went to whichever node happened to be
+    // declared first in NODES. Added earliest-word-position tie-breaking (job titles
+    // conventionally lead with the defining term) plus a standalone "qa" alias, verified live
+    // against the same real postings that exposed v18.1's gap.
+    private static final String MATCH_SCHEMA_VERSION = "v18.2-profession-taxonomy-tiebreak-fix";
 
     // General/entry-level/vocational roles - ones that don't require specialized prior training,
     // a degree, or domain-specific tools to perform. Two separate backend overrides key off this
@@ -394,6 +419,76 @@ public class JobMatchService {
         score.setImprovementSuggestions(null);
     }
 
+    enum ProfessionCompatibility { COMPATIBLE, INCOMPATIBLE, UNKNOWN }
+
+    // The HIGHEST-priority gate in the whole matching pipeline (see ProfessionTaxonomy's own
+    // documentation for the full rationale) - checked before the insufficient-data gate's sibling
+    // checks, before the embedding prefilter, and before any AI call. Two professions that BOTH
+    // resolve in the taxonomy, to DIFFERENT nodes, are incompatible full stop, regardless of
+    // shared industry, keywords, or anything else - this is what stops e.g. a Software Engineer
+    // CV from ever scoring against a QA Engineer posting, or a doctor CV against a nurse posting,
+    // just because both sides happen to share a broad field label. UNKNOWN (either side didn't
+    // resolve to any taxonomy node) is the honest "no opinion" result - the caller falls back to
+    // the existing AI-judged fieldRelationCloseness for that pair rather than guessing; this gate
+    // does not need to cover every possible profession to be safe, only to be correct where it
+    // does have an opinion.
+    //
+    // Vocational/general roles (cashier, cleaner, security guard, etc.) are exempted entirely -
+    // they're handled by the separate isGeneralVocationalRole override, which already makes them
+    // compatible with any candidate's background regardless of profession, and must never be
+    // blocked by this gate.
+    ProfessionCompatibility checkProfessionCompatibility(CVAnalysis analysis, Job job) {
+        if (isGeneralVocationalRole(job.getTitle())) {
+            return ProfessionCompatibility.UNKNOWN;
+        }
+
+        ProfessionTaxonomy.ProfessionNode jobProfession = ProfessionTaxonomy.resolve(job.getTitle());
+        if (jobProfession == null) {
+            return ProfessionCompatibility.UNKNOWN;
+        }
+
+        // Resolves every profession the candidate might genuinely be qualified in (professionTitle
+        // + previous job titles + AI-recommended roles), not just the single primary title - a
+        // job matching ANY one of these is profession-compatible, preserving the existing "a
+        // candidate can be qualified in more than one field at once" support (career changers,
+        // dual-qualified candidates).
+        Set<ProfessionTaxonomy.ProfessionNode> candidateProfessions = ProfessionTaxonomy.resolveAll(
+                analysis.getProfessionTitle(), analysis.getPreviousJobTitles(), analysis.getRecommendedRoles());
+        if (candidateProfessions.isEmpty()) {
+            return ProfessionCompatibility.UNKNOWN;
+        }
+
+        return candidateProfessions.contains(jobProfession)
+                ? ProfessionCompatibility.COMPATIBLE
+                : ProfessionCompatibility.INCOMPATIBLE;
+    }
+
+    // Persisted (cacheable, deterministic, zero AI spend) verdict for a taxonomy-confirmed
+    // profession mismatch - same synthetic-ParsedMatch/applyParsedMatchToScore mechanism
+    // applyPrefilteredUnrelatedVerdict below uses, but names both actual professions (the
+    // taxonomy knows what they both are, unlike the embedding prefilter, which only has a bare
+    // similarity number to go on).
+    private void applyProfessionIncompatibleVerdict(
+            JobMatchScore score, Job job, CVAnalysis analysis, String email, long jobId,
+            String cvFingerprint, String jobFingerprint, String jobContentFingerprint) {
+
+        ProfessionTaxonomy.ProfessionNode jobProfession = ProfessionTaxonomy.resolve(job.getTitle());
+        String candidateProfessionLabel = analysis.getProfessionTitle() != null && !analysis.getProfessionTitle().isBlank()
+                ? analysis.getProfessionTitle()
+                : nullToEmpty(analysis.getCandidateField());
+        String jobProfessionLabel = jobProfession != null ? jobProfession.displayName() : nullToEmpty(job.getTitle());
+
+        ParsedMatch synthetic = new ParsedMatch(
+                jobId, job.getTitle(), jobContentFingerprint, "unrelated",
+                "Your background is in " + candidateProfessionLabel + ", and this " + jobProfessionLabel
+                        + " role is a different profession - even though it may share an industry or a few "
+                        + "keywords with your field, the core job itself calls for different training and experience.",
+                List.of(), List.of(), List.of(), List.of(), null, null, null);
+
+        applyParsedMatchToScore(score, synthetic, job, analysis, email, jobId,
+                cvFingerprint, jobFingerprint, jobContentFingerprint);
+    }
+
     // Persists a pre-filter skip through the exact same code path an AI "unrelated" verdict
     // already uses (applyParsedMatchToScore) via a synthetic ParsedMatch, instead of duplicating
     // persistence logic - the resulting JobMatchScore row (fieldRelated=false, matchPercent=null)
@@ -527,6 +622,10 @@ public class JobMatchService {
             String email, List<Job> jobs, String language, Map<Long, float[]> jobEmbeddings,
             String jobType, BiConsumer<Long, Map<String, Object>> onJobResult, Runnable onComplete) {
 
+        // Measures only the DISPATCH phase (enqueueing every stale job and registering its
+        // awaitResult callback) - this method returns before jobs actually finish, so this is
+        // "how fast did the request thread get free again," not "how long until every score is
+        // ready" (each job's own resolution time is logged separately, see MatchScoreQueueWorker).
         long methodStart = System.nanoTime();
         CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(email).orElse(null);
         if (analysis == null || jobs == null || jobs.isEmpty()) {
@@ -566,6 +665,13 @@ public class JobMatchService {
                 matchMetrics.recordInsufficientData();
                 JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
                 applyInsufficientDataVerdict(score, email, job.getId(),
+                        cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()));
+                score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
+                onJobResult.accept(job.getId(), scoreToPayload(score));
+            } else if (checkProfessionCompatibility(analysis, job) == ProfessionCompatibility.INCOMPATIBLE) {
+                matchMetrics.recordProfessionIncompatible();
+                JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
+                applyProfessionIncompatibleVerdict(score, job, analysis, email, job.getId(),
                         cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()));
                 score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
                 onJobResult.accept(job.getId(), scoreToPayload(score));
@@ -663,6 +769,7 @@ public class JobMatchService {
                 }
             });
         }
+        log.info("match-scores-streaming candidate={} dispatchMs={}", email, (System.nanoTime() - methodStart) / 1_000_000);
     }
 
     // Singleflight per-job AI computation shared by every caller - the synchronous ensureCoreScores
@@ -748,6 +855,12 @@ public class JobMatchService {
             if (isStale && isInsufficientJobData(job)) {
                 JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
                 applyInsufficientDataVerdict(score, email, job.getId(),
+                        cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()));
+                cachedByJobId.put(job.getId(), jobMatchScoreRepositorySafeSave(score, email, job.getId()));
+            } else if (isStale && checkProfessionCompatibility(analysis, job) == ProfessionCompatibility.INCOMPATIBLE) {
+                matchMetrics.recordProfessionIncompatible();
+                JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
+                applyProfessionIncompatibleVerdict(score, job, analysis, email, job.getId(),
                         cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()));
                 cachedByJobId.put(job.getId(), jobMatchScoreRepositorySafeSave(score, email, job.getId()));
             } else if (isStale) {

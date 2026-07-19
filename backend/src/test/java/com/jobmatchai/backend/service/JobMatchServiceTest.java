@@ -228,46 +228,87 @@ class JobMatchServiceTest {
         assertThat(match.get("skillsMatchPercent")).isEqualTo(100);
     }
 
-    // ---- scenario 2: doctor CV against nurse job -> still related (same broad field, different
-    // specific role) - this is the exact case that used to incorrectly show "-" ----
+    // ---- scenario 2: doctor CV against nurse job -> a DIFFERENT profession, even though both
+    // are "healthcare" - the profession-taxonomy gate rejects this deterministically, before any
+    // AI call, per the explicit product requirement that sharing a broad field/industry must
+    // never by itself justify a real score. (Superseded an earlier version of this same test that
+    // asserted the opposite - "same broad field" used to be a real, scored tier; it no longer is.) ----
 
     @Test
-    void doctorCv_vsNurseJob_isRelatedButWithAReducedScore() {
+    void doctorCv_vsNurseJob_isIncompatibleProfessionAndNeverCallsAi() {
         when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(doctorAnalysis()));
         Job nurseJob = job(2L, "Registered Nurse", "Patient care, Nursing license, Medication administration",
                 "Requires an active nursing license.");
-
-        stubAi(Map.of(2L, relatedFixture("same_broad_field",
-                List.of("Patient care"), List.of("Nursing license", "Medication administration"),
-                "mid", null, null)));
 
         JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(nurseJob), "en");
 
         Map<String, Object> match = result.matches().get(0);
         assertThat(match.get("fieldRelated"))
-                .as("a doctor and a nurse share the same broad medical field - this must not be a field mismatch")
-                .isEqualTo(true);
-        assertThat(match.get("matchPercent")).isNotNull();
-        // same_broad_field (55) is deterministically lower than same_role (95) - the "different
-        // specific role" gap shows up here, and the missing nursing-specific skills pull the
-        // skills component down too - together demonstrating a real, reduced-but-present score.
-        assertThat((Integer) match.get("fieldRelevancePercent")).isEqualTo(55);
-        assertThat((Integer) match.get("skillsMatchPercent")).isLessThan(50);
+                .as("a doctor and a nurse are different professions - sharing the healthcare field is not enough")
+                .isEqualTo(false);
+        assertThat(match.get("matchPercent")).isNull();
+        verifyNoInteractions(openAICVAnalysisService);
     }
 
-    // ---- scenario 3: doctor CV against software developer job -> genuinely unrelated ----
+    // ---- scenario 3: doctor CV against software developer job -> genuinely unrelated, and now
+    // caught by the deterministic profession-taxonomy gate before any AI call is even made ----
 
     @Test
     void doctorCv_vsSoftwareDeveloperJob_isUnrelated() {
         when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(doctorAnalysis()));
         Job devJob = job(3L, "Software Developer", "Java, Spring Boot, SQL", "3+ years of backend development.");
 
-        stubAi(Map.of(3L, unrelatedFixture("medicine", "software engineering")));
-
         JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(devJob), "en");
 
         Map<String, Object> match = result.matches().get(0);
         assertThat(match.get("fieldRelated")).isEqualTo(false);
+        assertThat(match.get("matchPercent")).isNull();
+        verifyNoInteractions(openAICVAnalysisService);
+    }
+
+    // ---- scenario 3b: the exact pairs the product requirement names explicitly - none of these
+    // may receive a real score just because they share an industry, and none of them should ever
+    // reach the AI (the taxonomy gate is deterministic and free) ----
+
+    @Test
+    void explicitlyNamedIncompatibleProfessionPairs_areAllRejectedWithoutAnyAiCall() {
+        CVAnalysis softwareEngineer = professionOnlyAnalysis("Software Engineer");
+        CVAnalysis accountant = professionOnlyAnalysis("Accountant");
+        CVAnalysis lawyer = professionOnlyAnalysis("Lawyer");
+        CVAnalysis teacher = professionOnlyAnalysis("Teacher");
+        CVAnalysis mechanicalEngineer = professionOnlyAnalysis("Mechanical Engineer");
+
+        assertIncompatible(softwareEngineer, job(100L, "QA Engineer", "Manual testing, Test plans", "Experience with test automation."));
+        assertIncompatible(softwareEngineer, job(101L, "DevOps Engineer", "Kubernetes, CI/CD", "AWS experience required."));
+        assertIncompatible(softwareEngineer, job(102L, "Data Analyst", "SQL, Excel, dashboards", "Reporting experience required."));
+        assertIncompatible(softwareEngineer, job(103L, "Cybersecurity Engineer", "Penetration testing, SIEM", "Security clearance preferred."));
+        assertIncompatible(softwareEngineer, job(104L, "IT Support Specialist", "Help desk, troubleshooting", "Customer-facing role."));
+        assertIncompatible(accountant, job(105L, "Financial Advisor", "Portfolio management, client advising", "Series 7 license preferred."));
+        assertIncompatible(accountant, job(106L, "Auditor", "Internal controls, risk assessment", "CPA preferred."));
+        assertIncompatible(lawyer, job(107L, "Police Officer", "Law enforcement, patrol", "Police academy graduate required."));
+        assertIncompatible(teacher, job(108L, "Social Worker", "Case management, client advocacy", "MSW preferred."));
+        assertIncompatible(mechanicalEngineer, job(109L, "Civil Engineer", "Structural analysis, site planning", "PE license preferred."));
+
+        verifyNoInteractions(openAICVAnalysisService);
+    }
+
+    private CVAnalysis professionOnlyAnalysis(String professionTitle) {
+        CVAnalysis a = new CVAnalysis();
+        a.setUserEmail(EMAIL);
+        a.setProfessionTitle(professionTitle);
+        a.setCandidateField("other");
+        a.setExperienceLevel("mid_level");
+        a.setCvTextHash(professionTitle + "-hash");
+        return a;
+    }
+
+    private void assertIncompatible(CVAnalysis analysis, Job incompatibleJob) {
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(analysis));
+        JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(incompatibleJob), "en");
+        Map<String, Object> match = result.matches().get(0);
+        assertThat(match.get("fieldRelated"))
+                .as(analysis.getProfessionTitle() + " vs " + incompatibleJob.getTitle() + " must be incompatible")
+                .isEqualTo(false);
         assertThat(match.get("matchPercent")).isNull();
     }
 
@@ -425,16 +466,20 @@ class JobMatchServiceTest {
     void twoDifferentJobsInSameRequest_areScoredIndependentlyWithoutMixing() {
         when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(doctorAnalysis()));
         Job physicianJob = job(9L, "Physician", "Patient diagnosis, Patient care", "Active medical license required.");
-        Job devJob = job(10L, "Software Developer", "Java, Spring Boot", "3+ years of backend development.");
+        // A profession the taxonomy doesn't recognize (deliberately, so this still exercises the
+        // AI-judged fallback path and both jobs reach the AI) rather than "Software Developer",
+        // which the taxonomy gate would now reject deterministically before any AI call - see
+        // doctorCv_vsSoftwareDeveloperJob_isUnrelated for that case specifically.
+        Job urbanPlannerJob = job(10L, "Urban Planner", "GIS software, zoning regulations", "5+ years in city planning.");
 
         stubAi(Map.of(
                 9L, relatedFixture("same_role", List.of("Patient diagnosis", "Patient care"), List.of(),
                         "mid", "relevant_degree", "specific_license"),
-                10L, unrelatedFixture("medicine", "software engineering")
+                10L, unrelatedFixture("medicine", "urban planning")
         ));
 
         JobMatchService.MatchScoresResult result =
-                jobMatchService.getMatchScores(EMAIL, List.of(physicianJob, devJob), "en");
+                jobMatchService.getMatchScores(EMAIL, List.of(physicianJob, urbanPlannerJob), "en");
 
         Map<Long, Map<String, Object>> byJobId = new LinkedHashMap<>();
         result.matches().forEach(m -> byJobId.put((Long) m.get("jobId"), m));
@@ -675,9 +720,12 @@ class JobMatchServiceTest {
         // ResumeManager.tsx's upload/delete/analyze actions trigger. reset() first: re-stubbing
         // computeJobMatches with when() a second time in the same test would otherwise re-invoke
         // the FIRST stub's answer as a side effect of Mockito recording the new stub.
-        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(infoSystemsGradAnalysis()));
+        // Uses a profession the taxonomy doesn't recognize (deliberately) so this keeps
+        // exercising the AI-judged fallback path this test is actually about, rather than being
+        // short-circuited by the (also correct, but not what this test is testing) profession gate.
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(professionOnlyAnalysis("Urban Planner")));
         reset(openAICVAnalysisService);
-        stubAi(Map.of(24L, unrelatedFixture("software", "medicine")));
+        stubAi(Map.of(24L, unrelatedFixture("urban planning", "medicine")));
 
         JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(physicianJob), "en");
 
