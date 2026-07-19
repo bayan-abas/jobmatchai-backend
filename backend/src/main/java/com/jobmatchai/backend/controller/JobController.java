@@ -13,14 +13,19 @@ import com.jobmatchai.backend.util.MatchLabelUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 @RestController
 @RequestMapping("/api/jobs")
@@ -39,6 +44,14 @@ public class JobController {
 
     @Autowired
     private JobMatchService jobMatchService;
+
+    // One virtual thread per open SSE connection, mirroring ExternalJobController's identical
+    // streaming endpoint.
+    private final ExecutorService streamingExecutor = Executors.newVirtualThreadPerTaskExecutor();
+
+    // Hard backstop if a client goes away mid-stream without cleanly aborting - see
+    // ExternalJobController.SSE_TIMEOUT_MS for the full rationale.
+    private static final long SSE_TIMEOUT_MS = 180_000L;
 
     public record MatchScoreRequest(String email, List<Long> jobIds, String language) {}
 
@@ -391,6 +404,52 @@ public class JobController {
         } catch (Exception e) {
             log.error("Failed to compute match scores for candidate={}", authentication.getName(), e);
             return ResponseEntity.internalServerError().body("Failed to compute match scores. Please try again.");
+        }
+    }
+
+    // Progressive counterpart of /match-scores - see ExternalJobController.streamMatchScores for
+    // the full rationale (manual SSE-frame parsing on the frontend, POST instead of GET so the
+    // job-id list travels in the body). This is the internal-jobs half of that same contract.
+    @PostMapping(path = "/match-scores/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamMatchScores(@RequestBody MatchScoreRequest request, Authentication authentication) {
+        SseEmitter emitter = new SseEmitter(SSE_TIMEOUT_MS);
+        Object sendLock = new Object();
+        String email = authentication.getName();
+        List<Long> jobIds = request.jobIds() == null ? List.of() : request.jobIds();
+        List<Job> jobs = jobIds.isEmpty() ? List.of() : jobRepository.findAllById(jobIds);
+
+        streamingExecutor.execute(() -> {
+            try {
+                if (!jobMatchService.hasAnalysis(email)) {
+                    sendEvent(emitter, sendLock, "no-analysis", Map.of());
+                    emitter.complete();
+                    return;
+                }
+
+                jobMatchService.computeMatchScoresStreaming(email, jobs, request.language(), Map.of(), "internal",
+                        (jobId, payload) -> sendEvent(emitter, sendLock, "score", payload),
+                        () -> {
+                            sendEvent(emitter, sendLock, "done", Map.of());
+                            emitter.complete();
+                        });
+            } catch (Exception e) {
+                emitter.completeWithError(e);
+            }
+        });
+
+        return emitter;
+    }
+
+    private void sendEvent(SseEmitter emitter, Object lock, String name, Object data) {
+        // SseEmitter.send is documented as not safe for concurrent calls from multiple threads -
+        // every job's own async completion callback sends independently, so this lock is load-
+        // bearing, not defensive-for-show.
+        synchronized (lock) {
+            try {
+                emitter.send(SseEmitter.event().name(name).data(data, MediaType.APPLICATION_JSON));
+            } catch (IOException | IllegalStateException e) {
+                emitter.completeWithError(e);
+            }
         }
     }
 

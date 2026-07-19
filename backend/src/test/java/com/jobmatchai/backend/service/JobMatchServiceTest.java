@@ -19,6 +19,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.*;
@@ -45,6 +48,18 @@ class JobMatchServiceTest {
     @Mock
     private OpenAICVAnalysisService openAICVAnalysisService;
 
+    @Mock
+    private MatchMetrics matchMetrics;
+
+    @Mock
+    private MatchScoreQueueService matchScoreQueueService;
+
+    @Mock
+    private com.jobmatchai.backend.repository.JobRepository jobRepository;
+
+    @Mock
+    private EmbeddingService embeddingService;
+
     private JobMatchService jobMatchService;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -57,6 +72,11 @@ class JobMatchServiceTest {
         ReflectionTestUtils.setField(jobMatchService, "jobMatchScoreRepository", jobMatchScoreRepository);
         ReflectionTestUtils.setField(jobMatchService, "notificationService", notificationService);
         ReflectionTestUtils.setField(jobMatchService, "openAICVAnalysisService", openAICVAnalysisService);
+        ReflectionTestUtils.setField(jobMatchService, "matchMetrics", matchMetrics);
+        ReflectionTestUtils.setField(jobMatchService, "matchScoreQueueService", matchScoreQueueService);
+        ReflectionTestUtils.setField(jobMatchService, "jobRepository", jobRepository);
+        ReflectionTestUtils.setField(jobMatchService, "embeddingService", embeddingService);
+        ReflectionTestUtils.setField(jobMatchService, "queueAwaitTimeoutMs", 60000L);
 
         // cvAnalysisRepository.findByUserEmail is stubbed per-test (every test needs a
         // different CVAnalysis fixture), so it is deliberately not given a blanket default here.
@@ -470,5 +490,250 @@ class JobMatchServiceTest {
         // First attempt + exactly one feedback-guided retry - never accepted, never persisted.
         verify(openAICVAnalysisService, times(2)).computeJobMatches(any(), anyList(), anyMap(), any(), any());
         verify(jobMatchScoreRepository, never()).save(any());
+    }
+
+    // ---- scenario 11: a job posting with nothing beyond its own title -> "not enough job
+    // information", no AI call spent at all ----
+
+    @Test
+    void jobWithTitleOnly_isInsufficientDataAndNeverCallsAi() {
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(doctorAnalysis()));
+        Job titleOnlyJob = new Job("Doctor", "Acme Co", null, "Tel Aviv", "Full-time", "20000", "", "", "");
+        titleOnlyJob.setId(20L);
+
+        JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(titleOnlyJob), "en");
+
+        Map<String, Object> match = result.matches().get(0);
+        assertThat(match.get("insufficientData")).isEqualTo(true);
+        assertThat(match.get("matchPercent")).isNull();
+        assertThat(match.get("matchReason")).isEqualTo("Not enough job information to calculate a reliable match.");
+        verifyNoInteractions(openAICVAnalysisService);
+    }
+
+    // ---- scenario 12: an extremely short, non-descriptive description with no real
+    // requirements/skills -> also insufficient data, even with a title beyond one word ----
+
+    @Test
+    void jobWithExtremelyShortDescription_isInsufficientDataAndNeverCallsAi() {
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(doctorAnalysis()));
+        Job shortDescJob = new Job("Nurse Assistant", "Acme Co", null, "Haifa", "Part-time", "8000",
+                "Help out.", "", "");
+        shortDescJob.setId(25L);
+
+        JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(shortDescJob), "en");
+
+        Map<String, Object> match = result.matches().get(0);
+        assertThat(match.get("insufficientData")).isEqualTo(true);
+        assertThat(match.get("matchPercent")).isNull();
+        verifyNoInteractions(openAICVAnalysisService);
+    }
+
+    // ---- scenario 13: reproduces the exact production finding (job id 14: title "doctor",
+    // description just "doctor" again, requirements a single line, skills "doctor, medicine,
+    // family") that previously received a fabricated 81% match with a full paragraph of invented
+    // detail -> must now be insufficient data instead, with zero AI spend ----
+
+    @Test
+    void productionThinDoctorJob_isInsufficientDataInsteadOfFabricated81Percent() {
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(doctorAnalysis()));
+        Job thinJob = new Job("doctor", "AI", "ai@test.com", "tel aviv", "Full-time", "20000",
+                "doctor", "Experience: 2 - 5 years", "doctor, medicine, family");
+        thinJob.setId(14L);
+
+        JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(thinJob), "en");
+
+        Map<String, Object> match = result.matches().get(0);
+        assertThat(match.get("insufficientData")).isEqualTo(true);
+        assertThat(match.get("matchPercent")).isNull();
+        verifyNoInteractions(openAICVAnalysisService);
+    }
+
+    // ---- scenario 14: a senior candidate against a posting stating "2 - 5 years" with no stated
+    // maximum -> the experience component is a full 100, never penalized for exceeding the range ----
+
+    @Test
+    void seniorCandidate_vsTwoToFiveYearRole_notPenalizedForExceedingRange() {
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(doctorAnalysis()));
+        Job midRangeJob = job(21L, "Physician",
+                "Patient diagnosis, Patient care, Prescribing medication",
+                "- Experience: 2 - 5 years\n- Active medical license required\n- Strong communication skills");
+
+        stubAi(Map.of(21L, relatedFixture("same_role",
+                List.of("Patient diagnosis", "Patient care", "Prescribing medication"), List.of(),
+                "mid", null, "specific_license")));
+
+        JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(midRangeJob), "en");
+
+        Map<String, Object> match = result.matches().get(0);
+        assertThat(match.get("experienceMatchPercent"))
+                .as("a senior candidate (rank 3) meets/exceeds a 'mid' requirement (rank 2) - never penalized for having more")
+                .isEqualTo(100);
+    }
+
+    // ---- scenario 15: getMatchDetail's free-text narrative must not treat the job's LOCATION as
+    // a prior-work-experience requirement, must not invent ungrounded "leadership"/"public
+    // health" concerns the posting never mentioned, and must not frame more-than-required
+    // experience as a disadvantage - reproduces the exact fabricated bullets found in production
+    // for job id 14 (General Practitioner CV, "doctor" job in Tel Aviv, "Experience: 2-5 years") ----
+
+    @Test
+    void matchDetail_filtersLocationAsExperienceAndUngroundedFillerAndOverqualificationClaims() {
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(doctorAnalysis()));
+        Job thinButRelatedJob = job(22L, "Physician",
+                "Patient diagnosis, Patient care, Prescribing medication",
+                "- Experience: 2 - 5 years\n- Active medical license required\n- Strong communication skills");
+        thinButRelatedJob.setLocation("Tel Aviv");
+
+        stubAi(Map.of(22L, relatedFixture("same_role",
+                List.of("Patient diagnosis", "Patient care", "Prescribing medication"), List.of(),
+                "mid", null, "specific_license")));
+
+        when(openAICVAnalysisService.computeJobMatchDetail(any(), any(), any(), anyInt(), anyList(), anyList()))
+                .thenReturn("""
+                        {
+                          "languageMatchPercent": 90,
+                          "whyGoodMatch": ["You have over 8 years of experience as a General Practitioner, which exceeds the job's requirement of 2-5 years."],
+                          "whyNotPerfectMatch": [
+                            "There is no explicit mention of experience working in Tel Aviv or familiarity with local healthcare regulations.",
+                            "The posting does not specify a need for advanced leadership or public health experience, which are among your strengths.",
+                            "The job posting may prefer candidates with experience levels closer to the 2-5 year range, while you are at a senior level."
+                          ],
+                          "improvementSuggestions": ["Highlight your adaptability and willingness to work in new environments."],
+                          "recommendation": "You are a strong candidate for this position.",
+                          "shouldApply": true
+                        }
+                        """);
+
+        JobMatchService.MatchDetailResult result = jobMatchService.getMatchDetail(EMAIL, thinButRelatedJob, "en");
+
+        assertThat(result.whyNotPerfectMatch()).hasSize(1);
+        assertThat(result.whyNotPerfectMatch().get(0))
+                .as("all three fabricated bullets (location-as-experience, ungrounded leadership/public-health filler, "
+                        + "overqualification framing) must be filtered out, leaving only the honest fallback")
+                .doesNotContainIgnoringCase("Tel Aviv")
+                .doesNotContainIgnoringCase("leadership")
+                .doesNotContainIgnoringCase("public health")
+                .doesNotContainIgnoringCase("closer to the");
+    }
+
+    // ---- scenario 16: synonyms - the AI claims "doctor" as a missing skill for a job titled
+    // "Doctor" while ALSO judging fieldRelationCloseness=same_role - self-contradictory (the
+    // candidate cannot be missing the very role they were just judged to already hold). Rejected
+    // on both attempts, so this falls back to the honest error sentinel rather than persisting a
+    // misleading missing-skill claim (doctor/physician/General Practitioner must never be treated
+    // as unrelated or missing for a candidate who already holds one of those titles). ----
+
+    @Test
+    void selfContradictoryMissingSkill_isRejectedEvenWhenFieldRelationClosenessIsSameRole() {
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(doctorAnalysis()));
+        Job doctorTitledJob = job(23L, "Doctor", "doctor, medicine, family, patient care, diagnosis",
+                "- Experience: 2 - 5 years\n- Must hold an active medical license\n- Strong communication skills required");
+
+        when(openAICVAnalysisService.computeJobMatches(any(), anyList(), anyMap(), any(), any()))
+                .thenAnswer(invocation -> {
+                    List<Job> jobs = invocation.getArgument(1);
+                    Map<Long, String> fingerprints = invocation.getArgument(2);
+                    Job requestedJob = jobs.get(0);
+                    return buildResponseJson(requestedJob, fingerprints.get(requestedJob.getId()),
+                            relatedFixture("same_role", List.of("medicine", "family"), List.of("doctor"),
+                                    "mid", null, null));
+                });
+
+        JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(doctorTitledJob), "en");
+
+        Map<String, Object> match = result.matches().get(0);
+        assertThat(match.get("fieldRelated"))
+                .as("the self-contradictory response is rejected on both attempts, falling back to the honest "
+                        + "'couldn't compute' sentinel rather than persisting 'doctor' as a missing skill")
+                .isNull();
+        verify(openAICVAnalysisService, times(2)).computeJobMatches(any(), anyList(), anyMap(), any(), any());
+        verify(jobMatchScoreRepository, never()).save(any());
+    }
+
+    // ---- scenario 17: the CV changes (a brand new CVAnalysis, different cvTextHash) while an
+    // old cached score still exists for the same job -> the stale cache computed against the OLD
+    // CV must never be reused; a fresh AI call reflects the NEW CV ----
+
+    @Test
+    void cvChanged_whileOldScoreCached_triggersFreshComputationNotStaleReuse() {
+        Job physicianJob = job(24L, "Physician", "Patient diagnosis, Patient care", "Active medical license required.");
+
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(doctorAnalysis()));
+        stubAi(Map.of(24L, relatedFixture("same_role",
+                List.of("Patient diagnosis", "Patient care"), List.of(),
+                "mid", "relevant_degree", "specific_license")));
+
+        jobMatchService.getMatchScores(EMAIL, List.of(physicianJob), "en");
+
+        ArgumentCaptor<JobMatchScore> savedCaptor = ArgumentCaptor.forClass(JobMatchScore.class);
+        verify(jobMatchScoreRepository).save(savedCaptor.capture());
+        JobMatchScore cachedFromOldCv = savedCaptor.getValue();
+        when(jobMatchScoreRepository.findByCandidateEmailAndJobIdIn(eq(EMAIL), anyList()))
+                .thenReturn(List.of(cachedFromOldCv));
+
+        // Simulates deleting/replacing the CV (a different cvTextHash) - the same flow
+        // ResumeManager.tsx's upload/delete/analyze actions trigger. reset() first: re-stubbing
+        // computeJobMatches with when() a second time in the same test would otherwise re-invoke
+        // the FIRST stub's answer as a side effect of Mockito recording the new stub.
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(infoSystemsGradAnalysis()));
+        reset(openAICVAnalysisService);
+        stubAi(Map.of(24L, unrelatedFixture("software", "medicine")));
+
+        JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(physicianJob), "en");
+
+        Map<String, Object> match = result.matches().get(0);
+        assertThat(match.get("fieldRelated"))
+                .as("the NEW CV's own verdict must be used - the row cached against the OLD CV's fingerprint must not be reused")
+                .isEqualTo(false);
+        // times(1), not 0: reset() above cleared invocation history along with the old stub, so
+        // this counts only the call made against the NEW CV - the real assertion is that this
+        // call happened at all (a stale-cache reuse would have made zero calls here).
+        verify(openAICVAnalysisService, times(1)).computeJobMatches(any(), anyList(), anyMap(), any(), any());
+    }
+
+    // ---- scenario 18: computeMatchScoresStreaming (the dashboard/job-list path) no longer
+    // computes AI matches inline - a stale job is enqueued onto the persistent queue and awaited,
+    // never computed directly on the request thread. This is what "the dashboard does not trigger
+    // synchronous analysis of every job" actually means at the code level: the call returns via
+    // MatchScoreQueueService, not by JobMatchService running the OpenAI call itself. ----
+
+    @Test
+    void computeMatchScoresStreaming_enqueuesStaleJobsInsteadOfComputingInline() {
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(doctorAnalysis()));
+        Job physicianJob = job(30L, "Physician", "Patient diagnosis, Patient care", "Active medical license required.");
+
+        JobMatchScore queuedResult = new JobMatchScore();
+        queuedResult.setCandidateEmail(EMAIL);
+        queuedResult.setJobId(30L);
+        queuedResult.setFieldRelated(true);
+        queuedResult.setMatchPercent(88);
+
+        when(matchScoreQueueService.awaitResult(eq(EMAIL), eq(30L), eq("internal"), any(), any(), anyLong()))
+                .thenReturn(CompletableFuture.completedFuture(queuedResult));
+        // Internal-job embedding lookup (see ensureInternalJobEmbeddings) - the prefilter itself
+        // isn't under test here, so embedBatch failing open (empty list) is fine; only modelKey()
+        // is called unconditionally and must not NPE.
+        when(embeddingService.modelKey()).thenReturn("test-model@1");
+        when(embeddingService.embedBatch(anyList())).thenReturn(List.of());
+
+        AtomicInteger resultCount = new AtomicInteger(0);
+        AtomicBoolean completed = new AtomicBoolean(false);
+        Map<Long, Map<String, Object>> resultsByJobId = new LinkedHashMap<>();
+
+        jobMatchService.computeMatchScoresStreaming(EMAIL, List.of(physicianJob), "en", Map.of(), "internal",
+                (jobId, payload) -> {
+                    resultCount.incrementAndGet();
+                    resultsByJobId.put(jobId, payload);
+                },
+                () -> completed.set(true));
+
+        assertThat(completed.get()).isTrue();
+        assertThat(resultCount.get()).isEqualTo(1);
+        assertThat(resultsByJobId.get(30L).get("matchPercent")).isEqualTo(88);
+
+        // The actual behavioral claim: this job was handed to the QUEUE (enqueueIfNeeded), never
+        // computed by calling the AI directly from this method.
+        verify(matchScoreQueueService).enqueueIfNeeded(eq(EMAIL), eq(physicianJob), eq("internal"), eq("en"), any(), any());
+        verifyNoInteractions(openAICVAnalysisService);
     }
 }

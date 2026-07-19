@@ -29,6 +29,20 @@ public class Job {
     @Column(name = "created_at", updatable = false)
     private LocalDateTime createdAt;
 
+    // Cached OpenAI embedding of this posting's own content (title + description) - backs the
+    // deterministic, keyword-free pre-filter in JobMatchService that decides whether a job is
+    // even worth an AI classification call, mirroring ExternalJob's identical fields. Lazily
+    // computed and fingerprinted the same way (see JobMatchService#ensureInternalJobEmbeddings):
+    // only recomputed when the title/description text or the embedding model/dimensions change.
+    @Column(name = "content_embedding", columnDefinition = "TEXT")
+    private String contentEmbedding;
+
+    @Column(name = "content_embedding_hash")
+    private String contentEmbeddingHash;
+
+    @Column(name = "content_embedding_model")
+    private String contentEmbeddingModel;
+
     public Job() {}
 
     public Job(String title, String companyName, String companyEmail,
@@ -132,6 +146,30 @@ public class Job {
 
     public void setCreatedAt(LocalDateTime createdAt) {
         this.createdAt = createdAt;
+    }
+
+    public String getContentEmbedding() {
+        return contentEmbedding;
+    }
+
+    public void setContentEmbedding(String contentEmbedding) {
+        this.contentEmbedding = contentEmbedding;
+    }
+
+    public String getContentEmbeddingHash() {
+        return contentEmbeddingHash;
+    }
+
+    public void setContentEmbeddingHash(String contentEmbeddingHash) {
+        this.contentEmbeddingHash = contentEmbeddingHash;
+    }
+
+    public String getContentEmbeddingModel() {
+        return contentEmbeddingModel;
+    }
+
+    public void setContentEmbeddingModel(String contentEmbeddingModel) {
+        this.contentEmbeddingModel = contentEmbeddingModel;
     }
 
     @PrePersist

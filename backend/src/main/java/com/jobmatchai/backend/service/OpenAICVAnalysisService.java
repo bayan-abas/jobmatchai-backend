@@ -52,6 +52,9 @@ public class OpenAICVAnalysisService {
     @Qualifier("openAIRestClient")
     private RestClient restClient;
 
+    @Autowired
+    private MatchMetrics matchMetrics;
+
     public String analyzeCV(String cvText, String language) {
         try {
             String safeCvText = cvText;
@@ -496,9 +499,10 @@ STEP 2 - if fieldRelationCloseness is NOT "unrelated", classify this job's requi
 - matchedMandatorySkills / missingMandatorySkills: every MANDATORY skill, matched if the candidate's technical/soft skills or summary/strengths show that skill or a reasonable equivalent (abbreviations, translations, synonyms, or a broader skill that clearly implies it count as matched), missing otherwise.
 - matchedPreferredSkills / missingPreferredSkills: same classification for PREFERRED skills.
 - Use the EXACT wording from the job's skill/requirement text. Every skill must appear in exactly one of the four arrays. Empty arrays if the job lists no skills.
+- SYNONYM RULE (mandatory): different phrasings can refer to the exact same real-world qualification - e.g. "doctor", "physician", "General Practitioner", "GP", and "M.D." are the SAME profession; "developer" and "software engineer" are the same discipline; "RN" and "Registered Nurse" are the same credential. Before listing ANY skill as missing, check whether it is simply a synonym, abbreviation, or alternate name for something the candidate's Profession title, Candidate field, previous job titles, or skills ALREADY show - if so it is matched, not missing. NEVER list the candidate's own documented profession (or an equivalent name for it) as a missing skill - if fieldRelationCloseness is "same_role" or "same_specialization", the candidate's own profession is definitionally already satisfied.
 
 STEP 3 - classify these three job requirements ONLY if the posting actually states or clearly implies them; otherwise leave the field null/absent (a null requirement is excluded from the final score entirely, not treated as "candidate fails it"):
-- requiredExperienceLevel: exactly one of "entry", "mid", "senior", or null if the posting states no seniority/years-of-experience expectation. A junior candidate applying to a senior posting in their own field should get "senior" here (which the backend will score appropriately low) - this must never influence fieldRelationCloseness.
+- requiredExperienceLevel: exactly one of "entry", "mid", "senior", or null if the posting states no seniority/years-of-experience expectation. Parse ANY stated years-of-experience figure, including a plain range - e.g. "0-2 years" or "no experience required" -> "entry"; "2-5 years" or "3+ years" -> "mid"; "5+ years", "7+ years", or "senior" -> "senior". A junior candidate applying to a senior posting in their own field should get "senior" here (which the backend will score appropriately low) - this must never influence fieldRelationCloseness. A candidate who EXCEEDS the posting's stated range is never a problem - do not let that influence this label either; the backend numerically credits meeting-or-exceeding the requirement as a full match, and having MORE experience than a stated range (with no stated maximum) is never treated as a gap anywhere in this system.
 - requiredEducationLevel: exactly one of "any_degree" (posting wants a degree, field unspecified), "relevant_degree" (posting wants a degree IN this specific field), or null if no degree is required. Never set this for general/vocational roles (cashier, retail, warehouse, driver, cleaner, security guard, etc.).
 - requiredCertificationLevel: exactly one of "general_cert" (posting wants some relevant certification), "specific_license" (posting legally requires a named practice license, e.g. medical/nursing/bar/PE license), or null if neither is required. A missing certification/license here must lower ITS OWN score, not flip fieldRelationCloseness away from a shared broad field (e.g. doctor vs. nurse job above).
 
@@ -596,6 +600,14 @@ JOB POSTING:
 
 Evaluate this candidate against this job thoroughly and honestly, the same way a senior recruiter would coach the candidate one-on-one.
 
+STRICT EVIDENCE RULES (mandatory - every bullet you write is checked against these afterward, and any bullet that violates them is deleted before the candidate ever sees it):
+- Every claim, gap, or concern you raise must be traceable to EITHER the already-matched/missing skills lists above OR text that is literally present in this JOB POSTING's Requirements/Description above. Never introduce a skill, qualification, requirement, or concern that isn't grounded in one of those two sources.
+- The job's Location field describes WHERE the job is physically located - it is NEVER a prior-work-experience requirement. Do not write that the candidate lacks "experience working in [city]" or "familiarity with local regulations/practices in [city]" unless the Requirements/Description text ITSELF explicitly states such a requirement in words - a bare location field is never sufficient evidence for that claim.
+- More experience/seniority than the posting asks for is NEVER a disadvantage, gap, or concern to raise - do not suggest the candidate is "overqualified," that their seniority "may be a concern," or that the posting "may prefer" someone with less experience, UNLESS the Requirements/Description text explicitly states a MAXIMUM years of experience or says the role is for junior/entry-level candidates ONLY.
+- Do not invent generic-sounding concerns (leadership experience, public health experience, specific certifications, language requirements, local/regional experience, etc.) unless the Requirements/Description text actually mentions that exact topic. A posting that says nothing about leadership has no leadership gap to mention.
+- Recognize synonyms and equivalent professional terms (e.g. "doctor" / "physician" / "General Practitioner" are the same profession) - never describe the candidate as lacking their own documented profession under a different name.
+- When you do not have enough grounded material for a full bullet, write FEWER bullets rather than pad with an ungrounded one - an empty or short list is honest; a fabricated bullet is not.
+
 Return exactly this JSON structure:
 {
   "languageMatchPercent": 0,
@@ -609,10 +621,10 @@ Return exactly this JSON structure:
 Rules:
 - languageMatchPercent: integer 0-100, how well the candidate's language/communication skills match what this job needs (if no language requirement is evident, score based on general communication evidence in the profile, defaulting to a reasonable score rather than 0).
 - recommendation: 2-3 sentences giving a clear, personal apply-or-not recommendation with reasoning, written directly to the candidate ("you"), consistent with the given """ + matchPercent + """
-% score.
+% score. Follow the same STRICT EVIDENCE RULES above - never mention overqualification/seniority as a concern without an explicit stated maximum, and never treat location as a work-experience requirement.
 - whyGoodMatch: 2-4 short bullet points, each written directly to the candidate ("you"), citing concrete evidence from the candidate profile.
-- whyNotPerfectMatch: 2-4 short bullet points explaining honestly what keeps this from being a perfect match. If the given score is very high, it is fine for this to focus on minor gaps.
-- improvementSuggestions: 2-4 concrete, actionable bullet points on what the candidate could do to become a stronger fit for this exact job.
+- whyNotPerfectMatch: 0-4 short bullet points explaining honestly what keeps this from being a perfect match, following the STRICT EVIDENCE RULES above. If the given score is very high, it is fine for this to focus on minor gaps, or to be empty if there genuinely are none grounded in the posting's own text.
+- improvementSuggestions: 0-4 concrete, actionable bullet points on what the candidate could do to become a stronger fit for this exact job, grounded the same way.
 - shouldApply: true if the given score and analysis support applying despite any gaps, false only if the mismatch is severe.
 """;
 
@@ -1235,16 +1247,28 @@ Overall CV score: %s
 
     private Map<String, Object> callOpenAI(Map<String, Object> body) {
         String configuredApiKey = requireConfiguredApiKey();
+        String requestedModel = String.valueOf(body.get("model"));
+        long start = System.nanoTime();
 
-        Map<String, Object> response = restClient.post()
-                .uri("/v1/responses")
-                .header("Authorization", "Bearer " + configuredApiKey)
-                .header("Content-Type", "application/json")
-                .body(Objects.requireNonNull(body))
-                .retrieve()
-                .body(new ParameterizedTypeReference<Map<String, Object>>() {});
+        try {
+            Map<String, Object> response = restClient.post()
+                    .uri("/v1/responses")
+                    .header("Authorization", "Bearer " + configuredApiKey)
+                    .header("Content-Type", "application/json")
+                    .body(Objects.requireNonNull(body))
+                    .retrieve()
+                    .body(new ParameterizedTypeReference<Map<String, Object>>() {});
 
-        return response != null ? response : Map.of();
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+            log.info("openai-call model={} elapsedMs={}", requestedModel, elapsedMs);
+            matchMetrics.recordOpenAiCall(requestedModel, "success", elapsedMs);
+            return response != null ? response : Map.of();
+        } catch (RuntimeException e) {
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+            log.info("openai-call model={} elapsedMs={} failed={}", requestedModel, elapsedMs, e.getClass().getSimpleName());
+            matchMetrics.recordOpenAiCall(requestedModel, "error", elapsedMs);
+            throw e;
+        }
     }
 
     private String requireConfiguredApiKey() {

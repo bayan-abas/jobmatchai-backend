@@ -2,8 +2,12 @@ package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
 
+// Looked up by user_email on every single match-scoring request (the hottest read in this whole
+// pipeline - one lookup per candidate per dashboard/job-list load) - indexed for exactly that.
 @Entity
-@Table(name = "cv_analysis")
+@Table(name = "cv_analysis", indexes = {
+        @Index(name = "idx_cv_analysis_user_email", columnList = "user_email")
+})
 public class CVAnalysis {
 
     @Id

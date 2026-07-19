@@ -50,6 +50,9 @@ public class JobMatchService {
     private JobMatchScoreRepository jobMatchScoreRepository;
 
     @Autowired
+    private com.jobmatchai.backend.repository.JobRepository jobRepository;
+
+    @Autowired
     private NotificationService notificationService;
 
     // Candidates get a "high match" notification the first time a job scores at or above
@@ -63,7 +66,21 @@ public class JobMatchService {
     @Autowired
     private EmbeddingService embeddingService;
 
-    @Value("${matching.embedding.prefilter.enabled:false}")
+    @Autowired
+    private MatchScoreQueueService matchScoreQueueService;
+
+    @Autowired
+    private MatchMetrics matchMetrics;
+
+    // How long computeMatchScoresStreaming waits for the queue/worker to produce a result for one
+    // job before giving up and surfacing the honest "couldn't compute, please retry" sentinel.
+    // Generous on purpose: multiple jobs await concurrently (each awaitResult call returns
+    // immediately with its own future), so this bounds per-JOB latency under a worst-case queue
+    // backlog, not the whole stream's wall time.
+    @Value("${matching.queue.await-timeout-ms:60000}")
+    private long queueAwaitTimeoutMs;
+
+    @Value("${matching.embedding.prefilter.enabled:true}")
     private boolean prefilterEnabled;
 
     @Value("${matching.embedding.prefilter.threshold:0.15}")
@@ -137,7 +154,22 @@ public class JobMatchService {
     // cleared the entry-level requirement. Field relevance for this case is now 25 (see
     // MatchScoreCalculator#scoreFieldRelevance), and experience is excluded entirely for
     // vocational roles, same as education already was.
-    private static final String MATCH_SCHEMA_VERSION = "v16-vocational-role-score-capped";
+    // v17: fixed a real production finding - a General Practitioner CV against a job literally
+    // titled "doctor" (skills "doctor, medicine, family") got fieldRelationCloseness=same_role
+    // (correct) but "doctor" was ALSO listed as a missing mandatory skill (self-contradictory -
+    // the candidate's own profession IS "doctor"), and the separate, unvalidated detail-narrative
+    // call (computeJobMatchDetail) invented an experience penalty for the candidate having MORE
+    // than the stated 2-5 years (no max was stated), described the job's Tel Aviv location as a
+    // missing "experience working in Tel Aviv", and criticized missing "leadership" and "public
+    // health" experience the posting never asked for. Also added a deterministic, pre-AI
+    // insufficient-job-data gate (see isInsufficientJobData) for postings too thin to compare
+    // against at all (that same "doctor" job: description was just the word "doctor" again,
+    // requirements a single line, three skill words including the title itself) - it had
+    // previously still received a confident 81% and a full paragraph of fabricated detail from
+    // essentially four words of real content. See validateMatch's self-contradictory-missing-
+    // skill check and OpenAICVAnalysisService's computeJobMatchDetail prompt/validateDetailClaims
+    // for the rest of this fix.
+    private static final String MATCH_SCHEMA_VERSION = "v17-insufficient-data-gate-and-stricter-evidence";
 
     // General/entry-level/vocational roles - ones that don't require specialized prior training,
     // a degree, or domain-specific tools to perform. Two separate backend overrides key off this
@@ -204,6 +236,162 @@ public class JobMatchService {
             return false;
         }
         return EmbeddingService.cosineSimilarity(profileVector, jobVector) < prefilterThreshold;
+    }
+
+    // Internal-jobs counterpart of ExternalJobService's attachEmbeddings/embeddingText - internal
+    // Job rows didn't have embedding columns at all until now, which is why the prefilter never
+    // actually applied to internal jobs (every internal caller always passed an empty embeddings
+    // map). Lazy + fingerprinted exactly like ensureProfileEmbedding: only the jobs that actually
+    // need computing (missing, or stale content/model) spend an embeddings call; everything else
+    // is a pure cache hit against the job's own persisted vector, reused for every candidate who
+    // is ever compared against it - "store job embeddings once and reuse them for all candidates."
+    private Map<Long, float[]> ensureInternalJobEmbeddings(List<Job> jobs) {
+        Map<Long, float[]> result = new HashMap<>();
+        if (jobs.isEmpty()) {
+            return result;
+        }
+
+        String modelKey = embeddingService.modelKey();
+        List<Job> needingEmbedding = new ArrayList<>();
+
+        for (Job job : jobs) {
+            String text = internalJobEmbeddingText(job);
+            String hash = HashUtil.sha256(text);
+
+            if (hash.equals(job.getContentEmbeddingHash()) && modelKey.equals(job.getContentEmbeddingModel())
+                    && job.getContentEmbedding() != null) {
+                float[] vector = embeddingService.fromJson(job.getContentEmbedding());
+                if (vector != null) {
+                    result.put(job.getId(), vector);
+                    continue;
+                }
+            }
+            needingEmbedding.add(job);
+        }
+
+        if (!needingEmbedding.isEmpty()) {
+            List<String> texts = needingEmbedding.stream().map(this::internalJobEmbeddingText).toList();
+            List<float[]> vectors = embeddingService.embedBatch(texts);
+
+            if (vectors.size() == needingEmbedding.size()) {
+                for (int i = 0; i < needingEmbedding.size(); i++) {
+                    Job job = needingEmbedding.get(i);
+                    float[] vector = vectors.get(i);
+                    job.setContentEmbedding(embeddingService.toJson(vector));
+                    job.setContentEmbeddingHash(HashUtil.sha256(texts.get(i)));
+                    job.setContentEmbeddingModel(modelKey);
+                    result.put(job.getId(), vector);
+                }
+                jobRepository.saveAll(needingEmbedding);
+            }
+            // A partial/failed embeddings call (embedBatch fails open, returning List.of()) just
+            // means these jobs are missing from `result` this round - shouldSkipAiViaPrefilter
+            // already fails open on a missing vector (sends to AI), never guesses.
+        }
+
+        return result;
+    }
+
+    private String internalJobEmbeddingText(Job job) {
+        String description = job.getDescription();
+        if (description != null && description.length() > 1500) {
+            description = description.substring(0, 1500);
+        }
+        return nullToEmpty(job.getTitle()) + ". " + nullToEmpty(description);
+    }
+
+    // One-time-per-boot catch-up for internal job rows with no embedding yet (created before this
+    // column existed, or a prior embeddings call failed) - cheap no-op once nothing is missing, so
+    // it's safe to run on every startup. Mirrors ExternalJobService#backfillMissingEmbeddingsOnStartup.
+    @org.springframework.context.event.EventListener(org.springframework.boot.context.event.ApplicationReadyEvent.class)
+    public void backfillMissingInternalJobEmbeddingsOnStartup() {
+        List<Job> missing = jobRepository.findByContentEmbeddingIsNull();
+        if (missing.isEmpty()) {
+            return;
+        }
+        ensureInternalJobEmbeddings(missing);
+    }
+
+    // Deterministic, pre-AI gate - a job posting with essentially nothing beyond its own title
+    // (no real description, requirements, or skills) can never support a reliable comparison.
+    // Sending it to the AI anyway is exactly what produces confident-sounding but fabricated
+    // output: found via live production data - job id 14, title "doctor", description "doctor"
+    // (literally just the title again), requirements "Experience: 2 - 5 years", skills "doctor,
+    // medicine, family" - the AI still returned an 81% match with a full paragraph of invented
+    // detail (fabricated concerns about "experience working in Tel Aviv", unrequested "leadership
+    // or public health experience", and "doctor" itself listed as a missing skill for a candidate
+    // who IS a doctor) from essentially four words of real content. This check runs BEFORE the
+    // embedding prefilter and before any AI call, so a thin posting costs nothing to identify -
+    // never an AI judgment call, so it is 100% reproducible.
+    // A posting with clearly bulleted/multi-line requirements, or a generous skill list, is never
+    // insufficient regardless of total length - either is a strong standalone signal of a real
+    // posting (short bullets are still real content). Everything else falls back to a combined
+    // total-content-length check across all three fields together, rather than requiring each
+    // field to individually clear its own bar - a job can legitimately split modest content
+    // across description/requirements/skills (e.g. a one-line description plus a short skills
+    // list) without any single field being long, and that must not be flagged as "insufficient"
+    // the way a job that is really just its title repeated three ways should be.
+    private static final int MIN_REAL_SKILL_TERMS = 3;
+    private static final int MIN_TOTAL_CONTENT_CHARS = 65;
+
+    private boolean isInsufficientJobData(Job job) {
+        String title = nullToEmpty(job.getTitle()).trim();
+        String normalizedTitle = normalizeForTitleComparison(title);
+        String description = nullToEmpty(job.getDescription()).trim();
+        String requirements = nullToEmpty(job.getRequirements()).trim();
+        String skills = nullToEmpty(job.getSkills()).trim();
+
+        // A description that just repeats the title verbatim says nothing a candidate could
+        // actually be compared against, so it doesn't count toward the total.
+        String descriptionBeyondTitle =
+                normalizeForTitleComparison(description).equals(normalizedTitle) ? "" : description;
+
+        // Real, distinct skill terms only - a "skills" field that just repeats the job's own
+        // title (e.g. "doctor" on a job titled "doctor") is not a second real skill signal.
+        long realSkillTerms = java.util.Arrays.stream(skills.split("[,;\\n]"))
+                .map(String::trim)
+                .filter(s -> !s.isBlank())
+                .filter(s -> !normalizeForTitleComparison(s).equals(normalizedTitle))
+                .distinct()
+                .count();
+
+        boolean hasStructuredRequirements = requirements.lines().count() >= 2;
+        boolean hasEnoughSkills = realSkillTerms >= MIN_REAL_SKILL_TERMS;
+        int totalContentChars = descriptionBeyondTitle.length() + requirements.length() + skills.length();
+
+        return !hasStructuredRequirements && !hasEnoughSkills && totalContentChars < MIN_TOTAL_CONTENT_CHARS;
+    }
+
+    // Persisted (cacheable, deterministic - never retried on the next visit) unlike the ephemeral
+    // "AI call failed" error sentinel elsewhere in this class, which is intentionally NEVER saved.
+    // fieldRelated is left null (no verdict was ever possible), matched via insufficientData=true
+    // rather than fieldRelated itself - see JobMatchScore#insufficientData.
+    private void applyInsufficientDataVerdict(
+            JobMatchScore score, String email, long jobId,
+            String cvFingerprint, String jobFingerprint, String jobContentFingerprint) {
+        score.setCandidateEmail(email);
+        score.setJobId(jobId);
+        score.setInsufficientData(true);
+        score.setFieldRelated(null);
+        score.setMatchReason("Not enough job information to calculate a reliable match.");
+        score.setMatchPercent(null);
+        score.setMatchedSkills("");
+        score.setMissingSkills("");
+        score.setMissingRequiredSkills("");
+        score.setMissingPreferredSkills("");
+        score.setFieldRelevancePercent(null);
+        score.setSkillsMatchPercent(null);
+        score.setExperienceMatchPercent(null);
+        score.setEducationMatchPercent(null);
+        score.setCertificationMatchPercent(null);
+        score.setLocationMatchPercent(null);
+        score.setCvFingerprint(cvFingerprint);
+        score.setJobFingerprint(jobFingerprint);
+        score.setJobContentFingerprint(jobContentFingerprint);
+        score.setRecommendation(null);
+        score.setWhyGoodMatch(null);
+        score.setWhyNotPerfectMatch(null);
+        score.setImprovementSuggestions(null);
     }
 
     // Persists a pre-filter skip through the exact same code path an AI "unrelated" verdict
@@ -285,6 +473,7 @@ public class JobMatchService {
         match.put("fieldRelated", score.getFieldRelated());
         match.put("matchPercent", score.getMatchPercent());
         match.put("matchReason", score.getMatchReason());
+        match.put("insufficientData", Boolean.TRUE.equals(score.getInsufficientData()));
         match.put("matchedSkills", splitSkillsString(score.getMatchedSkills()));
         match.put("missingSkills", splitSkillsString(score.getMissingSkills()));
         match.put("missingRequiredSkills", splitSkillsString(score.getMissingRequiredSkills()));
@@ -304,6 +493,7 @@ public class JobMatchService {
         match.put("fieldRelated", null);
         match.put("matchPercent", null);
         match.put("matchReason", "We couldn't calculate a match for this job right now. Please try again.");
+        match.put("insufficientData", false);
         match.put("matchedSkills", List.of());
         match.put("missingSkills", List.of());
         match.put("missingRequiredSkills", List.of());
@@ -335,8 +525,9 @@ public class JobMatchService {
     // fires for those, exactly like today's AI-only behavior.
     public void computeMatchScoresStreaming(
             String email, List<Job> jobs, String language, Map<Long, float[]> jobEmbeddings,
-            BiConsumer<Long, Map<String, Object>> onJobResult, Runnable onComplete) {
+            String jobType, BiConsumer<Long, Map<String, Object>> onJobResult, Runnable onComplete) {
 
+        long methodStart = System.nanoTime();
         CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(email).orElse(null);
         if (analysis == null || jobs == null || jobs.isEmpty()) {
             onComplete.run();
@@ -345,11 +536,14 @@ public class JobMatchService {
 
         String cvFingerprint = fingerprintCv(analysis);
 
+        long dbReadStart = System.nanoTime();
         List<Long> jobIds = jobs.stream().map(Job::getId).toList();
         Map<Long, JobMatchScore> cachedByJobId = new HashMap<>();
         for (JobMatchScore score : jobMatchScoreRepository.findByCandidateEmailAndJobIdIn(email, jobIds)) {
             cachedByJobId.put(score.getJobId(), score);
         }
+        long dbReadMs = (System.nanoTime() - dbReadStart) / 1_000_000;
+        matchMetrics.recordDbQuery("read_scores", dbReadMs);
 
         Map<Long, String> jobFingerprints = new HashMap<>();
         Map<Long, String> jobContentFingerprints = new HashMap<>();
@@ -365,10 +559,19 @@ public class JobMatchService {
                     || !cvFingerprint.equals(cached.getCvFingerprint())
                     || !jobFingerprint.equals(cached.getJobFingerprint());
 
-            if (isStale) {
-                jobsNeedingComputation.add(job);
-            } else {
+            if (!isStale) {
+                matchMetrics.recordCacheHit(jobType);
                 onJobResult.accept(job.getId(), scoreToPayload(cached));
+            } else if (isInsufficientJobData(job)) {
+                matchMetrics.recordInsufficientData();
+                JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
+                applyInsufficientDataVerdict(score, email, job.getId(),
+                        cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()));
+                score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
+                onJobResult.accept(job.getId(), scoreToPayload(score));
+            } else {
+                matchMetrics.recordCacheMiss(jobType);
+                jobsNeedingComputation.add(job);
             }
         }
 
@@ -377,10 +580,22 @@ public class JobMatchService {
             return;
         }
 
-        // Only bother computing/loading the candidate's own profile vector if the caller
-        // actually supplied any job vectors to compare it against - avoids a wasted embeddings
-        // call for a caller that never wires up jobEmbeddings at all (e.g. internal jobs today).
-        boolean anyJobEmbeddings = jobEmbeddings != null && !jobEmbeddings.isEmpty();
+        // Internal jobs get their own embeddings computed/cached here (see
+        // ensureInternalJobEmbeddings) - external jobs already arrive with theirs via
+        // ExternalJobService, which computes them once at import time. Either way, this is what
+        // makes the pre-filter actually apply to BOTH job types instead of only ever firing for
+        // external jobs (it silently never fired for internal jobs before this - callers always
+        // passed an empty embeddings map).
+        Map<Long, float[]> effectiveEmbeddings = jobEmbeddings == null
+                ? new HashMap<>() : new HashMap<>(jobEmbeddings);
+        if ("internal".equals(jobType)) {
+            effectiveEmbeddings.putAll(ensureInternalJobEmbeddings(jobsNeedingComputation));
+        }
+
+        // Only bother computing/loading the candidate's own profile vector if there's actually
+        // at least one job vector to compare it against - avoids a wasted embeddings call
+        // otherwise.
+        boolean anyJobEmbeddings = !effectiveEmbeddings.isEmpty();
         float[] profileVector = anyJobEmbeddings
                 ? embeddingService.ensureProfileEmbedding(analysis, cvAnalysisRepository)
                 : null;
@@ -389,7 +604,7 @@ public class JobMatchService {
         Map<Long, Float> similarityByJobId = new HashMap<>();
 
         for (Job job : jobsNeedingComputation) {
-            float[] jobVector = jobEmbeddings == null ? null : jobEmbeddings.get(job.getId());
+            float[] jobVector = effectiveEmbeddings.get(job.getId());
             if (profileVector != null && jobVector != null) {
                 similarityByJobId.put(job.getId(), EmbeddingService.cosineSimilarity(profileVector, jobVector));
             }
@@ -410,16 +625,25 @@ public class JobMatchService {
             return;
         }
 
-        Semaphore limiter = new Semaphore(MAX_CONCURRENT_MATCH_CALLS);
-        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        // Handed off to the persistent queue instead of computed inline on a per-request virtual
+        // thread - the actual OpenAI call now happens in MatchScoreQueueWorker's own bounded,
+        // rate-limited pool, decoupled from this request's lifetime (the candidate can navigate
+        // away or close the tab and background pre-computation continues regardless). This
+        // request only enqueues (idempotent - a job already queued by another concurrent request
+        // is left alone, not duplicated) and awaits a result, which still resolves the moment
+        // it's ready so the streaming/progressive UX is unchanged from the candidate's side.
         AtomicInteger remaining = new AtomicInteger(jobsSentToAi.size());
 
         for (Job job : jobsSentToAi) {
-            CompletableFuture<JobMatchScore> future = singleflightComputeJob(email, job, analysis, language,
-                    cvFingerprint, jobFingerprints, jobContentFingerprints, cachedByJobId, limiter, executor);
+            long jobId = job.getId();
+            String jobFingerprint = jobFingerprints.get(jobId);
+
+            matchScoreQueueService.enqueueIfNeeded(email, job, jobType, language, cvFingerprint, jobFingerprint);
+            CompletableFuture<JobMatchScore> future = matchScoreQueueService.awaitResult(
+                    email, jobId, jobType, cvFingerprint, jobFingerprint, queueAwaitTimeoutMs);
 
             future.whenComplete((score, ex) -> {
-                Float similarity = similarityByJobId.get(job.getId());
+                Float similarity = similarityByJobId.get(jobId);
                 if (similarity != null) {
                     // Shadow-calibration signal: logged for every job that actually reached the
                     // AI (whether because the prefilter is disabled, or scored above threshold),
@@ -428,14 +652,13 @@ public class JobMatchService {
                     // AI calls outright. See matching.embedding.prefilter.* config.
                     Boolean fieldRelated = score != null ? score.getFieldRelated() : null;
                     log.info("prefilter-shadow email={} jobId={} similarity={} fieldRelated={}",
-                            email, job.getId(), similarity, fieldRelated);
+                            email, jobId, similarity, fieldRelated);
                 }
 
-                Map<String, Object> payload = (score != null) ? scoreToPayload(score) : errorPayload(job.getId());
-                onJobResult.accept(job.getId(), payload);
+                Map<String, Object> payload = (score != null) ? scoreToPayload(score) : errorPayload(jobId);
+                onJobResult.accept(jobId, payload);
 
                 if (remaining.decrementAndGet() == 0) {
-                    executor.shutdown();
                     onComplete.run();
                 }
             });
@@ -478,7 +701,9 @@ public class JobMatchService {
         });
     }
 
-    private JsonNode firstMatchForJob(JsonNode matches, long jobId) {
+    // Package-private (not private): MatchScoreQueueWorker reuses this exact validated logic
+    // rather than duplicating it - see this class's other package-private compute methods below.
+    JsonNode firstMatchForJob(JsonNode matches, long jobId) {
         if (matches == null) {
             return null;
         }
@@ -494,13 +719,17 @@ public class JobMatchService {
     // missingSkills (and every weighted component) for a candidate+job, shared by both
     // getMatchScores (the job list/card view) and getMatchDetail (the job details page).
     private Map<Long, JobMatchScore> ensureCoreScores(String email, List<Job> jobs, String language, CVAnalysis analysis) {
+        long methodStart = System.nanoTime();
         String cvFingerprint = fingerprintCv(analysis);
 
+        long dbReadStart = System.nanoTime();
         List<Long> jobIds = jobs.stream().map(Job::getId).toList();
         Map<Long, JobMatchScore> cachedByJobId = new HashMap<>();
         for (JobMatchScore score : jobMatchScoreRepository.findByCandidateEmailAndJobIdIn(email, jobIds)) {
             cachedByJobId.put(score.getJobId(), score);
         }
+        long dbReadMs = (System.nanoTime() - dbReadStart) / 1_000_000;
+        matchMetrics.recordDbQuery("read_scores", dbReadMs);
 
         Map<Long, String> jobFingerprints = new HashMap<>();
         Map<Long, String> jobContentFingerprints = new HashMap<>();
@@ -516,12 +745,21 @@ public class JobMatchService {
                     || !cvFingerprint.equals(cached.getCvFingerprint())
                     || !jobFingerprint.equals(cached.getJobFingerprint());
 
-            if (isStale) {
+            if (isStale && isInsufficientJobData(job)) {
+                JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
+                applyInsufficientDataVerdict(score, email, job.getId(),
+                        cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()));
+                cachedByJobId.put(job.getId(), jobMatchScoreRepositorySafeSave(score, email, job.getId()));
+            } else if (isStale) {
                 jobsNeedingComputation.add(job);
             }
         }
 
+        log.info("match-scores-timing candidate={} totalJobs={} cacheHits={} needingComputation={} dbReadMs={}",
+                email, jobs.size(), jobs.size() - jobsNeedingComputation.size(), jobsNeedingComputation.size(), dbReadMs);
+
         if (!jobsNeedingComputation.isEmpty()) {
+            long aiPhaseStart = System.nanoTime();
             Semaphore limiter = new Semaphore(MAX_CONCURRENT_MATCH_CALLS);
 
             // Every job's AI call is routed through the same singleflightComputeJob/
@@ -566,12 +804,18 @@ public class JobMatchService {
                     }
                 }
             }
+
+            long aiPhaseMs = (System.nanoTime() - aiPhaseStart) / 1_000_000;
+            log.info("match-scores-timing candidate={} aiPhaseMs={} jobsComputed={} avgMsPerJob={}",
+                    email, aiPhaseMs, jobsNeedingComputation.size(),
+                    jobsNeedingComputation.isEmpty() ? 0 : aiPhaseMs / jobsNeedingComputation.size());
         }
 
+        log.info("match-scores-timing candidate={} totalMs={}", email, (System.nanoTime() - methodStart) / 1_000_000);
         return cachedByJobId;
     }
 
-    private void maybeNotifyHighMatch(String email, Job job, JobMatchScore score) {
+    void maybeNotifyHighMatch(String email, Job job, JobMatchScore score) {
         Integer matchPercent = score.getMatchPercent();
         if (matchPercent != null && matchPercent >= HIGH_MATCH_NOTIFICATION_THRESHOLD) {
             notificationService.createNotificationOnce(
@@ -591,11 +835,16 @@ public class JobMatchService {
     // existing synchronous endpoint at once). Someone else's concurrently-saved row for the exact
     // same CV+job+schema is equally valid - there's no "which one is right" question - so just
     // re-read and use theirs instead of surfacing an error.
-    private JobMatchScore jobMatchScoreRepositorySafeSave(JobMatchScore score, String email, long jobId) {
+    JobMatchScore jobMatchScoreRepositorySafeSave(JobMatchScore score, String email, long jobId) {
+        long start = System.nanoTime();
         try {
             return jobMatchScoreRepository.save(score);
         } catch (DataIntegrityViolationException e) {
             return jobMatchScoreRepository.findByCandidateEmailAndJobId(email, jobId).orElseThrow(() -> e);
+        } finally {
+            long dbSaveMs = (System.nanoTime() - start) / 1_000_000;
+            log.info("match-scores-timing jobId={} dbSaveMs={}", jobId, dbSaveMs);
+            matchMetrics.recordDbQuery("save_score", dbSaveMs);
         }
     }
 
@@ -606,9 +855,14 @@ public class JobMatchService {
     // "same CV + same job -> same score" hold even across AI response variance, since the only
     // way the score changes is if the AI's CLASSIFICATION changes, and identical classifications
     // always produce identical numbers.
-    private void applyParsedMatchToScore(
+    void applyParsedMatchToScore(
             JobMatchScore score, ParsedMatch parsed, Job job, CVAnalysis analysis, String email, long jobId,
             String cvFingerprint, String jobFingerprint, String jobContentFingerprint) {
+
+        // A real AI verdict was reached (however it comes out below) - never the deterministic
+        // "posting too thin to score" gate (see applyInsufficientDataVerdict), so this is always
+        // explicitly false here, never left null/ambiguous in a persisted row.
+        score.setInsufficientData(false);
 
         // Backend override: a general/vocational role must never come back "unrelated" for the
         // candidate's specialized background - see GENERAL_VOCATIONAL_ROLE_KEYWORDS. Only
@@ -757,9 +1011,25 @@ public class JobMatchService {
 
             if (json != null) {
                 core.setLanguageMatchPercent(json.has("languageMatchPercent") ? json.path("languageMatchPercent").asInt() : null);
-                core.setWhyGoodMatch(joinSkillsArray(json.path("whyGoodMatch")));
-                core.setWhyNotPerfectMatch(joinSkillsArray(json.path("whyNotPerfectMatch")));
-                core.setImprovementSuggestions(joinSkillsArray(json.path("improvementSuggestions")));
+
+                // computeJobMatches' matchedSkills/missingSkills go through validateMatch before
+                // ever being trusted - this free-text narrative call has no equivalent fixed-
+                // vocabulary classification step, so validateDetailClaims is its evidence check:
+                // any bullet this can positively identify as unsupported by the job's own text is
+                // dropped rather than shown. See validateDetailClaims for the production examples
+                // that made this necessary (location-as-experience, ungrounded filler concerns,
+                // framing more-than-required experience as a disadvantage).
+                List<String> whyGoodMatch = validateDetailClaims(toStringList(json.path("whyGoodMatch")), job);
+                List<String> whyNotPerfectMatch = validateDetailClaims(toStringList(json.path("whyNotPerfectMatch")), job);
+                List<String> improvementSuggestions = validateDetailClaims(toStringList(json.path("improvementSuggestions")), job);
+
+                core.setWhyGoodMatch(String.join("|", whyGoodMatch));
+                core.setWhyNotPerfectMatch(whyNotPerfectMatch.isEmpty()
+                        ? "No specific concerns beyond your background - this looks like a strong overall match."
+                        : String.join("|", whyNotPerfectMatch));
+                core.setImprovementSuggestions(improvementSuggestions.isEmpty()
+                        ? "No specific suggestions - your profile already aligns well with this role's stated requirements."
+                        : String.join("|", improvementSuggestions));
                 // recommendation must end up non-blank on success so the check above can tell a
                 // completed computation apart from one that never ran / previously failed.
                 String recommendation = json.path("recommendation").asText("");
@@ -807,20 +1077,85 @@ public class JobMatchService {
         }
     }
 
-    private String joinSkillsArray(JsonNode skillsNode) {
-        if (skillsNode == null || !skillsNode.isArray()) {
-            return "";
+    // Fixed set of commonly-hallucinated "concern" topics found via production testing (a
+    // General Practitioner CV against a job titled "doctor" got criticized for missing
+    // "leadership or public health experience" the posting never mentioned) - a bullet may only
+    // raise one of these if the job's OWN text actually contains it; otherwise there is nothing
+    // real for the candidate to be "missing" relative to.
+    private static final List<String> UNGROUNDED_FILLER_TERMS = List.of(
+            "leadership", "public health", "certification", "certifications",
+            "language requirement", "language skills", "local experience", "local regulations"
+    );
+
+    // Phrasings that frame MORE experience/seniority than required as a concern - never valid
+    // unless the posting itself states an explicit maximum or a junior/entry-only restriction
+    // (see EXPLICIT_EXPERIENCE_CAP below). MatchScoreCalculator#scoreExperience already never
+    // penalizes exceeding the required level numerically; this is purely about the free-text
+    // narrative independently inventing the same non-existent penalty in prose.
+    private static final List<String> OVERQUALIFICATION_PHRASES = List.of(
+            "overqualified", "over-qualified", "exceeds the job's requirement", "exceeds the stated",
+            "above the stated", "above the required", "closer to the", "may prefer candidates with experience levels",
+            "your seniority may be", "targeted at less experienced"
+    );
+
+    private static final java.util.regex.Pattern EXPLICIT_EXPERIENCE_CAP = java.util.regex.Pattern.compile(
+            "(maximum|no more than|up to \\d+\\s*years|junior[- ]only|entry[- ]level only)",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    // Filters computeJobMatchDetail's whyGoodMatch/whyNotPerfectMatch/improvementSuggestions
+    // bullets against the job's own text. Unlike computeJobMatches (see validateMatch), this
+    // free-text narrative call has no fixed-vocabulary classification to check the AI's output
+    // against - this is its evidence check. These are advisory bullet points, so an unsupported
+    // one is simply dropped rather than triggering a whole-call retry (see the fallback text at
+    // this method's only call site for what happens if every bullet in a list is dropped).
+    //
+    // Found in production: a General Practitioner CV against a job titled "doctor" in Tel Aviv
+    // (posting text: only "Experience: 2 - 5 years") produced bullets claiming "no explicit
+    // mention of experience working in Tel Aviv" (the job's LOCATION field is where the job IS,
+    // never a prior-work-experience requirement the candidate must independently have),
+    // criticizing missing "leadership or public health experience" (the posting never asked for
+    // either), and framing the candidate's 8+ years as a concern against a posting that stated no
+    // maximum at all.
+    private List<String> validateDetailClaims(List<String> bullets, Job job) {
+        if (bullets == null || bullets.isEmpty()) {
+            return List.of();
         }
 
-        List<String> skills = new ArrayList<>();
-        for (JsonNode skill : skillsNode) {
-            String text = skill.asText("").trim();
-            if (!text.isBlank()) {
-                skills.add(text);
+        String jobBlob = jobRequirementsBlob(job);
+        String jobLocation = nullToEmpty(job.getLocation()).trim().toLowerCase(Locale.ROOT);
+        boolean locationDiscussedInRequirements = !jobLocation.isBlank() && jobBlob.contains(jobLocation);
+        boolean hasExplicitExperienceCap = EXPLICIT_EXPERIENCE_CAP
+                .matcher(nullToEmpty(job.getRequirements()) + " " + nullToEmpty(job.getDescription()))
+                .find();
+
+        List<String> filtered = new ArrayList<>();
+        for (String bullet : bullets) {
+            if (bullet == null || bullet.isBlank()) {
+                continue;
             }
-        }
+            String lower = bullet.toLowerCase(Locale.ROOT);
 
-        return String.join("|", skills);
+            if (!jobLocation.isBlank() && lower.contains(jobLocation) && !locationDiscussedInRequirements
+                    && (lower.contains("experience") || lower.contains("familiar") || lower.contains("background"))) {
+                log.info("match-detail-filtered jobId={} reason=location-as-experience", job.getId());
+                continue;
+            }
+
+            boolean hasUngroundedFiller = UNGROUNDED_FILLER_TERMS.stream()
+                    .anyMatch(term -> lower.contains(term) && !jobBlob.contains(term));
+            if (hasUngroundedFiller) {
+                log.info("match-detail-filtered jobId={} reason=ungrounded-filler", job.getId());
+                continue;
+            }
+
+            if (!hasExplicitExperienceCap && OVERQUALIFICATION_PHRASES.stream().anyMatch(lower::contains)) {
+                log.info("match-detail-filtered jobId={} reason=overqualification-claim", job.getId());
+                continue;
+            }
+
+            filtered.add(bullet);
+        }
+        return filtered;
     }
 
     private List<String> splitSkillsString(String value) {
@@ -857,9 +1192,9 @@ public class JobMatchService {
     // - before giving up on a job for this request.
     private static final int MAX_CONCURRENT_MATCH_CALLS = 5;
 
-    private record ValidatedBatch(List<JsonNode> validMatches, boolean allValid, Map<Long, List<String>> errorsByJobId) {}
+    record ValidatedBatch(List<JsonNode> validMatches, boolean allValid, Map<Long, List<String>> errorsByJobId) {}
 
-    private JsonNode computeChunkWithRetry(
+    JsonNode computeChunkWithRetry(
             CVAnalysis analysis, List<Job> chunk, Map<Long, String> jobFingerprints,
             String language, Semaphore concurrencyLimiter) {
         try {
@@ -869,21 +1204,30 @@ public class JobMatchService {
             return objectMapper.createArrayNode();
         }
 
+        long jobId = chunk.isEmpty() ? -1 : chunk.get(0).getId();
+        long waitStart = System.nanoTime();
         try {
             Map<Long, Job> jobById = chunk.stream().collect(Collectors.toMap(Job::getId, job -> job));
 
+            long callStart = System.nanoTime();
             JsonNode firstAttempt = readMatchesArray(
                     openAICVAnalysisService.computeJobMatches(analysis, chunk, jobFingerprints, language, null));
             ValidatedBatch firstResult = validateBatch(firstAttempt, jobById, jobFingerprints, analysis);
+            log.info("match-scores-timing jobId={} waitedForPermitMs={} firstCallMs={} firstValid={}",
+                    jobId, (callStart - waitStart) / 1_000_000, (System.nanoTime() - callStart) / 1_000_000,
+                    firstResult.allValid());
 
             if (firstResult.allValid()) {
                 return toArrayNode(firstResult.validMatches());
             }
 
             String feedback = buildRetryFeedback(chunk, firstResult);
+            long retryStart = System.nanoTime();
             JsonNode retryAttempt = readMatchesArray(
                     openAICVAnalysisService.computeJobMatches(analysis, chunk, jobFingerprints, language, feedback));
             ValidatedBatch retryResult = validateBatch(retryAttempt, jobById, jobFingerprints, analysis);
+            log.info("match-scores-timing jobId={} retryCallMs={} retryValid={}",
+                    jobId, (System.nanoTime() - retryStart) / 1_000_000, retryResult.allValid());
 
             // Keep whichever attempt validly covers more jobs - a fully-valid retry always wins,
             // and a still-partial retry is only worth using if it's a strict improvement over
@@ -959,7 +1303,7 @@ public class JobMatchService {
     // AI output is strictly classification - a handful of fixed-vocabulary labels - never a raw
     // score. MatchScoreCalculator (see applyParsedMatchToScore) is the only thing that turns
     // these labels into numbers.
-    private record ParsedMatch(
+    record ParsedMatch(
             long jobId,
             String jobTitle,
             String jobFingerprint,
@@ -980,7 +1324,7 @@ public class JobMatchService {
     private static final Set<String> VALID_EDUCATION_LEVELS = Set.of("any_degree", "relevant_degree");
     private static final Set<String> VALID_CERTIFICATION_LEVELS = Set.of("general_cert", "specific_license");
 
-    private ParsedMatch parseMatch(JsonNode match) {
+    ParsedMatch parseMatch(JsonNode match) {
         // An unrecognized/missing closeness value defaults to "unrelated" (the safe, honest
         // failure mode) rather than silently treating it as related - validateMatch below still
         // rejects anything outside VALID_CLOSENESS outright, so this default only matters for
@@ -1076,9 +1420,30 @@ public class JobMatchService {
             }
 
             String jobBlob = jobRequirementsBlob(job);
+            // Self-contradictory claim - found in production: a General Practitioner CV against a
+            // job titled "doctor" was judged fieldRelationCloseness=same_role (correct) but then
+            // ALSO listed "doctor" itself as a missing mandatory skill. If the AI has already
+            // judged this job to BE the candidate's own specific role/specialization, the job's
+            // own defining title cannot simultaneously be something the candidate is "missing" -
+            // checked against the JOB's title, not the candidate's, since that's the profession
+            // sameSpecificRole just asserted the candidate already holds.
+            boolean sameSpecificRole = "same_role".equals(parsed.fieldRelationCloseness())
+                    || "same_specialization".equals(parsed.fieldRelationCloseness());
+            String normalizedJobTitle = normalizeForTitleComparison(nullToEmpty(job.getTitle()));
+
             for (String skill : concat(parsed.missingMandatorySkills(), parsed.missingPreferredSkills())) {
                 if (!evidencedIn(skill, jobBlob)) {
                     errors.add("missing skill '" + skill + "' does not appear anywhere in this job's posting text.");
+                    continue;
+                }
+                if (sameSpecificRole) {
+                    String normalizedSkill = normalizeForTitleComparison(skill);
+                    if (!normalizedJobTitle.isBlank() && !normalizedSkill.isBlank()
+                            && (normalizedJobTitle.contains(normalizedSkill) || normalizedSkill.contains(normalizedJobTitle))) {
+                        errors.add("missing skill '" + skill + "' is this job's own title/profession, which is "
+                                + "self-contradictory given fieldRelationCloseness='" + parsed.fieldRelationCloseness()
+                                + "' - the candidate cannot be missing the very role they were just judged to already hold.");
+                    }
                 }
             }
 
@@ -1188,7 +1553,7 @@ public class JobMatchService {
     // ---- Fingerprinting (requirement: same unchanged CV + job always produces the same cached
     // score, and is only recomputed when either actually changes) ----
 
-    private String fingerprintCv(CVAnalysis analysis) {
+    String fingerprintCv(CVAnalysis analysis) {
         String cvTextHash = analysis.getCvTextHash();
 
         // Preferred: fingerprint the actual uploaded CV text. This stays stable across
@@ -1213,7 +1578,7 @@ public class JobMatchService {
     }
 
     // Content hash used for cache staleness (unchanged CV+job never recomputes).
-    private String fingerprintJob(Job job) {
+    String fingerprintJob(Job job) {
         return HashUtil.sha256(String.join("|",
                 nullToEmpty(job.getTitle()),
                 nullToEmpty(job.getType()),
@@ -1228,7 +1593,7 @@ public class JobMatchService {
     // company + normalized title + content hash, per the anti-batch-mixing requirement. Distinct
     // from fingerprintJob() above (which is content-only and used for cache staleness) because
     // this one also needs to catch a verdict attached to the right CONTENT but wrong jobId/title.
-    private String buildJobContentFingerprint(Job job, String jobContentHash) {
+    String buildJobContentFingerprint(Job job, String jobContentHash) {
         return HashUtil.sha256(String.join("|",
                 String.valueOf(job.getId()),
                 nullToEmpty(job.getTitle()),

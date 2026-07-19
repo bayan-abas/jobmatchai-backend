@@ -625,7 +625,7 @@ public class ExternalJobService {
             }
         }
 
-        jobMatchService.computeMatchScoresStreaming(email, transientJobs, language, jobEmbeddings,
+        jobMatchService.computeMatchScoresStreaming(email, transientJobs, language, jobEmbeddings, "external",
                 (offsetId, payload) -> {
                     Map<String, Object> remapped = new LinkedHashMap<>(payload);
                     remapped.put("jobId", offsetId - EXTERNAL_ID_OFFSET);

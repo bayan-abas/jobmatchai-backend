@@ -109,6 +109,15 @@
             <artifactId>spring-boot-starter-mail</artifactId>
         </dependency>
 
+        <!-- Real production metrics (queue depth, cache-hit rate, OpenAI call count/latency, DB
+             query latency) exposed at /actuator/metrics - no external monitoring service
+             required to start collecting these; Prometheus/Grafana can scrape
+             /actuator/prometheus later if desired, but the metrics exist either way. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
         <!-- In-memory token-bucket rate limiting for the auth endpoints (see
              com.jobmatchai.backend.security.ratelimit) - single-instance, non-clustered usage. -->
         <dependency>

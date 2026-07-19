@@ -93,6 +93,17 @@ public class JobMatchScore {
     @Column(name = "job_content_fingerprint")
     private String jobContentFingerprint;
 
+    // True when this job's own posting text was too thin (title-only, or a one-line description
+    // with no real requirements/skills) to support a reliable comparison at all - a deterministic,
+    // pre-AI gate (see JobMatchService#isInsufficientJobData), never an AI judgment call. Distinct
+    // from fieldRelated=null (JobMatchService's transient "AI call failed, please retry" sentinel,
+    // which is NEVER persisted): this is a real, stable, cacheable verdict about the JOB POSTING
+    // itself, not a failure - a candidate never gets asked to "retry" a job that will never have
+    // enough content to score, and matchPercent/skills/component fields are correctly left null
+    // rather than a fabricated-looking number computed from almost nothing.
+    @Column(name = "insufficient_data")
+    private Boolean insufficientData;
+
     public JobMatchScore() {}
 
     public Long getId() {
@@ -289,5 +300,13 @@ public class JobMatchScore {
 
     public void setJobContentFingerprint(String jobContentFingerprint) {
         this.jobContentFingerprint = jobContentFingerprint;
+    }
+
+    public Boolean getInsufficientData() {
+        return insufficientData;
+    }
+
+    public void setInsufficientData(Boolean insufficientData) {
+        this.insufficientData = insufficientData;
     }
 }
