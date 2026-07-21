@@ -26,7 +26,7 @@ public class JobicyJobProvider implements ExternalJobProvider {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    private final RestClient restClient = RestClient.builder()
+    private final RestClient restClient = ExternalJobRestClients.timeoutBuilder()
             .baseUrl("https://jobicy.com")
             .build();
 
@@ -79,7 +79,8 @@ public class JobicyJobProvider implements ExternalJobProvider {
                 applyUrl,
                 applyUrl,
                 "Jobicy",
-                resolveIndustry(result.path("jobIndustry"))
+                resolveIndustry(result.path("jobIndustry")),
+                ExternalDateParser.parse(textOrNull(result, "pubDate"))
         );
     }
 

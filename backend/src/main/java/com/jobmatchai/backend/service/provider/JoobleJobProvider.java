@@ -29,7 +29,7 @@ public class JoobleJobProvider implements ExternalJobProvider {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    private final RestClient restClient = RestClient.builder()
+    private final RestClient restClient = ExternalJobRestClients.timeoutBuilder()
             .baseUrl("https://jooble.org")
             .build();
 
@@ -123,7 +123,8 @@ public class JoobleJobProvider implements ExternalJobProvider {
                 joobleSourceLabel(result),
                 // Jooble's API doesn't surface a category/occupation field - the frontend
                 // classifier falls back to title-based inference for these.
-                null
+                null,
+                ExternalDateParser.parse(textOrNull(result, "updated"))
         );
     }
 

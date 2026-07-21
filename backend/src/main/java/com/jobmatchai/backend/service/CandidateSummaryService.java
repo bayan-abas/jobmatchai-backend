@@ -58,7 +58,12 @@ public class CandidateSummaryService {
             String weaknesses,
             String overallSuitability,
             Integer matchScore,
-            String matchLabel
+            String matchLabel,
+            // Fixed-vocabulary hiring-decision category ("accept"/"consider"/"reject"), derived
+            // from matchScore by MatchLabelUtil - the single authoritative source for this
+            // judgment (see MatchLabelUtil#recommendationFromScore). The frontend only maps this
+            // category to a localized label/description; it never decides the category itself.
+            String recommendation
     ) {}
 
     public SummaryResult getCandidateSummary(String candidateEmail, Job job, String language) {
@@ -67,7 +72,7 @@ public class CandidateSummaryService {
         if (analysis == null) {
             log.info("[AI-SUMMARY] candidate={} jobId={} -> no CVAnalysis on file, cannot generate a summary",
                     candidateEmail, job.getId());
-            return new SummaryResult(false, null, List.of(), null, null, null, null, null, null);
+            return new SummaryResult(false, null, List.of(), null, null, null, null, null, null, null);
         }
 
         String cvFingerprint = fingerprintCv(analysis);
@@ -103,14 +108,26 @@ public class CandidateSummaryService {
             String result = openAICVAnalysisService.computeCandidateSummary(analysis, job, language);
             JsonNode json = readObject(result);
 
+            // Self-consistency guard: keySkills and weaknesses are two independent fields the SAME
+            // AI call can disagree with itself on - nothing previously stopped a skill from being
+            // listed in keySkills (a positive claim) while a weaknesses sentence separately claims
+            // the candidate lacks that exact skill (a negative claim about the identical evidence).
+            // Rather than silently trusting whichever field a reader happens to look at first, drop
+            // the specific contradicting SENTENCE from weaknesses (never the keySkills entry itself
+            // - keySkills is the more specific, structured claim) - same "drop the unsupported
+            // claim rather than the validated data" precedent JobMatchService.validateDetailClaims
+            // already uses for whyGoodMatch/whyNotPerfectMatch vs. matchedSkills/missingSkills.
+            List<String> keySkillsList = extractStringList(json.path("keySkills"));
+            String weaknessesText = removeSentencesContradictingKeySkills(json.path("weaknesses").asText(""), keySkillsList);
+
             CandidateAiSummary summary = cached != null ? cached : new CandidateAiSummary();
             summary.setCandidateEmail(candidateEmail);
             summary.setJobId(job.getId());
             summary.setProfessionalBackground(json.path("professionalBackground").asText(""));
-            summary.setKeySkills(joinArray(json.path("keySkills")));
+            summary.setKeySkills(String.join("|", keySkillsList));
             summary.setYearsOfExperience(json.path("yearsOfExperience").asText(""));
             summary.setStrengths(json.path("strengths").asText(""));
-            summary.setWeaknesses(json.path("weaknesses").asText(""));
+            summary.setWeaknesses(weaknessesText);
             summary.setOverallSuitability(json.path("overallSuitability").asText(""));
 
             int matchScore = clampScore(json.path("matchScore").asInt(0));
@@ -138,7 +155,8 @@ public class CandidateSummaryService {
                 resolved.getWeaknesses(),
                 resolved.getOverallSuitability(),
                 resolved.getMatchScore(),
-                MatchLabelUtil.fromScore(resolved.getMatchScore())
+                MatchLabelUtil.fromScore(resolved.getMatchScore()),
+                MatchLabelUtil.recommendationFromScore(resolved.getMatchScore())
         );
     }
 
@@ -154,9 +172,9 @@ public class CandidateSummaryService {
         }
     }
 
-    private String joinArray(JsonNode arrayNode) {
+    private List<String> extractStringList(JsonNode arrayNode) {
         if (arrayNode == null || !arrayNode.isArray()) {
-            return "";
+            return List.of();
         }
 
         List<String> items = new ArrayList<>();
@@ -167,7 +185,75 @@ public class CandidateSummaryService {
             }
         }
 
-        return String.join("|", items);
+        return items;
+    }
+
+    // Mirrors JobMatchService.ABSENCE_PHRASES - phrases pairing a skill mention with claimed
+    // absence. Kept as its own small local copy rather than a shared constant: this method
+    // operates on whole SENTENCES (not the short, atomic bullets validateDetailClaims checks), so
+    // it deliberately requires the cue phrase and the skill name to co-occur within the same
+    // sentence - a much smaller, less ambiguous unit than a whole weaknesses paragraph, which
+    // keeps the false-positive rate low without needing to share validation logic across classes
+    // built around different-shaped input (bullet lists vs. free-text prose).
+    private static final List<String> ABSENCE_PHRASES = List.of(
+            "lack", "lacking", "missing", "don't have", "doesn't have", "not reflected",
+            "not evident", "no experience with", "need to develop", "gap in", "not shown", "absent"
+    );
+
+    // Words that, appearing shortly before an ABSENCE_PHRASES match, flip its meaning from a real
+    // gap claim into an explicit denial of one - e.g. "does not indicate any missing skills...
+    // all key requirements, including Java, Spring Boot, REST APIs, are well covered" CONFIRMS
+    // there is no gap, even though it contains "missing". Found via real end-to-end testing: a
+    // genuinely gap-free candidate's weaknesses text was having every one of its own keySkills
+    // wrongly stripped out as "contradicting" itself, because the bare substring check never
+    // accounted for the sentence explicitly negating its own absence phrase.
+    private static final List<String> NEGATION_WORDS = List.of("no ", "not ", "n't", "never ", "without ", "none ");
+
+    private boolean hasGenuineAbsenceClaim(String textLower) {
+        for (String phrase : ABSENCE_PHRASES) {
+            int idx = textLower.indexOf(phrase);
+            while (idx >= 0) {
+                String preceding = textLower.substring(Math.max(0, idx - 25), idx);
+                if (NEGATION_WORDS.stream().noneMatch(preceding::contains)) {
+                    return true;
+                }
+                idx = textLower.indexOf(phrase, idx + 1);
+            }
+        }
+        return false;
+    }
+
+    // Drops any sentence in `weaknesses` that both (a) names a skill already listed in keySkills
+    // and (b) uses an absence phrase - i.e. a sentence claiming the candidate lacks a skill the
+    // SAME AI response's keySkills field just said they have. An empty or short result is left as
+    // whatever remains (including empty) rather than backfilled with invented text - consistent
+    // with this codebase's "an honest empty list beats a fabricated one" rule (see
+    // JobMatchService.validateDetailClaims's docstring for the same principle applied to bullets).
+    private String removeSentencesContradictingKeySkills(String weaknesses, List<String> keySkills) {
+        if (weaknesses == null || weaknesses.isBlank() || keySkills.isEmpty()) {
+            return weaknesses == null ? "" : weaknesses;
+        }
+
+        String[] sentences = weaknesses.split("(?<=[.!?])\\s+");
+        List<String> kept = new ArrayList<>();
+
+        for (String sentence : sentences) {
+            if (sentence.isBlank()) {
+                continue;
+            }
+            String lower = sentence.toLowerCase();
+            boolean hasAbsencePhrase = hasGenuineAbsenceClaim(lower);
+            boolean namesKeySkill = hasAbsencePhrase && keySkills.stream()
+                    .anyMatch(skill -> skill.length() >= 3 && lower.contains(skill.toLowerCase()));
+
+            if (namesKeySkill) {
+                log.info("[AI-SUMMARY] dropped weaknesses sentence contradicting keySkills: \"{}\"", sentence.trim());
+                continue;
+            }
+            kept.add(sentence);
+        }
+
+        return String.join(" ", kept).trim();
     }
 
     private List<String> splitToList(String value) {

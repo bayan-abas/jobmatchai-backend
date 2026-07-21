@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jobmatchai.backend.model.ExternalJob;
 import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.repository.ExternalJobRepository;
+import com.jobmatchai.backend.repository.JobMatchScoreRepository;
+import com.jobmatchai.backend.repository.MatchScoreJobRepository;
 import com.jobmatchai.backend.service.provider.ExternalJobData;
 import com.jobmatchai.backend.service.provider.ExternalJobProvider;
 import com.jobmatchai.backend.util.HashUtil;
@@ -44,6 +46,12 @@ public class ExternalJobService {
     @Autowired
     private ExternalJobRepository externalJobRepository;
 
+    @Autowired
+    private JobMatchScoreRepository jobMatchScoreRepository;
+
+    @Autowired
+    private MatchScoreJobRepository matchScoreJobRepository;
+
     /**
      * Spring auto-collects every ExternalJobProvider bean here, so all active sources (Jooble,
      * JSearch, ...) are queried and merged on each import. Adding a new provider later just
@@ -80,12 +88,18 @@ public class ExternalJobService {
     @Value("${externaljobs.import.country:il}")
     private String defaultCountry;
 
-    // Real job postings expire. Without this, external_jobs only ever grows - every import
-    // cycle adds more rows on top of previously-imported (likely long-expired) postings, which
-    // both keeps showing the candidate stale/dead listings forever and makes every full
-    // CV-match recompute (see JobMatchService) slower over time since it has to score an
-    // ever-growing table instead of a realistically-sized current one.
-    @Value("${externaljobs.retention.days:21}")
+    // None of these providers expose an explicit "this posting is closed" flag - the only
+    // available signal that a listing is gone is that it stops reappearing in the scheduled
+    // re-imports (see importFromProviders' "reappearing confirms it's still live" comment below).
+    // This IS the closed-job/sync mechanism: retentionDays is how long a job is allowed to go
+    // without reappearing before it's treated as closed and pruned. Short enough (relative to the
+    // 6-hourly import cadence, ~4 cycles/day) that a genuinely closed posting disappears within a
+    // few days rather than lingering for weeks, but still several cycles wide so a job surviving
+    // pruning doesn't require reappearing in literally every single cycle - insulation against a
+    // provider's ranking briefly bumping a still-open job out of a keyword's top results, or one
+    // cycle's fetch having a transient hiccup (see MIN_FETCHED_TO_TRUST_PRUNING below for the
+    // broader-outage case).
+    @Value("${externaljobs.retention.days:3}")
     private int retentionDays;
 
     public record ImportResult(int imported, int skipped, int total) {}
@@ -324,6 +338,7 @@ public class ExternalJobService {
         job.setApplyUrl(data.applyUrl());
         job.setSourceUrl(data.sourceUrl());
         job.setSourceName(data.sourceName());
+        job.setPublishedAt(data.publishedAt());
     }
 
     // Only the fields that would actually change the candidate-facing content (and therefore
@@ -494,7 +509,8 @@ public class ExternalJobService {
         if (externalJob == null) {
             return new JobMatchService.MatchDetailResult(
                     false, externalJobId, null, null, List.of(), List.of(), List.of(), List.of(), List.of(), null, null,
-                    null, null, null, null, null, null, null, null, List.of(), List.of());
+                    null, null, null, null, null, null, null, null, List.of(), List.of(),
+                    null, null, null, null, null, null);
         }
 
         Job transientJob = new Job(
@@ -533,7 +549,13 @@ public class ExternalJobService {
                 result.certificationMatchPercent(),
                 result.locationMatchPercent(),
                 result.missingRequiredSkills(),
-                result.missingPreferredSkills()
+                result.missingPreferredSkills(),
+                result.requiredExperienceLevel(),
+                result.requiredExperienceType(),
+                result.candidateHasRequiredExperienceType(),
+                result.requiredEducationLevel(),
+                result.requiredCertificationLevel(),
+                result.lastAnalyzedAt()
         );
     }
 
@@ -693,7 +715,31 @@ public class ExternalJobService {
         }
 
         LocalDateTime cutoff = LocalDateTime.now().minusDays(retentionDays);
-        long deleted = externalJobRepository.deleteByImportedAtBefore(cutoff);
+        List<Long> idsToPrune = externalJobRepository.findIdByImportedAtBefore(cutoff);
+        if (idsToPrune.isEmpty()) {
+            return;
+        }
+
+        // Every persisted/queued match-score artifact for these jobs must go with them - a
+        // pruned job can never be recomputed for, so leaving these behind would just be permanent
+        // orphans. External jobs use the EXTERNAL_ID_OFFSET convention for JobMatchScore.jobId
+        // (see the class-level comment) but NOT for MatchScoreJob, which instead has its own
+        // jobType column - see MatchScoreJob's own comment for why the two differ.
+        List<Long> offsetIds = idsToPrune.stream().map(id -> EXTERNAL_ID_OFFSET + id).toList();
+        jobMatchScoreRepository.deleteByJobIdIn(offsetIds);
+        matchScoreJobRepository.deleteByJobIdInAndJobType(idsToPrune, "external");
+
+        // Not wrapped in one @Transactional spanning all three deletes: pruneExpiredJobs is a
+        // private method invoked via self-call from the @Scheduled scheduledImport() - Spring's
+        // proxy-based AOP can't intercept that invocation, so a @Transactional annotation here
+        // would silently do nothing rather than actually group these into one transaction. Each
+        // delete above is still individually atomic (Spring Data wraps every repository method in
+        // its own transaction), and this whole cycle is idempotent and re-run every 6 hours, so a
+        // crash in the exact window between these calls only ever means the next cycle finishes
+        // what this one started - never a stuck, unrecoverable state.
+        externalJobRepository.deleteAllByIdInBatch(idsToPrune);
+
+        int deleted = idsToPrune.size();
         if (deleted > 0) {
             log.info("Retention pruning removed {} external job(s) not re-imported since before {}.", deleted, cutoff);
         }

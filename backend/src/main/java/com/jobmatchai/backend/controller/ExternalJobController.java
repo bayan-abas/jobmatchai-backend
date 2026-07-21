@@ -247,6 +247,10 @@ public class ExternalJobController {
         response.put("locationMatchPercent", result.locationMatchPercent());
         response.put("missingRequiredSkills", result.missingRequiredSkills());
         response.put("missingPreferredSkills", result.missingPreferredSkills());
+        response.put("requiredExperienceLevel", result.requiredExperienceLevel());
+        response.put("requiredEducationLevel", result.requiredEducationLevel());
+        response.put("requiredCertificationLevel", result.requiredCertificationLevel());
+        response.put("lastAnalyzedAt", result.lastAnalyzedAt());
         return response;
     }
 }

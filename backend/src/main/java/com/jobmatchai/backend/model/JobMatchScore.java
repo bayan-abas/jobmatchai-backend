@@ -3,6 +3,8 @@ package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
 
+import java.time.LocalDateTime;
+
 @Entity
 @Table(name = "job_match_scores", uniqueConstraints = {
         @UniqueConstraint(columnNames = {"candidate_email", "job_id"})
@@ -103,6 +105,45 @@ public class JobMatchScore {
     // rather than a fabricated-looking number computed from almost nothing.
     @Column(name = "insufficient_data")
     private Boolean insufficientData;
+
+    // The AI-classified requirement level this job was scored against for each dimension (e.g.
+    // "mid", "relevant_degree", "specific_license") - set alongside the corresponding *MatchPercent
+    // in applyParsedMatchToScore, so the Match Details page can show WHAT was required, not just
+    // the resulting percentage. Null when that dimension wasn't applicable to this job (mirrors
+    // the corresponding *MatchPercent being null for the same reason).
+    @Column(name = "required_experience_level")
+    private String requiredExperienceLevel;
+
+    // Non-null only when this job named a distinct experience sub-domain/type beyond general
+    // seniority (e.g. "Clinical Research") - see JobMatchService.ParsedMatch's
+    // requiredExperienceType and MatchScoreCalculator#scoreExperience's amount-vs-type blending.
+    // candidateHasRequiredExperienceType is null exactly when this is null, otherwise true/false
+    // for whether the candidate's history showed real evidence of THAT specific type - lets the
+    // Match Details page (and the detail-narrative prompt) explain a low experience score as
+    // "right amount, wrong specialty" rather than "not enough experience."
+    @Column(name = "required_experience_type")
+    private String requiredExperienceType;
+
+    @Column(name = "candidate_has_required_experience_type")
+    private Boolean candidateHasRequiredExperienceType;
+
+    @Column(name = "required_education_level")
+    private String requiredEducationLevel;
+
+    @Column(name = "required_certification_level")
+    private String requiredCertificationLevel;
+
+    // When this row's core score was last (re)computed - the Match Details page's "Last
+    // Analyzed" timestamp. Auto-maintained by JPA lifecycle callbacks rather than set manually at
+    // every call site, so it can never drift out of sync with an actual row change.
+    @Column(name = "updated_at")
+    private LocalDateTime updatedAt;
+
+    @PrePersist
+    @PreUpdate
+    protected void onSave() {
+        updatedAt = LocalDateTime.now();
+    }
 
     public JobMatchScore() {}
 
@@ -284,6 +325,50 @@ public class JobMatchScore {
 
     public void setCertificationMatchPercent(Integer certificationMatchPercent) {
         this.certificationMatchPercent = certificationMatchPercent;
+    }
+
+    public String getRequiredExperienceLevel() {
+        return requiredExperienceLevel;
+    }
+
+    public void setRequiredExperienceLevel(String requiredExperienceLevel) {
+        this.requiredExperienceLevel = requiredExperienceLevel;
+    }
+
+    public String getRequiredExperienceType() {
+        return requiredExperienceType;
+    }
+
+    public void setRequiredExperienceType(String requiredExperienceType) {
+        this.requiredExperienceType = requiredExperienceType;
+    }
+
+    public Boolean getCandidateHasRequiredExperienceType() {
+        return candidateHasRequiredExperienceType;
+    }
+
+    public void setCandidateHasRequiredExperienceType(Boolean candidateHasRequiredExperienceType) {
+        this.candidateHasRequiredExperienceType = candidateHasRequiredExperienceType;
+    }
+
+    public String getRequiredEducationLevel() {
+        return requiredEducationLevel;
+    }
+
+    public void setRequiredEducationLevel(String requiredEducationLevel) {
+        this.requiredEducationLevel = requiredEducationLevel;
+    }
+
+    public String getRequiredCertificationLevel() {
+        return requiredCertificationLevel;
+    }
+
+    public void setRequiredCertificationLevel(String requiredCertificationLevel) {
+        this.requiredCertificationLevel = requiredCertificationLevel;
+    }
+
+    public LocalDateTime getUpdatedAt() {
+        return updatedAt;
     }
 
     public Integer getLocationMatchPercent() {

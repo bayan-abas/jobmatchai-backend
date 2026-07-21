@@ -153,6 +153,26 @@
                 <mainClass>com.jobmatchai.backend.BackendApplication</mainClass>
             </configuration>
         </plugin>
+        <!-- Resolves the mockito-core jar path into a property so Surefire can load it as a
+             javaagent below, per Mockito's own guidance for JDKs that disallow self-attaching. -->
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-dependency-plugin</artifactId>
+            <executions>
+                <execution>
+                    <goals>
+                        <goal>properties</goal>
+                    </goals>
+                </execution>
+            </executions>
+        </plugin>
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+                <argLine>-javaagent:${org.mockito:mockito-core:jar}</argLine>
+            </configuration>
+        </plugin>
     </plugins>
 </build>
 

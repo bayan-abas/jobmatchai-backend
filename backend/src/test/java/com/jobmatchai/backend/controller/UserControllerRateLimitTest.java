@@ -32,6 +32,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -103,7 +104,7 @@ class UserControllerRateLimitTest {
 
     @Test
     void loginUser_allowsFailedAttemptsUpToCapacity_thenLocksOutSameIpWith429() {
-        when(authService.login(anyString(), anyString()))
+        when(authService.login(anyString(), anyString(), anyBoolean()))
                 .thenThrow(new InvalidCredentialsException("Invalid email or password"));
         HttpServletRequest ip = requestFrom("198.51.100.11");
 
@@ -119,12 +120,12 @@ class UserControllerRateLimitTest {
         assertThat(blocked.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
         assertThat(blocked.getHeaders().getFirst("Retry-After")).isNotNull();
         assertThat(blocked.getBody().get("message")).isEqualTo("Too many requests. Please try again later.");
-        verify(authService, times((int) LOGIN_CAPACITY)).login(anyString(), anyString());
+        verify(authService, times((int) LOGIN_CAPACITY)).login(anyString(), anyString(), anyBoolean());
     }
 
     @Test
     void loginUser_locksOutSameEmailEvenAcrossDifferentIps() {
-        when(authService.login(anyString(), anyString()))
+        when(authService.login(anyString(), anyString(), anyBoolean()))
                 .thenThrow(new InvalidCredentialsException("Invalid email or password"));
 
         for (int i = 0; i < LOGIN_CAPACITY; i++) {
@@ -137,12 +138,12 @@ class UserControllerRateLimitTest {
                 loginData("victim@example.com", "wrongpassword"), requestFrom("203.0.113.99"));
 
         assertThat(blocked.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
-        verify(authService, times((int) LOGIN_CAPACITY)).login(anyString(), anyString());
+        verify(authService, times((int) LOGIN_CAPACITY)).login(anyString(), anyString(), anyBoolean());
     }
 
     @Test
     void loginUser_invalidCredentials_stillReturnsExistingBadRequestBehavior_whenWithinLimit() {
-        when(authService.login(anyString(), anyString()))
+        when(authService.login(anyString(), anyString(), anyBoolean()))
                 .thenThrow(new InvalidCredentialsException("Invalid email or password"));
 
         ResponseEntity<Map<String, Object>> response = userController.loginUser(
@@ -154,7 +155,7 @@ class UserControllerRateLimitTest {
 
     @Test
     void loginUser_successfulAttempts_neverLockOut() {
-        when(authService.login(anyString(), anyString()))
+        when(authService.login(anyString(), anyString(), anyBoolean()))
                 .thenReturn(new AuthService.LoginResult(new User(), "token"));
         HttpServletRequest ip = requestFrom("198.51.100.22");
 
@@ -180,7 +181,7 @@ class UserControllerRateLimitTest {
 
         AuthController authController = new AuthController();
         AuthService authServiceForAuthController = mock(AuthService.class);
-        when(authServiceForAuthController.login(anyString(), anyString()))
+        when(authServiceForAuthController.login(anyString(), anyString(), anyBoolean()))
                 .thenThrow(new InvalidCredentialsException("Invalid email or password"));
         ReflectionTestUtils.setField(authController, "authService", authServiceForAuthController);
         ReflectionTestUtils.setField(authController, "userRepository", mock(UserRepository.class));
@@ -207,7 +208,7 @@ class UserControllerRateLimitTest {
                 userController.loginUser(loginData("shared@example.com", "wrongpassword"), ip);
 
         assertThat(blocked.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
-        verify(authService, times(0)).login(anyString(), anyString());
+        verify(authService, times(0)).login(anyString(), anyString(), anyBoolean());
     }
 
     // ---- /api/users/register ----

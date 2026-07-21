@@ -232,13 +232,22 @@ CV Text:
 
             JsonNode json = objectMapper.readTree(result);
 
-            // Build a set of existing skills (lowercase) for fast lookup
+            // Build a set of existing skills (lowercase) for fast lookup - pulled from ALL three
+            // skill-bearing fields (skills, technicalSkills, softSkills), not just the combined
+            // "skills" field alone. Previously only "skills" was checked, so the AI could list a
+            // skill under technicalSkills/softSkills only and STILL have it show up as "missing"
+            // a few lines later - the same contradiction this whole filter exists to prevent, just
+            // for two fields it wasn't looking at.
             String rawSkills = json.path("skills").asText("");
+            String rawTechnicalSkills = json.path("technicalSkills").asText("");
+            String rawSoftSkills = json.path("softSkills").asText("");
             Set<String> skillsSet = new HashSet<>();
-            for (String s : rawSkills.split("[,;\\n]")) {
-                String trimmed = s.trim().toLowerCase();
-                if (!trimmed.isBlank()) {
-                    skillsSet.add(trimmed);
+            for (String field : new String[] { rawSkills, rawTechnicalSkills, rawSoftSkills }) {
+                for (String s : field.split("[,;\\n]")) {
+                    String trimmed = s.trim().toLowerCase();
+                    if (!trimmed.isBlank()) {
+                        skillsSet.add(trimmed);
+                    }
                 }
             }
 
@@ -498,11 +507,17 @@ STEP 2 - if fieldRelationCloseness is NOT "unrelated", classify this job's requi
 - For each skill/requirement the posting lists, decide if it reads as MANDATORY (required, must-have, essential) or PREFERRED (nice-to-have, a plus, preferred, bonus) - if the posting gives no such cue, treat it as MANDATORY by default.
 - matchedMandatorySkills / missingMandatorySkills: every MANDATORY skill, matched if the candidate's technical/soft skills or summary/strengths show that skill or a reasonable equivalent (abbreviations, translations, synonyms, or a broader skill that clearly implies it count as matched), missing otherwise.
 - matchedPreferredSkills / missingPreferredSkills: same classification for PREFERRED skills.
-- Use the EXACT wording from the job's skill/requirement text. Every skill must appear in exactly one of the four arrays. Empty arrays if the job lists no skills.
+- Use the EXACT wording from the job's skill/requirement text. Every skill must appear in exactly one of the six arrays below (the four above plus the two *Inferred arrays). Empty arrays if the job lists no skills.
 - SYNONYM RULE (mandatory): different phrasings can refer to the exact same real-world qualification - e.g. "doctor", "physician", "General Practitioner", "GP", and "M.D." are the SAME profession; "developer" and "software engineer" are the same discipline; "RN" and "Registered Nurse" are the same credential. Before listing ANY skill as missing, check whether it is simply a synonym, abbreviation, or alternate name for something the candidate's Profession title, Candidate field, previous job titles, or skills ALREADY show - if so it is matched, not missing. NEVER list the candidate's own documented profession (or an equivalent name for it) as a missing skill - if fieldRelationCloseness is "same_role" or "same_specialization", the candidate's own profession is definitionally already satisfied.
+- FUNDAMENTAL-SKILL INFERENCE RULE (matchedMandatorySkillsInferred / matchedPreferredSkillsInferred): a skill does not have to be literally written in the CV to be real. A candidate's documented profession, formal education, and described work experience imply certain foundational knowledge as a normal, expected consequence of that training or practice - credit that skill as matched even when the CV text never spells it out. Examples: a licensed physician/doctor (M.D.) can reasonably be assumed to know Pharmacology, Anatomy, and Diagnosis, even if the CV never uses those exact words. A software engineer with real coding experience can reasonably be assumed to understand Object-Oriented Programming, Debugging, and REST APIs as fundamentals of the trade, even if never spelled out verbatim. A licensed accountant can reasonably be assumed to understand double-entry bookkeeping. Put a skill matched this way - not found in the CV text, but a reasonable and direct consequence of the candidate's documented profession/education/experience - into matchedMandatorySkillsInferred or matchedPreferredSkillsInferred (never into the plain matchedMandatorySkills/matchedPreferredSkills arrays, which are reserved for skills the CV text itself shows).
+  Hard limits on this inference (do not skip these - a violation here is worse than leaving the skill as missing):
+  - ONLY infer a skill when this job is the candidate's own specific role or specialization (i.e. you would also classify fieldRelationCloseness as "same_role" or "same_specialization" for this job) - never infer anything for a job that is only "same_broad_field" or looser; a broad-field relation is not close enough for this kind of confident assumption.
+  - NEVER infer a specialized, regulated, or credentialed skill - this includes any named certification, license, or accreditation (e.g. "GMP"/"Good Manufacturing Practice", "Regulatory Affairs", "Sterilization Protocols", "HIPAA", "ISO 27001", "PCI DSS", "board certified", any "X License" or "Licensed X"), and any SPECIFIC named tool, technology, framework, programming language, product, or brand (e.g. "React", "Spring Boot", "Salesforce", "AWS", a specific lab instrument model). Only broad, foundational professional CONCEPTS and practices that are essentially universal to formal training or real practice in that exact profession may be inferred - never a specific product/brand/credential. If in doubt, do not infer it - leave it as missing instead.
+  - Infer at most 3 skills per job, combined across both *Inferred arrays, and only ones you are genuinely confident about - this is meant for the handful of truly foundational basics, not a way to paper over real gaps.
 
-STEP 3 - classify these three job requirements ONLY if the posting actually states or clearly implies them; otherwise leave the field null/absent (a null requirement is excluded from the final score entirely, not treated as "candidate fails it"):
+STEP 3 - classify these job requirements ONLY if the posting actually states or clearly implies them; otherwise leave the field null/absent (a null requirement is excluded from the final score entirely, not treated as "candidate fails it"):
 - requiredExperienceLevel: exactly one of "entry", "mid", "senior", or null if the posting states no seniority/years-of-experience expectation. Parse ANY stated years-of-experience figure, including a plain range - e.g. "0-2 years" or "no experience required" -> "entry"; "2-5 years" or "3+ years" -> "mid"; "5+ years", "7+ years", or "senior" -> "senior". A junior candidate applying to a senior posting in their own field should get "senior" here (which the backend will score appropriately low) - this must never influence fieldRelationCloseness. A candidate who EXCEEDS the posting's stated range is never a problem - do not let that influence this label either; the backend numerically credits meeting-or-exceeding the requirement as a full match, and having MORE experience than a stated range (with no stated maximum) is never treated as a gap anywhere in this system.
+- requiredExperienceType / candidateHasRequiredExperienceType: some postings ask for general years of experience in the candidate's field ("2+ years of experience"); OTHERS name a distinct SUB-DOMAIN or TYPE of experience beyond just seniority (e.g. "2+ years of Clinical Research experience", "prior people-management experience", "B2B sales experience", "experience running a trading desk"). requiredExperienceType captures ONLY the latter case: a short label (2-5 words, using the posting's own wording) naming that specific sub-domain/type, or null if the posting only asks for general years/seniority in the field with no distinct named type. When requiredExperienceType is non-null, set candidateHasRequiredExperienceType to true only if the candidate's job titles, descriptions, or summary/strengths show REAL evidence of having actually done that specific type of work - not merely being in the same broad profession. This distinction matters: a candidate can have deep, senior-level general experience in their field while genuinely lacking one named sub-domain the posting specifically asks for (e.g. a General Practitioner with 10 years treating patients has extensive medical experience, but that is not the same thing as documented Clinical Research experience if the CV never describes running or supporting clinical trials/studies) - candidateHasRequiredExperienceType must honestly reflect that gap as false rather than being marked true just because the candidate is senior or in the right general field. Leave both fields null/absent together when the posting has no distinct named type (just a general years-of-experience bar). NEVER double-classify the same requirement: if you set requiredExperienceType to a phrase (e.g. "Clinical Research"), that exact requirement must NOT also appear as an entry in missingMandatorySkills/missingPreferredSkills - it is either an experience-type gap (STEP 3) or a missing skill (STEP 2), never both, since counting the identical gap in two different score components unfairly double-penalizes the candidate for one deficiency.
 - requiredEducationLevel: exactly one of "any_degree" (posting wants a degree, field unspecified), "relevant_degree" (posting wants a degree IN this specific field), or null if no degree is required. Never set this for general/vocational roles (cashier, retail, warehouse, driver, cleaner, security guard, etc.).
 - requiredCertificationLevel: exactly one of "general_cert" (posting wants some relevant certification), "specific_license" (posting legally requires a named practice license, e.g. medical/nursing/bar/PE license), or null if neither is required. A missing certification/license here must lower ITS OWN score, not flip fieldRelationCloseness away from a shared broad field (e.g. doctor vs. nurse job above).
 
@@ -510,8 +525,10 @@ Return exactly this JSON structure:
 {
   "matches": [
     { "jobId": 0, "jobTitle": "", "jobFingerprint": "", "fieldRelationCloseness": "unrelated", "matchReason": "",
-      "matchedMandatorySkills": [], "missingMandatorySkills": [], "matchedPreferredSkills": [], "missingPreferredSkills": [],
-      "requiredExperienceLevel": null, "requiredEducationLevel": null, "requiredCertificationLevel": null }
+      "matchedMandatorySkills": [], "matchedMandatorySkillsInferred": [], "missingMandatorySkills": [],
+      "matchedPreferredSkills": [], "matchedPreferredSkillsInferred": [], "missingPreferredSkills": [],
+      "requiredExperienceLevel": null, "requiredExperienceType": null, "candidateHasRequiredExperienceType": null,
+      "requiredEducationLevel": null, "requiredCertificationLevel": null }
   ]
 }
 
@@ -519,8 +536,9 @@ Rules:
 - jobTitle: copy the EXACT "Title:" value given for that jobId above, unchanged.
 - jobFingerprint: copy the EXACT "Fingerprint:" value given for that jobId above, unchanged. Both jobTitle and jobFingerprint are cross-checks, not scoring inputs - they are what lets the caller catch a verdict that got attached to the wrong job internally, so get them exactly right, character for character.
 - fieldRelationCloseness: exactly one of "same_role", "same_specialization", "same_broad_field", "unrelated" - never any other value.
-- matchReason: ONE concise sentence (max ~25 words), SPECIFIC to this exact job and candidate (name the actual job title/profession involved - never reuse a generic stock phrase across different jobs), written directly to the candidate ("you").
+- matchReason: ONE concise sentence (max ~25 words), SPECIFIC to this exact job and candidate (name the actual job title/profession involved - never reuse a generic stock phrase across different jobs), written directly to the candidate ("you"). If candidateHasRequiredExperienceType is false, prefer using this sentence to name that specific gap (e.g. "you have strong general medical experience, but this role specifically needs Clinical Research experience") rather than a generic "lacks experience" statement.
 - requiredExperienceLevel/requiredEducationLevel/requiredCertificationLevel: use null (not a placeholder string) when the posting gives no signal for that requirement.
+- requiredExperienceType: null unless the posting names a genuinely distinct sub-domain/type of experience beyond general seniority; candidateHasRequiredExperienceType: null exactly when requiredExperienceType is null, otherwise true/false per the rule above.
 - Include exactly one entry per job listed above, using the exact jobId given.
 """;
 
@@ -560,7 +578,8 @@ Rules:
     // same job.
     public String computeJobMatchDetail(
             CVAnalysis analysis, Job job, String language,
-            int matchPercent, List<String> matchedSkills, List<String> missingSkills) {
+            int matchPercent, List<String> matchedSkills, List<String> missingSkills,
+            String requiredExperienceType, Boolean candidateHasRequiredExperienceType) {
         try {
             String languageInstruction = switch (language == null ? "en" : language) {
                 case "ar" -> "Write every text field (whyGoodMatch, whyNotPerfectMatch, improvementSuggestions, recommendation) entirely in Arabic.";
@@ -571,13 +590,30 @@ Rules:
             String matchedSkillsText = matchedSkills.isEmpty() ? "none" : String.join(", ", matchedSkills);
             String missingSkillsText = missingSkills.isEmpty() ? "none" : String.join(", ", missingSkills);
 
+            // Only present when this job named a specific experience sub-domain beyond general
+            // seniority (see computeJobMatches' requiredExperienceType) - gives this call the same
+            // amount-vs-type distinction the core score was already computed with, instead of it
+            // having to guess from matchPercent alone whether a low experience component means
+            // "not enough years" or "right amount, wrong specialty."
+            String experienceTypeBlock = (requiredExperienceType == null || requiredExperienceType.isBlank())
+                    ? ""
+                    : "\nThis role specifically requires experience in: " + requiredExperienceType + ". "
+                    + (Boolean.TRUE.equals(candidateHasRequiredExperienceType)
+                            ? "The candidate's history DOES show real evidence of this specific type of experience."
+                            : "The candidate's history does NOT show direct evidence of this specific type of experience - "
+                            + "if you mention this gap, describe it as lacking THIS SPECIFIC type/domain of experience, "
+                            + "never as lacking experience altogether, and acknowledge whatever general professional "
+                            + "experience the candidate profile above DOES show.")
+                    + "\n";
+
             // Built with plain concatenation (not a text block) since it interpolates
             // matchPercent mid-sentence in several places - a text block's closing/reopening
             // """ must be followed by a line break, so it can't sit mid-line like this.
             String givenScoreBlock =
                     "This candidate's overall match for this job has ALREADY been determined: " + matchPercent + "% match.\n"
                     + "Already-matched skills: " + matchedSkillsText + "\n"
-                    + "Already-identified missing skills: " + missingSkillsText + "\n\n"
+                    + "Already-identified missing skills: " + missingSkillsText + "\n"
+                    + experienceTypeBlock + "\n"
                     + "Your job is NOT to re-decide the overall fit or the matched/missing skill lists - those are fixed and given above. "
                     + "Build a detailed, honest, personalized breakdown and explanation that is fully CONSISTENT with this exact " + matchPercent + "% score. "
                     + "Do not write anything that implies a meaningfully higher or lower fit than " + matchPercent + "% - if the score is low, "
@@ -606,6 +642,7 @@ STRICT EVIDENCE RULES (mandatory - every bullet you write is checked against the
 - More experience/seniority than the posting asks for is NEVER a disadvantage, gap, or concern to raise - do not suggest the candidate is "overqualified," that their seniority "may be a concern," or that the posting "may prefer" someone with less experience, UNLESS the Requirements/Description text explicitly states a MAXIMUM years of experience or says the role is for junior/entry-level candidates ONLY.
 - Do not invent generic-sounding concerns (leadership experience, public health experience, specific certifications, language requirements, local/regional experience, etc.) unless the Requirements/Description text actually mentions that exact topic. A posting that says nothing about leadership has no leadership gap to mention.
 - Recognize synonyms and equivalent professional terms (e.g. "doctor" / "physician" / "General Practitioner" are the same profession) - never describe the candidate as lacking their own documented profession under a different name.
+- If this role requires a specific experience TYPE/sub-domain the candidate's history doesn't show (see below, when present), describe that gap precisely as missing THAT specific type of experience - never write that the candidate simply "lacks experience" or "lacks relevant experience" when the candidate profile shows real, general professional experience in their field; name both what they DO have and the specific type they're missing.
 - When you do not have enough grounded material for a full bullet, write FEWER bullets rather than pad with an ungrounded one - an empty or short list is honest; a fabricated bullet is not.
 
 Return exactly this JSON structure:
@@ -761,8 +798,8 @@ Field instructions:
 - keySkills: an array of 5-10 of the candidate's most relevant technical/professional skills, most relevant to this job first, using the exact wording from the candidate's skills where possible.
 - yearsOfExperience: a short estimate such as "0-1 years", "2-4 years", "5-7 years", "8+ years", or "Not clearly stated in the CV" if it cannot be reasonably estimated.
 - strengths: 2-4 sentences on the candidate's main strengths relevant to this specific job.
-- weaknesses: 2-4 sentences honestly describing potential weaknesses or missing skills relative to THIS job's requirements. If the candidate profile shows no missing skills for this job, note that clearly instead of inventing gaps.
-- overallSuitability: EXACTLY 3 to 5 sentences giving the hiring manager a clear, balanced verdict on this candidate's overall suitability for this specific job, referencing concrete evidence from the candidate profile and job requirements.
+- weaknesses: 2-4 sentences honestly describing potential weaknesses or missing skills relative to THIS job's requirements. If the candidate profile shows no missing skills for this job, note that clearly instead of inventing gaps. INTERNAL CONSISTENCY (mandatory): never name a skill as lacking/missing here if that same skill is listed in keySkills above - a skill is either a strength (in keySkills) or a gap (named here), never both at once for the same candidate and job.
+- overallSuitability: EXACTLY 3 to 5 sentences giving the hiring manager a clear, balanced verdict on this candidate's overall suitability for this specific job, referencing concrete evidence from the candidate profile and job requirements. Must read as consistent with matchScore below - a high matchScore should not be paired with a verdict that reads as lukewarm or skeptical, and a low matchScore should not be paired with an enthusiastic, unreserved endorsement.
 - matchScore: integer 0-100 measuring how well the candidate's ACTUAL profile matches THIS SPECIFIC job's requirements — this is a job-fit comparison, not a general CV quality score. Base it on ALL of the following, compared directly against the job's required skills, requirements, and description: (1) technical/professional skills overlap, (2) relevant work experience and its depth, (3) education/certifications relevant to the role, and (4) overall domain/field alignment.
   Scoring rules:
   - If the candidate's profile shows none (or almost none) of the job's core required skills/technologies/domain (e.g. the job requires Java, Spring Boot, SQL, and REST APIs for a backend role, and the candidate has no backend/programming experience at all), score MUST be low, in the 10-30 range.

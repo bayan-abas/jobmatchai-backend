@@ -26,7 +26,8 @@
                     "SPRING_DATASOURCE_URL": "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE",
                     "SPRING_DATASOURCE_USERNAME": "sa",
                     "SPRING_DATASOURCE_PASSWORD": "",
-                    "SPRING_JPA_HIBERNATE_DDL_AUTO": "update"
+                    "SPRING_JPA_HIBERNATE_DDL_AUTO": "update",
+                    "APP_ENVIRONMENT": "dev"
                 }
             },
             "problemMatcher": []
@@ -41,17 +42,6 @@
             },
             "problemMatcher": []
         },
-        {
-            "label": "Clean Backend",
-            "type": "shell",
-            "command": ".\\backend\\mvnw.cmd",
-            "args": ["-f", "backend\\pom.xml", "clean"],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        },
-
         {
             "label": "Clean Backend",
             "type": "shell",

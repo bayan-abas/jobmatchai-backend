@@ -20,14 +20,14 @@ public final class MatchScoreCalculator {
         FIELD_RELEVANCE, REQUIRED_SKILLS, EXPERIENCE, EDUCATION, CERTIFICATION, LOCATION
     }
 
-    // Weights per the product spec: field relevance 25%, required skills 25%, experience/
-    // seniority 20%, education 15%, certifications/licenses 10%, location/work arrangement 5%.
+    // Weights per the product spec: field relevance 30%, required skills 30%, experience/
+    // seniority 20%, education 10%, certifications/licenses 5%, location/work arrangement 5%.
     private static final Map<ComponentKey, Double> WEIGHTS = Map.of(
-            ComponentKey.FIELD_RELEVANCE, 0.25,
-            ComponentKey.REQUIRED_SKILLS, 0.25,
+            ComponentKey.FIELD_RELEVANCE, 0.30,
+            ComponentKey.REQUIRED_SKILLS, 0.30,
             ComponentKey.EXPERIENCE, 0.20,
-            ComponentKey.EDUCATION, 0.15,
-            ComponentKey.CERTIFICATION, 0.10,
+            ComponentKey.EDUCATION, 0.10,
+            ComponentKey.CERTIFICATION, 0.05,
             ComponentKey.LOCATION, 0.05
     );
 
@@ -157,6 +157,28 @@ public final class MatchScoreCalculator {
     // inflating a job that only shares a broad field, while still crediting genuinely related
     // (same_role/same_specialization) experience at full value.
     public static int scoreExperience(String candidateExperienceLevel, String requiredLevel, boolean sameSpecificRole) {
+        return scoreExperience(candidateExperienceLevel, requiredLevel, sameSpecificRole, false, false);
+    }
+
+    // requiresSpecificType/candidateHasSpecificType (see JobMatchService.ParsedMatch's
+    // requiredExperienceType/candidateHasRequiredExperienceType): some postings ask for general
+    // seniority in the field ("2+ years of experience"), while others name a distinct SUB-DOMAIN
+    // of experience beyond just years (e.g. "2+ years of Clinical Research experience"). Amount
+    // and type are different questions with different failure modes - a senior General
+    // Practitioner clears the AMOUNT bar for a "2+ years" Clinical Research posting trivially
+    // (candidateRank >= requiredRank), but that says nothing about whether they have ever actually
+    // done clinical research. Scoring purely on amount here would silently ignore a real,
+    // meaningful gap; scoring the type gap as a full miss (as if the posting's own rank-vs-rank
+    // amount check had failed) would misrepresent an experienced candidate as having little/no
+    // relevant professional experience at all - exactly the "you lack experience altogether"
+    // framing this method exists to avoid. Blending the amount score down (halved, not zeroed) is
+    // the middle ground: it stays visibly below a genuine full match, scales with how much amount
+    // credit the candidate already earned (a senior candidate blends to a higher score than a
+    // junior one facing the same type gap - both still have SOME relevant amount of experience),
+    // and never collapses to the same near-zero score true "no experience at all" would produce.
+    public static int scoreExperience(
+            String candidateExperienceLevel, String requiredLevel, boolean sameSpecificRole,
+            boolean requiresSpecificType, boolean candidateHasSpecificType) {
         int candidateRank = rank(candidateExperienceLevel, EXPERIENCE_LEVELS);
         if (!sameSpecificRole) {
             candidateRank = Math.max(0, candidateRank - 1);
@@ -170,10 +192,14 @@ public final class MatchScoreCalculator {
             requiredRank = 1;
         }
 
-        if (candidateRank >= requiredRank) {
-            return 100;
+        int amountScore = candidateRank >= requiredRank
+                ? 100
+                : clamp(100 - (requiredRank - candidateRank) * 40);
+
+        if (!requiresSpecificType || candidateHasSpecificType) {
+            return amountScore;
         }
-        return clamp(100 - (requiredRank - candidateRank) * 40);
+        return clamp((int) Math.round(amountScore * 0.5));
     }
 
     private static final List<String> EDUCATION_EVIDENCE_LEVELS = List.of("none", "general", "relevant_degree");

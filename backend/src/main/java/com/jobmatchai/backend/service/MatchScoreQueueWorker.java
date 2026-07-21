@@ -86,6 +86,9 @@ public class MatchScoreQueueWorker {
     @Value("${matching.queue.max-attempts:4}")
     private int maxAttempts;
 
+    @Value("${matching.queue.stale-in-progress-minutes:5}")
+    private int staleInProgressMinutes;
+
     private Semaphore aiConcurrencyLimiter;
     private Bucket rateLimitBucket;
     private ExecutorService dispatchExecutor;
@@ -194,15 +197,49 @@ public class MatchScoreQueueWorker {
             matchScoreJobRepository.delete(row);
             matchScoreQueueService.completeIfAwaited(row.getCandidateEmail(), row.getJobId(), row.getJobType(), score);
             matchMetrics.recordQueueJobProcessed("success", elapsedMs(start));
-        } catch (Exception e) {
+        } catch (Throwable t) {
+            // Throwable, not Exception: an OutOfMemoryError or StackOverflowError from a
+            // pathological job/CV payload must still land this row back in PENDING/FAILED via
+            // handleFailure - otherwise the row (and the request awaiting it) is stuck forever,
+            // since nothing else ever marks it terminal.
             log.error("Unexpected failure processing match-score queue row id={} candidate={} jobId={}",
-                    row.getId(), row.getCandidateEmail(), row.getJobId(), e);
+                    row.getId(), row.getCandidateEmail(), row.getJobId(), t);
             try {
-                handleFailure(row, e.getClass().getSimpleName() + ": " + e.getMessage());
+                handleFailure(row, t.getClass().getSimpleName() + ": " + t.getMessage());
             } catch (Exception saveFailure) {
                 log.error("Failed to even record the failure for queue row id={}", row.getId(), saveFailure);
             }
             matchMetrics.recordQueueJobProcessed("error", elapsedMs(start));
+        }
+    }
+
+    // Reclaims rows a worker claimed (IN_PROGRESS) but never finished - the app crashed,
+    // restarted, or was redeployed mid-processing. Without this, such a row stays IN_PROGRESS
+    // forever: enqueueIfNeeded (see MatchScoreQueueService) treats IN_PROGRESS as "already being
+    // worked" and never touches it again, permanently blocking that candidate+job from ever being
+    // recomputed. Routed through the normal handleFailure path so it gets the same retry/backoff
+    // and eventual FAILED-after-max-attempts treatment as any other failure, rather than being
+    // reset to PENDING unconditionally forever.
+    @Scheduled(fixedDelayString = "${matching.queue.reap-interval-ms:60000}")
+    public void reclaimStaleInProgress() {
+        LocalDateTime cutoff = LocalDateTime.now().minusMinutes(Math.max(1, staleInProgressMinutes));
+        List<MatchScoreJob> stale;
+        try {
+            stale = matchScoreJobRepository.findByStatusAndUpdatedAtBefore("IN_PROGRESS", cutoff);
+        } catch (Exception e) {
+            log.error("Failed to query stale IN_PROGRESS match-score queue rows", e);
+            return;
+        }
+
+        for (MatchScoreJob row : stale) {
+            log.warn("Reclaiming stale IN_PROGRESS match-score queue row id={} candidate={} jobId={} (stuck since {})",
+                    row.getId(), row.getCandidateEmail(), row.getJobId(), row.getUpdatedAt());
+            try {
+                handleFailure(row, "Reclaimed after being stuck IN_PROGRESS for over " + staleInProgressMinutes
+                        + "m - worker likely crashed or the app restarted mid-processing");
+            } catch (Exception e) {
+                log.error("Failed to reclaim stale queue row id={}", row.getId(), e);
+            }
         }
     }
 

@@ -8,7 +8,9 @@ import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CVAnalysisCacheRepository;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
+import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.repository.JobRepository;
+import com.jobmatchai.backend.repository.MatchScoreJobRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.CVTextExtractorService;
 import com.jobmatchai.backend.service.OpenAICVAnalysisService;
@@ -29,6 +31,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.interceptor.TransactionAspectSupport;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -68,6 +71,12 @@ public class CVController {
 
     @Autowired
     private JobRepository jobRepository;
+
+    @Autowired
+    private JobMatchScoreRepository jobMatchScoreRepository;
+
+    @Autowired
+    private MatchScoreJobRepository matchScoreJobRepository;
 
     // Bump this whenever the analyzeCV prompt changes materially (mirrors JobMatchService's
     // MATCH_SCHEMA_VERSION pattern) - keeps a prompt improvement from being silently masked by
@@ -299,10 +308,23 @@ public class CVController {
             cvAnalysisRepository.findByUserEmail(email)
                     .ifPresent(cvAnalysisRepository::delete);
 
+            // No CV left means every cached match score/pending computation for this candidate
+            // is now meaningless (getMatchScores/computeMatchScoresStreaming both refuse to show
+            // a score without a CVAnalysis on file anyway) - clearing them here, rather than
+            // leaving them as invisible orphans, is what actually frees the DB space and keeps a
+            // subsequent re-upload from having any stale state to collide with.
+            jobMatchScoreRepository.deleteByCandidateEmail(email);
+            matchScoreJobRepository.deleteByCandidateEmail(email);
+
             return ResponseEntity.ok("CV deleted successfully");
 
         } catch (Exception e) {
             log.error("Failed to delete CV", e);
+            // @Transactional only auto-rolls-back on an exception that propagates OUT of the
+            // method - this catch block returns a normal error response instead of rethrowing, so
+            // without this, a failure partway through (e.g. the match-score cleanup throwing)
+            // would still COMMIT whatever had already happened (e.g. the file delete/user update).
+            TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
             return ResponseEntity.internalServerError()
                     .body("Failed to delete CV. Please try again.");
         }
@@ -502,6 +524,9 @@ public class CVController {
         }
     }
 
+    // Transactional so saving the new analysis and discarding the now-stale match scores it
+    // invalidates either both commit or both roll back - see discardStaleMatchScores.
+    @Transactional
     @PostMapping({"/analyze", "/analyze/"})
     public ResponseEntity<?> analyzeCV(
             @RequestParam(value = "language", defaultValue = "en") String language,
@@ -585,6 +610,7 @@ public class CVController {
                 analysis.setCvTextHash(cvTextHash);
 
                 cvAnalysisRepository.save(analysis);
+                discardStaleMatchScores(email);
 
                 return ResponseEntity.ok(analysis);
             }
@@ -627,6 +653,7 @@ public class CVController {
             analysis.setCvTextHash(cvTextHash);
 
             cvAnalysisRepository.save(analysis);
+            discardStaleMatchScores(email);
 
             // Store in the durable cache too, so the next analysis of this exact CV content -
             // by this user after a delete/re-upload, or by anyone else who uploads
@@ -660,9 +687,27 @@ public class CVController {
 
         } catch (Exception e) {
             log.error("Failed to analyze CV for user={}", email, e);
+            // Same reasoning as deleteCV's catch block - this returns a normal error response
+            // rather than rethrowing, so @Transactional's automatic rollback never triggers on
+            // its own; without this, a failure after the analysis was already saved (e.g. in the
+            // CVAnalysisCache write) could commit a saved CVAnalysis while this response still
+            // reports failure.
+            TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
             return ResponseEntity.internalServerError()
                     .body("Failed to analyze CV. Please try again.");
         }
+    }
+
+    // Called once a candidate's CV content is CONFIRMED different from what was last analyzed
+    // (new upload, or the same account's CV replaced) and the new CVAnalysis is already safely
+    // saved - every JobMatchScore/MatchScoreJob row still on file at that point was computed
+    // against the OLD CV and is no longer valid. Deleting them outright (rather than leaving them
+    // for the existing cvFingerprint-mismatch check to quietly skip one job at a time) is what
+    // makes "upload a new CV -> every job gets re-analyzed against it" an explicit, immediate
+    // guarantee instead of something that only happens incidentally as each job is next viewed.
+    private void discardStaleMatchScores(String email) {
+        jobMatchScoreRepository.deleteByCandidateEmail(email);
+        matchScoreJobRepository.deleteByCandidateEmail(email);
     }
 
     @GetMapping("/analysis")

@@ -21,10 +21,12 @@ public class JwtService {
 
     private final SecretKey signingKey;
     private final long expirationMs;
+    private final long rememberMeExpirationMs;
 
     public JwtService(
             @Value("${app.jwt.secret}") String secret,
             @Value("${app.jwt.expiration-ms}") long expirationMs,
+            @Value("${app.jwt.remember-me-expiration-ms}") long rememberMeExpirationMs,
             @Value("${app.environment:dev}") String environment
     ) {
         // Fails startup outright rather than silently running with a publicly-known signing
@@ -39,11 +41,16 @@ public class JwtService {
 
         this.signingKey = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
         this.expirationMs = expirationMs;
+        this.rememberMeExpirationMs = rememberMeExpirationMs;
     }
 
     public String generateToken(String email, String role) {
+        return generateToken(email, role, false);
+    }
+
+    public String generateToken(String email, String role, boolean rememberMe) {
         Date now = new Date();
-        Date expiry = new Date(now.getTime() + expirationMs);
+        Date expiry = new Date(now.getTime() + (rememberMe ? rememberMeExpirationMs : expirationMs));
 
         return Jwts.builder()
                 .subject(email)

@@ -28,6 +28,10 @@ public class AuthService {
     private static final String INVALID_CREDENTIALS_MESSAGE = "Invalid email or password";
 
     public LoginResult login(String email, String password) {
+        return login(email, password, false);
+    }
+
+    public LoginResult login(String email, String password, boolean rememberMe) {
         User user = userRepository.findByEmail(email);
 
         if (user == null) {
@@ -38,7 +42,7 @@ public class AuthService {
             throw new InvalidCredentialsException(INVALID_CREDENTIALS_MESSAGE);
         }
 
-        String token = jwtService.generateToken(user.getEmail(), user.getRole());
+        String token = jwtService.generateToken(user.getEmail(), user.getRole(), rememberMe);
         user.setPassword(null);
         return new LoginResult(user, token);
     }

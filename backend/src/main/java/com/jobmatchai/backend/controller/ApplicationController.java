@@ -97,6 +97,11 @@ public class ApplicationController {
             String appliedDate,
             Integer matchPercent,
             String matchLabel,
+            // Fixed-vocabulary hiring-decision category ("accept"/"consider"/"reject"), derived
+            // from the same matchPercent by MatchLabelUtil - see CandidateSummaryService.
+            // SummaryResult's own comment on this field. The frontend must only map this to a
+            // localized label, never compute its own recommendation from matchPercent.
+            String recommendation,
             boolean viewedByCompany,
             Map<String, String> preInterviewAnswers,
             String contactMethod,
@@ -169,6 +174,7 @@ public class ApplicationController {
                             application.getAppliedDate(),
                             summary != null ? summary.getMatchScore() : null,
                             summary != null ? MatchLabelUtil.fromScore(summary.getMatchScore()) : null,
+                            summary != null ? MatchLabelUtil.recommendationFromScore(summary.getMatchScore()) : null,
                             application.isViewedByCompany(),
                             parsePreInterviewAnswers(application.getPreInterviewAnswersJson()),
                             application.getContactMethod(),
@@ -580,6 +586,7 @@ public class ApplicationController {
         response.put("overallSuitability", result.overallSuitability());
         response.put("matchScore", result.matchScore());
         response.put("matchLabel", result.matchLabel());
+        response.put("recommendation", result.recommendation());
 
         return ResponseEntity.ok(response);
     }

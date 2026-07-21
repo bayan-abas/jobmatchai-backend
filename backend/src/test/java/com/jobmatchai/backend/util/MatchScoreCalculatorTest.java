@@ -133,6 +133,50 @@ class MatchScoreCalculatorTest {
         assertThat(MatchScoreCalculator.scoreExperience("entry_level", "entry", false)).isEqualTo(60);
     }
 
+    // ---- amount-vs-type distinction: a posting can name a specific experience sub-domain (e.g.
+    // "Clinical Research") beyond just general seniority - see JobMatchService.ParsedMatch's
+    // requiredExperienceType/candidateHasRequiredExperienceType and this method's own comment ----
+
+    @Test
+    void experienceScore_seniorCandidateMissingSpecificType_isBlendedNotZeroedNorIgnored() {
+        // The exact scenario from the product request: a senior General Practitioner (10 years,
+        // senior_level, same_role) applying to a role that requires "2+ years" (mid) PLUS a named
+        // Clinical Research sub-domain the candidate's history doesn't show. Amount alone would
+        // score 100 (candidateRank senior >= required mid) - blending halves that to 50, which is
+        // neither "full credit, type gap ignored" (the old behavior) nor "as if they had no
+        // professional experience at all" (a bare mismatch would score near 0).
+        assertThat(MatchScoreCalculator.scoreExperience(
+                "senior_level", "mid", true, true, false)).isEqualTo(50);
+    }
+
+    @Test
+    void experienceScore_specificTypePresent_isFullCreditJustLikeAmountOnly() {
+        // candidateHasSpecificType=true means the candidate's history DOES evidence that exact
+        // sub-domain - scores identically to the plain amount-only case, no blending.
+        assertThat(MatchScoreCalculator.scoreExperience(
+                "senior_level", "mid", true, true, true)).isEqualTo(100);
+    }
+
+    @Test
+    void experienceScore_noSpecificTypeRequired_matchesThreeArgOverloadExactly() {
+        // requiresSpecificType=false must behave identically to the original 3-arg overload
+        // (which callers with no experience-type signal at all still use) - never a silent
+        // behavior change for postings that only ever asked for general seniority.
+        assertThat(MatchScoreCalculator.scoreExperience("mid_level", "senior", true, false, false))
+                .isEqualTo(MatchScoreCalculator.scoreExperience("mid_level", "senior", true));
+        assertThat(MatchScoreCalculator.scoreExperience("senior_level", "entry", true, false, true))
+                .isEqualTo(MatchScoreCalculator.scoreExperience("senior_level", "entry", true));
+    }
+
+    @Test
+    void experienceScore_typeGapCompoundsWithAnAmountShortfall() {
+        // entry_level (rank 1) vs required senior (rank 3): amount score is 20 (see
+        // experienceScore_shortfallCostsFixedPenaltyPerRank above); a missing specific type on top
+        // of an amount shortfall blends that already-low score down further, never up.
+        assertThat(MatchScoreCalculator.scoreExperience(
+                "entry_level", "senior", true, true, false)).isEqualTo(10);
+    }
+
     @Test
     void educationScore_relevantDegreeSatisfiesEitherRequirement() {
         assertThat(MatchScoreCalculator.scoreEducation("relevant_degree", "any_degree")).isEqualTo(100);

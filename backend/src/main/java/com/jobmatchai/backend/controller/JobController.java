@@ -6,7 +6,9 @@ import com.jobmatchai.backend.model.CandidateAiSummary;
 import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
+import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.repository.JobRepository;
+import com.jobmatchai.backend.repository.MatchScoreJobRepository;
 import com.jobmatchai.backend.service.JobMatchService;
 import com.jobmatchai.backend.util.MatchLabelUtil;
 
@@ -17,6 +19,8 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.interceptor.TransactionAspectSupport;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
@@ -41,6 +45,12 @@ public class JobController {
 
     @Autowired
     private CandidateAiSummaryRepository candidateAiSummaryRepository;
+
+    @Autowired
+    private JobMatchScoreRepository jobMatchScoreRepository;
+
+    @Autowired
+    private MatchScoreJobRepository matchScoreJobRepository;
 
     @Autowired
     private JobMatchService jobMatchService;
@@ -349,6 +359,11 @@ public class JobController {
         }
     }
 
+    // Transactional so the job row and its match-score/queue cleanup either all commit or all
+    // roll back - a failure partway through must never leave JobMatchScore/MatchScoreJob rows
+    // pointing at a jobId the Job table no longer has, which the worker could never resolve and
+    // would sit there as a permanent orphan.
+    @Transactional
     @DeleteMapping("/{id}")
     @PreAuthorize("hasRole('COMPANY')")
     public Map<String, Object> deleteJob(@PathVariable long id, Authentication authentication) {
@@ -363,23 +378,25 @@ public class JobController {
                 return response;
             }
 
-            return jobRepository.findById(id)
-                    .map(job -> {
-                        jobRepository.deleteById(id);
+            // Every persisted/queued match-score artifact for this job must go with it - a
+            // deleted job can never be recomputed for, so leaving these behind would just be
+            // permanent orphans (the worker's own jobId lookups would all resolve to nothing).
+            jobMatchScoreRepository.deleteByJobIdIn(List.of(id));
+            matchScoreJobRepository.deleteByJobIdInAndJobType(List.of(id), "internal");
+            jobRepository.deleteById(id);
 
-                        response.put("success", true);
-                        response.put("message", "Job deleted successfully");
-
-                        return response;
-                    })
-                    .orElseGet(() -> {
-                        response.put("success", false);
-                        response.put("message", "Job not found");
-                        return response;
-                    });
+            response.put("success", true);
+            response.put("message", "Job deleted successfully");
+            return response;
 
         } catch (Exception e) {
             log.error("Failed to delete job id={} for company={}", id, authentication.getName(), e);
+            // Without this, a failure partway through (e.g. the job-row delete itself throwing)
+            // would still COMMIT whatever match-score/queue rows were already deleted before it -
+            // @Transactional only auto-rolls-back on an exception that propagates OUT of the
+            // method, and this catch block deliberately doesn't rethrow (it returns a normal
+            // {success:false} response instead), so the rollback has to be requested explicitly.
+            TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
             response.put("success", false);
             response.put("message", "Failed to delete job. Please try again.");
             return response;
@@ -490,6 +507,10 @@ public class JobController {
             response.put("locationMatchPercent", result.locationMatchPercent());
             response.put("missingRequiredSkills", result.missingRequiredSkills());
             response.put("missingPreferredSkills", result.missingPreferredSkills());
+            response.put("requiredExperienceLevel", result.requiredExperienceLevel());
+            response.put("requiredEducationLevel", result.requiredEducationLevel());
+            response.put("requiredCertificationLevel", result.requiredCertificationLevel());
+            response.put("lastAnalyzedAt", result.lastAnalyzedAt());
 
             return ResponseEntity.ok(response);
 

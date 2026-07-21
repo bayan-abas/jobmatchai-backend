@@ -84,7 +84,12 @@ public class AuthController {
 
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
-    public record LoginRequest(String email, String password) {}
+    public record LoginRequest(String email, String password, boolean rememberMe) {
+        // Kept for existing callers/tests that predate the rememberMe field.
+        public LoginRequest(String email, String password) {
+            this(email, password, false);
+        }
+    }
 
     public record ForgotPasswordRequest(String email) {}
 
@@ -198,7 +203,7 @@ public class AuthController {
         }
 
         try {
-            AuthService.LoginResult result = authService.login(request.email(), request.password());
+            AuthService.LoginResult result = authService.login(request.email(), request.password(), request.rememberMe());
 
             if (rateLimitProperties.isEnabled()) {
                 loginLockoutService.recordSuccess(ipKey);

@@ -178,7 +178,8 @@ public class UserController {
         }
 
         try {
-            AuthService.LoginResult result = authService.login(loginData.get("email"), loginData.get("password"));
+            boolean rememberMe = Boolean.parseBoolean(loginData.get("rememberMe"));
+            AuthService.LoginResult result = authService.login(loginData.get("email"), loginData.get("password"), rememberMe);
 
             if (rateLimitProperties.isEnabled()) {
                 loginLockoutService.recordSuccess(ipKey);

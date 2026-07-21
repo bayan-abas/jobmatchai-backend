@@ -71,6 +71,12 @@ public class ExternalJob {
 
     private LocalDateTime importedAt;
 
+    // The provider's own posted/updated date for this listing (see ExternalDateParser) - null
+    // when the provider didn't supply one or it didn't parse. Distinct from importedAt (this
+    // app's own "when did WE last confirm it's still live" timestamp) - this is what the
+    // frontend shows as the job's publication date.
+    private LocalDateTime publishedAt;
+
     // Cached OpenAI embedding of this job's title+description, computed once at import time (see
     // ExternalJobService) - backs the deterministic, keyword-free pre-filter in JobMatchService
     // that decides whether a job is even worth an AI classification call, by cosine similarity
@@ -216,6 +222,14 @@ public class ExternalJob {
 
     public void setImportedAt(LocalDateTime importedAt) {
         this.importedAt = importedAt;
+    }
+
+    public LocalDateTime getPublishedAt() {
+        return publishedAt;
+    }
+
+    public void setPublishedAt(LocalDateTime publishedAt) {
+        this.publishedAt = publishedAt;
     }
 
     public String getContentEmbedding() {

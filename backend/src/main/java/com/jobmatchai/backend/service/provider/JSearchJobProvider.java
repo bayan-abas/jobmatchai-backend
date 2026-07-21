@@ -34,7 +34,7 @@ public class JSearchJobProvider implements ExternalJobProvider {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    private final RestClient restClient = RestClient.builder()
+    private final RestClient restClient = ExternalJobRestClients.timeoutBuilder()
             .baseUrl("https://jsearch.p.rapidapi.com")
             .build();
 
@@ -117,7 +117,8 @@ public class JSearchJobProvider implements ExternalJobProvider {
                 textOrNull(result, "job_apply_link"),
                 textOrNull(result, "job_apply_link"),
                 joinPublishers(result),
-                resolveIndustry(result)
+                resolveIndustry(result),
+                ExternalDateParser.parse(textOrNull(result, "job_posted_at_datetime_utc"))
         );
     }
 

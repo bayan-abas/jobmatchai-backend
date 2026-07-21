@@ -30,7 +30,11 @@ public interface ExternalJobRepository extends JpaRepository<ExternalJob, Long> 
     // visible.
     List<ExternalJob> findAllByOrderByImportedAtDesc();
 
-    long deleteByImportedAtBefore(LocalDateTime cutoff);
+    // Split into a find-then-delete pair (see ExternalJobService#pruneExpiredJobs) rather than a
+    // single bulk deleteByImportedAtBefore, so the caller knows exactly which ids are about to be
+    // pruned and can cascade-delete their JobMatchScore/MatchScoreJob rows first - otherwise those
+    // would be left pointing at an external job id that no longer exists.
+    List<Long> findIdByImportedAtBefore(LocalDateTime cutoff);
 
     // Backs the startup embedding backfill in ExternalJobService - rows imported before the
     // embedding pre-filter existed (or any row whose embedding call failed at import time) have
