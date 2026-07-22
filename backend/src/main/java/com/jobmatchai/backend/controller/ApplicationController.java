@@ -442,8 +442,16 @@ public class ApplicationController {
                                     "other".equals(request.contactMethod()) ? request.contactMethodOther().trim() : null);
                             String message = request.contactMessage();
                             application.setContactMessage(message != null && !message.isBlank() ? message.trim() : null);
+                            // A candidate must never see a stale rejection reason once the
+                            // decision has moved to Accepted - unreachable today (Rejected is
+                            // itself a final status the guard above never lets this method touch
+                            // again), but this keeps the row honest if that guard ever loosens.
+                            application.setRejectionReason(null);
                         } else if (rejecting) {
                             application.setRejectionReason(request.rejectionReason().trim());
+                        } else {
+                            // Shortlisted / Under Review - same stale-reason guard as above.
+                            application.setRejectionReason(null);
                         }
 
                         // A company decision implies the application has been reviewed, even if
@@ -457,12 +465,20 @@ public class ApplicationController {
 
                         if (saved.getCandidateEmail() != null && !saved.getCandidateEmail().isBlank()) {
                             String jobTitle = saved.getJobTitle() != null ? saved.getJobTitle() : "the position";
+                            // " at Acme Corp" when available, otherwise omitted entirely rather than
+                            // leaving a dangling "at" - companyName isn't guaranteed to be set on
+                            // every historical Application row (it's copied from the Job at apply
+                            // time, see applyToJob).
+                            String companySuffix = saved.getCompanyName() != null && !saved.getCompanyName().isBlank()
+                                    ? " at " + saved.getCompanyName()
+                                    : "";
 
                             if (accepting) {
                                 String contactLabel = buildContactMethodLabel(
                                         saved.getContactMethod(), saved.getContactMethodOther());
                                 StringBuilder text = new StringBuilder(
-                                        "Your application for " + jobTitle + " has been accepted! The company will contact you via "
+                                        "Your application for " + jobTitle + companySuffix
+                                                + " has been accepted! The company will contact you via "
                                                 + contactLabel + ".");
                                 if (saved.getContactMessage() != null && !saved.getContactMessage().isBlank()) {
                                     text.append(" ").append(saved.getContactMessage());
@@ -473,8 +489,8 @@ public class ApplicationController {
                             } else if (rejecting) {
                                 // The reason is appended verbatim - the company's exact wording,
                                 // never rewritten or replaced with a generic message.
-                                String text = "Your application for " + jobTitle + " has been rejected. Reason: "
-                                        + saved.getRejectionReason();
+                                String text = "Your application for " + jobTitle + companySuffix
+                                        + " has been rejected. Reason: " + saved.getRejectionReason();
 
                                 notificationService.createNotification(
                                         saved.getCandidateEmail(), "Application Rejected", text, "APPLICATION_REJECTED");
