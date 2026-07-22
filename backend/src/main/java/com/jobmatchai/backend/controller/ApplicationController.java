@@ -7,12 +7,15 @@ import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.model.CandidateAiSummary;
 import com.jobmatchai.backend.model.CVAnalysis;
+import com.jobmatchai.backend.model.JobMatchScore;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
+import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.CandidateSummaryService;
+import com.jobmatchai.backend.service.JobMatchService;
 import com.jobmatchai.backend.service.NotificationService;
 import com.jobmatchai.backend.util.MatchLabelUtil;
 import org.slf4j.Logger;
@@ -67,6 +70,12 @@ public class ApplicationController {
     private CandidateAiSummaryRepository candidateAiSummaryRepository;
 
     @Autowired
+    private JobMatchScoreRepository jobMatchScoreRepository;
+
+    @Autowired
+    private JobMatchService jobMatchService;
+
+    @Autowired
     private NotificationService notificationService;
 
     @Autowired
@@ -95,13 +104,29 @@ public class ApplicationController {
             String candidateEmail,
             String status,
             String appliedDate,
+            // Sourced from JobMatchScore (see resolveCachedMatchScores below) - the same
+            // deterministic, backend-weighted score the candidate's own "Job Matches" page shows
+            // for this pair, so a recruiter and a candidate never see two different numbers for
+            // the same match.
             Integer matchPercent,
             String matchLabel,
-            // Fixed-vocabulary hiring-decision category ("accept"/"consider"/"reject"), derived
-            // from the same matchPercent by MatchLabelUtil - see CandidateSummaryService.
-            // SummaryResult's own comment on this field. The frontend must only map this to a
-            // localized label, never compute its own recommendation from matchPercent.
+            // Fixed-vocabulary hiring-decision category ("accept"/"consider"/"reject"). NOT
+            // derived from matchPercent above - it stays sourced from CandidateAiSummary's own
+            // internal matchScore (see resolveCachedSummaries/MatchLabelUtil.recommendationFromScore),
+            // which still exists purely to drive this field and the AI Summary's narrative -
+            // it is deliberately never exposed as a displayed percentage anymore. The frontend
+            // must only map this to a localized label, never compute its own recommendation.
             String recommendation,
+            // Whether a CandidateAiSummary row already exists for this candidate+job - i.e.
+            // whether POST /{id}/ai-summary is guaranteed to be a cache hit right now rather than
+            // a fresh (billed) OpenAI call. Before matchPercent moved to JobMatchScore, the
+            // frontend used "matchPercent !== null" as a proxy for this, which happened to be
+            // safe only because matchPercent WAS CandidateAiSummary's own score at the time. That
+            // proxy silently broke the moment the source changed - JobMatchScore is typically
+            // populated well before any CandidateAiSummary is ever generated - so this field
+            // exists specifically to give the frontend an honest, source-independent signal to
+            // gate on instead.
+            boolean hasAiSummary,
             boolean viewedByCompany,
             Map<String, String> preInterviewAnswers,
             String contactMethod,
@@ -122,11 +147,12 @@ public class ApplicationController {
         }
     }
 
-    // CandidateAiSummary (the "AI Summary" feature) is the single source of truth for the
-    // score/label shown on candidate cards. It must never be mixed with JobMatchScore (the
-    // separate candidate-facing "Job Matches" feature, a different OpenAI prompt entirely) -
-    // doing so previously caused the card to show one AI evaluation while "AI Summary"
-    // showed another, and the value would jump the moment a summary was generated.
+    // CandidateAiSummary now backs ONLY `recommendation` (via MatchLabelUtil.recommendationFromScore
+    // below) and the AI Summary narrative (getCandidateAiSummary) - its matchScore is never
+    // returned as a displayed percentage anymore (see resolveCachedMatchScores for that). Kept
+    // as its own lookup specifically so `recommendation` keeps working exactly as it did before -
+    // this task's constraint was to swap the DISPLAYED percentage's source, not to touch how the
+    // AI's own recommendation judgment is derived.
     //
     // Keyed by "candidateEmail::jobId" so a batch of summaries fetched with one query
     // (findByCandidateEmailInAndJobIdIn) can be looked up the same way per-item queries
@@ -152,6 +178,27 @@ public class ApplicationController {
         return latestByKey;
     }
 
+    // JobMatchScore is now the single source of truth for the displayed match percentage/label
+    // on every company-facing applicant card (see ApplicantView's own comment) - the exact same
+    // number JobMatchService computes for the candidate's own "Job Matches" page. A plain cache
+    // read, same as resolveCachedSummaries above (no on-demand computation in a list endpoint) -
+    // see JobController#getApplicationsForJob for why a still-missing row here just means "not
+    // scored yet" rather than an error.
+    private Map<String, JobMatchScore> resolveCachedMatchScores(List<Application> applications) {
+        if (applications.isEmpty()) {
+            return Map.of();
+        }
+
+        List<String> candidateEmails = applications.stream().map(Application::getCandidateEmail).distinct().toList();
+        List<Long> jobIds = applications.stream().map(Application::getJobId).distinct().toList();
+
+        Map<String, JobMatchScore> byKey = new HashMap<>();
+        for (JobMatchScore score : jobMatchScoreRepository.findByCandidateEmailInAndJobIdIn(candidateEmails, jobIds)) {
+            byKey.put(score.getCandidateEmail() + "::" + score.getJobId(), score);
+        }
+        return byKey;
+    }
+
     @GetMapping("/company")
     @PreAuthorize("hasRole('COMPANY')")
     public List<ApplicantView> getApplicationsByCompany(Authentication authentication) {
@@ -159,10 +206,14 @@ public class ApplicationController {
 
         List<Application> applications = applicationRepository.findByCompanyEmail(companyEmail);
         Map<String, CandidateAiSummary> summariesByKey = resolveCachedSummaries(applications);
+        Map<String, JobMatchScore> matchScoresByKey = resolveCachedMatchScores(applications);
 
         return applications.stream()
                 .map(application -> {
-                    CandidateAiSummary summary = summariesByKey.get(application.getCandidateEmail() + "::" + application.getJobId());
+                    String key = application.getCandidateEmail() + "::" + application.getJobId();
+                    CandidateAiSummary summary = summariesByKey.get(key);
+                    JobMatchScore matchScore = matchScoresByKey.get(key);
+                    Integer matchPercent = matchScore != null ? matchScore.getMatchPercent() : null;
 
                     return new ApplicantView(
                             application.getId(),
@@ -172,9 +223,10 @@ public class ApplicationController {
                             application.getCandidateEmail(),
                             application.getStatus(),
                             application.getAppliedDate(),
-                            summary != null ? summary.getMatchScore() : null,
-                            summary != null ? MatchLabelUtil.fromScore(summary.getMatchScore()) : null,
+                            matchPercent,
+                            matchPercent != null ? MatchLabelUtil.fromScore(matchPercent) : null,
                             summary != null ? MatchLabelUtil.recommendationFromScore(summary.getMatchScore()) : null,
+                            summary != null,
                             application.isViewedByCompany(),
                             parsePreInterviewAnswers(application.getPreInterviewAnswersJson()),
                             application.getContactMethod(),
@@ -576,6 +628,22 @@ public class ApplicationController {
             return ResponseEntity.ok(response);
         }
 
+        // The displayed percentage is always JobMatchService's deterministic score - the same
+        // number the candidate's own "Job Matches" page shows for this pair - computed on demand
+        // if it doesn't exist yet. This endpoint already does real AI work on a cache miss for
+        // the summary narrative itself, so doing the same here for the match score is consistent
+        // with what this endpoint already does, not a new class of side effect. result.matchScore()
+        // (CandidateAiSummary's own AI-invented number) stays purely internal from here on - it
+        // already drove result.recommendation() inside CandidateSummaryService and still does,
+        // but is no longer returned to the client as "the" match percentage.
+        JobMatchService.MatchScoresResult matchScoresResult =
+                jobMatchService.getMatchScores(application.getCandidateEmail(), List.of(job), language);
+        Integer matchPercent = null;
+        if (!matchScoresResult.matches().isEmpty()) {
+            Object rawPercent = matchScoresResult.matches().get(0).get("matchPercent");
+            matchPercent = rawPercent instanceof Integer percent ? percent : null;
+        }
+
         Map<String, Object> response = new HashMap<>();
         response.put("hasAnalysis", true);
         response.put("professionalBackground", result.professionalBackground());
@@ -584,8 +652,8 @@ public class ApplicationController {
         response.put("strengths", result.strengths());
         response.put("weaknesses", result.weaknesses());
         response.put("overallSuitability", result.overallSuitability());
-        response.put("matchScore", result.matchScore());
-        response.put("matchLabel", result.matchLabel());
+        response.put("matchScore", matchPercent);
+        response.put("matchLabel", matchPercent != null ? MatchLabelUtil.fromScore(matchPercent) : null);
         response.put("recommendation", result.recommendation());
 
         return ResponseEntity.ok(response);

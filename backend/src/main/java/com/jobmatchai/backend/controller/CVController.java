@@ -14,6 +14,7 @@ import com.jobmatchai.backend.repository.MatchScoreJobRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.CVTextExtractorService;
 import com.jobmatchai.backend.service.OpenAICVAnalysisService;
+import com.jobmatchai.backend.service.storage.FileStorageService;
 import com.jobmatchai.backend.util.CvFileValidator;
 import com.jobmatchai.backend.util.HashUtil;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -24,7 +25,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
-import org.springframework.core.io.UrlResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -39,8 +39,6 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -78,6 +76,9 @@ public class CVController {
     @Autowired
     private MatchScoreJobRepository matchScoreJobRepository;
 
+    @Autowired
+    private FileStorageService fileStorageService;
+
     // Bump this whenever the analyzeCV prompt changes materially (mirrors JobMatchService's
     // MATCH_SCHEMA_VERSION pattern) - keeps a prompt improvement from being silently masked by
     // stale cached results for CV content that was already analyzed under the old prompt.
@@ -86,9 +87,6 @@ public class CVController {
     // languages, previousJobTitles) the job matcher now relies on instead of free-text prose -
     // any CV analyzed under v2 has all of those as null/blank, so it must be recomputed.
     private static final String ANALYSIS_PROMPT_VERSION = "v3-structured-evidence";
-
-    @Value("${app.upload.dir:uploads/cvs/}")
-    private String uploadDir;
 
     @Value("${app.cv.upload.max-size-bytes:10485760}")
     private long maxCvUploadSizeBytes;
@@ -185,16 +183,6 @@ public class CVController {
                         "תוכן הקובץ שהועלה אינו תואם למסמך PDF או DOCX תקין."));
             }
 
-            // Path.resolve (unlike the legacy File(parent, child) constructor) correctly
-            // returns uploadDir as-is when it's already absolute - which it is by default
-            // now that it points outside the project directory - instead of risking it
-            // getting silently mis-joined with the CWD.
-            File folder = Paths.get(System.getProperty("user.dir")).resolve(uploadDir).normalize().toFile();
-
-            if (!folder.exists()) {
-                folder.mkdirs();
-            }
-
             // Fully server-generated - none of the uploaded filename's content ends up in the
             // storage key, so there's nothing in it left to sanitize or exploit (unusual
             // encodings, excessive length, path-traversal tricks). The original name the user
@@ -202,54 +190,60 @@ public class CVController {
             // exactly as before.
             String fileName = UUID.randomUUID() + "." + extension;
 
-            File destination = new File(folder, fileName);
-            file.transferTo(destination);
-
-            String extractedText;
+            // Written to a LOCAL temp file first, regardless of app.storage.type - extraction
+            // (below) needs a real java.io.File either way, and validating against a temp file
+            // before ever calling fileStorageService.store() means a rejected upload never
+            // touches the configured storage backend at all (local disk or S3), not even
+            // momentarily. The temp file is always cleaned up in the finally block, whether the
+            // upload is accepted or rejected.
+            File tempFile = File.createTempFile("cv-upload-", "." + extension);
             try {
-                extractedText = cvTextExtractorService.extractText(destination);
-            } catch (Exception extractException) {
-                // A file Tika can't parse (corrupt, or a renamed non-document binary) would
-                // otherwise be written to disk and left there forever, unassociated with any
-                // user - clean it up the same as the "no readable text" case below.
-                destination.delete();
-                return badRequest(pickByLanguage(language,
-                        "The uploaded file does not contain readable CV text.",
-                        "الملف الذي تم رفعه لا يحتوي على نص سيرة ذاتية قابل للقراءة.",
-                        "הקובץ שהועלה אינו מכיל טקסט קורות חיים קריא."));
+                file.transferTo(tempFile);
+
+                String extractedText;
+                try {
+                    extractedText = cvTextExtractorService.extractText(tempFile);
+                } catch (Exception extractException) {
+                    return badRequest(pickByLanguage(language,
+                            "The uploaded file does not contain readable CV text.",
+                            "الملف الذي تم رفعه لا يحتوي على نص سيرة ذاتية قابل للقراءة.",
+                            "הקובץ שהועלה אינו מכיל טקסט קורות חיים קריא."));
+                }
+
+                if (extractedText == null || extractedText.isBlank()) {
+                    return badRequest(pickByLanguage(language,
+                            "The uploaded file does not contain readable CV text.",
+                            "الملف الذي تم رفعه لا يحتوي على نص سيرة ذاتية قابل للقراءة.",
+                            "הקובץ שהועלה אינו מכיל טקסט קורות חיים קריא."));
+                }
+
+                String validationResult = openAICVAnalysisService.validateCV(extractedText, language);
+                JsonNode validationJson = objectMapper.readTree(validationResult);
+
+                boolean isCV = validationJson.path("isCV").asBoolean(false);
+                int confidence = validationJson.path("confidence").asInt(0);
+                String reason = validationJson.path("reason").asText(pickByLanguage(language,
+                        "The uploaded file is not a valid CV.",
+                        "الملف الذي تم رفعه ليس سيرة ذاتية صالحة.",
+                        "הקובץ שהועלה אינו קורות חיים תקינים."));
+
+                if (!isCV || confidence < 75) {
+                    return badRequest(pickByLanguage(language,
+                            "Invalid CV file: ",
+                            "ملف السيرة الذاتية غير صالح: ",
+                            "קובץ קורות החיים אינו תקין: ") + reason);
+                }
+
+                fileStorageService.store(tempFile, fileName);
+            } finally {
+                tempFile.delete();
             }
 
-            if (extractedText == null || extractedText.isBlank()) {
-                destination.delete();
-                return badRequest(pickByLanguage(language,
-                        "The uploaded file does not contain readable CV text.",
-                        "الملف الذي تم رفعه لا يحتوي على نص سيرة ذاتية قابل للقراءة.",
-                        "הקובץ שהועלה אינו מכיל טקסט קורות חיים קריא."));
-            }
-
-            String validationResult = openAICVAnalysisService.validateCV(extractedText, language);
-            JsonNode validationJson = objectMapper.readTree(validationResult);
-
-            boolean isCV = validationJson.path("isCV").asBoolean(false);
-            int confidence = validationJson.path("confidence").asInt(0);
-            String reason = validationJson.path("reason").asText(pickByLanguage(language,
-                    "The uploaded file is not a valid CV.",
-                    "الملف الذي تم رفعه ليس سيرة ذاتية صالحة.",
-                    "הקובץ שהועלה אינו קורות חיים תקינים."));
-
-            if (!isCV || confidence < 75) {
-                destination.delete();
-                return badRequest(pickByLanguage(language,
-                        "Invalid CV file: ",
-                        "ملف السيرة الذاتية غير صالح: ",
-                        "קובץ קורות החיים אינו תקין: ") + reason);
-            }
-
-            // Drop the previous CV file now that the new one is validated and about to
-            // replace it - otherwise every re-upload leaves the old file on disk forever.
+            // Drop the previous CV file now that the new one is validated and stored - otherwise
+            // every re-upload leaves the old one behind forever.
             String previousFileName = user.getCvFileName();
             if (previousFileName != null && !previousFileName.isBlank() && !previousFileName.equals(fileName)) {
-                new File(folder, previousFileName).delete();
+                fileStorageService.delete(previousFileName);
             }
 
             user.setCvFileName(fileName);
@@ -283,22 +277,7 @@ public class CVController {
             String fileName = user.getCvFileName();
 
             if (fileName != null && !fileName.isBlank()) {
-                Path uploadPath = Paths.get(System.getProperty("user.dir"))
-                        .resolve(uploadDir)
-                        .normalize()
-                        .toAbsolutePath();
-
-                Path filePath = uploadPath.resolve(fileName)
-                        .normalize()
-                        .toAbsolutePath();
-
-                if (filePath.startsWith(uploadPath)) {
-                    File cvFile = filePath.toFile();
-
-                    if (cvFile.exists()) {
-                        cvFile.delete();
-                    }
-                }
+                fileStorageService.delete(fileName);
             }
 
             user.setCvFileName(null);
@@ -434,32 +413,18 @@ public class CVController {
     // verify the caller is entitled to fileName before calling this; it only resolves the
     // path safely and picks the right content type/display name.
     private ResponseEntity<?> serveCvFile(String fileName, String originalFileName) throws Exception {
-        Path uploadPath = Paths.get(System.getProperty("user.dir"))
-                .resolve(uploadDir)
-                .normalize()
-                .toAbsolutePath();
-
-        Path filePath = uploadPath.resolve(fileName).normalize().toAbsolutePath();
-
-        if (!filePath.startsWith(uploadPath)) {
-            return ResponseEntity.badRequest().body("Invalid file name");
-        }
-
-        Resource resource = new UrlResource(filePath.toUri());
-
-        if (!resource.exists()) {
+        if (!fileStorageService.exists(fileName)) {
             return ResponseEntity.notFound().build();
         }
 
-        String resourceFilename = resource.getFilename();
-        String lowerFileName = resourceFilename == null ? "" : resourceFilename.toLowerCase();
+        Resource resource = fileStorageService.loadAsResource(fileName);
+        String lowerFileName = fileName.toLowerCase();
 
-        // Prefer the name actually uploaded over the sanitized/timestamp-prefixed storage
-        // name, so the browser's save dialog and inline viewer both show the real file name
-        // instead of a generic one.
+        // Prefer the name actually uploaded over the generated storage key, so the browser's
+        // save dialog and inline viewer both show the real file name instead of a generic one.
         String displayFilename = originalFileName != null && !originalFileName.isBlank()
                 ? originalFileName
-                : resourceFilename;
+                : fileName;
 
         MediaType mediaType = MediaType.APPLICATION_OCTET_STREAM;
 
@@ -497,17 +462,11 @@ public class CVController {
                 return ResponseEntity.badRequest().body("No CV uploaded for user");
             }
 
-            File cvFile = Paths.get(System.getProperty("user.dir"))
-                    .resolve(uploadDir)
-                    .resolve(fileName)
-                    .normalize()
-                    .toFile();
-
-            if (!cvFile.exists()) {
+            if (!fileStorageService.exists(fileName)) {
                 return ResponseEntity.notFound().build();
             }
 
-            String text = cvTextExtractorService.extractText(cvFile);
+            String text = fileStorageService.withLocalFile(fileName, cvTextExtractorService::extractText);
 
             if (text == null || text.isBlank()) {
                 return ResponseEntity.badRequest().body("Could not extract text from this CV");
@@ -547,17 +506,11 @@ public class CVController {
                 return ResponseEntity.badRequest().body("No CV uploaded for user");
             }
 
-            File cvFile = Paths.get(System.getProperty("user.dir"))
-                    .resolve(uploadDir)
-                    .resolve(fileName)
-                    .normalize()
-                    .toFile();
-
-            if (!cvFile.exists()) {
+            if (!fileStorageService.exists(fileName)) {
                 return ResponseEntity.notFound().build();
             }
 
-            String text = cvTextExtractorService.extractText(cvFile);
+            String text = fileStorageService.withLocalFile(fileName, cvTextExtractorService::extractText);
 
             if (text == null || text.isBlank()) {
                 return ResponseEntity.badRequest().body("Could not extract text from this CV");

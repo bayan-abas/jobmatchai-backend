@@ -17,14 +17,11 @@ import com.jobmatchai.backend.repository.RecentlyViewedJobRepository;
 import com.jobmatchai.backend.repository.SavedJobRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.security.TokenRevocationService;
+import com.jobmatchai.backend.service.storage.FileStorageService;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.io.File;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.Instant;
 import java.util.List;
 
@@ -76,8 +73,8 @@ public class UserDeletionService {
     @Autowired
     private TokenRevocationService tokenRevocationService;
 
-    @Value("${app.upload.dir:uploads/cvs/}")
-    private String uploadDir;
+    @Autowired
+    private FileStorageService fileStorageService;
 
     @Transactional
     public void deleteUserAccount(String email) {
@@ -134,21 +131,6 @@ public class UserDeletionService {
             return;
         }
 
-        Path uploadPath = Paths.get(System.getProperty("user.dir"))
-                .resolve(uploadDir)
-                .normalize()
-                .toAbsolutePath();
-
-        Path filePath = uploadPath.resolve(fileName)
-                .normalize()
-                .toAbsolutePath();
-
-        if (filePath.startsWith(uploadPath)) {
-            File cvFile = filePath.toFile();
-
-            if (cvFile.exists()) {
-                cvFile.delete();
-            }
-        }
+        fileStorageService.delete(fileName);
     }
 }

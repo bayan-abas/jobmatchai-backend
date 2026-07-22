@@ -14,6 +14,7 @@ import com.jobmatchai.backend.repository.UserRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,26 +41,53 @@ public class AIChatContextService {
     @Autowired
     private JobMatchScoreRepository jobMatchScoreRepository;
 
-    public record ChatContext(String mode, String contextBlock) {}
+    public record ChatContext(String mode, String contextBlock, List<CanonicalFact> facts) {}
+
+    // The same canonical per-(job, candidate) match facts the contextBlock text is built FROM,
+    // kept as typed data alongside the stringified prompt so ChatConsistencyValidator can check an
+    // AI-generated reply against the exact numbers/skill lists it was given, instead of the
+    // validator having to re-parse contextBlock's free-text formatting (which is prompt-tuning
+    // surface, not a stable data contract) or re-query the database itself. candidateName is null
+    // in candidate mode - the chat's "you" is unambiguous there - and non-null in company mode,
+    // where several candidates can be discussed for the same job in one reply.
+    public record CanonicalFact(
+            Long jobId,
+            String jobTitle,
+            String candidateEmail,
+            String candidateName,
+            Integer matchPercent,
+            Boolean fieldRelated,
+            List<String> matchedSkills,
+            List<String> missingSkills,
+            Integer experienceMatchPercent,
+            Integer educationMatchPercent,
+            Integer certificationMatchPercent,
+            Integer fieldRelevancePercent,
+            String matchReason
+    ) {}
+
+    private record ModeContext(String contextBlock, List<CanonicalFact> facts) {}
 
     public ChatContext buildContext(String email, String language) {
         if (email == null || email.isBlank()) {
-            return new ChatContext("anonymous", "");
+            return new ChatContext("anonymous", "", List.of());
         }
 
         User user = userRepository.findByEmail(email.trim());
         if (user == null) {
-            return new ChatContext("anonymous", "");
+            return new ChatContext("anonymous", "", List.of());
         }
 
         if ("company".equalsIgnoreCase(user.getRole())) {
-            return new ChatContext("company", buildCompanyContext(email.trim(), language));
+            ModeContext company = buildCompanyContext(email.trim(), language);
+            return new ChatContext("company", company.contextBlock(), company.facts());
         }
 
-        return new ChatContext("candidate", buildCandidateContext(email.trim(), language));
+        ModeContext candidate = buildCandidateContext(email.trim(), language);
+        return new ChatContext("candidate", candidate.contextBlock(), candidate.facts());
     }
 
-    private String buildCandidateContext(String email, String language) {
+    private ModeContext buildCandidateContext(String email, String language) {
         CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(email).orElse(null);
         List<Application> applications = applicationRepository.findByCandidateEmail(email);
 
@@ -105,12 +133,13 @@ public class AIChatContextService {
                     "אין עדיין ניתוח קורות חיים — אחוזי ההתאמה אינם זמינים עד שהמועמד ינתח את קורות החיים שלו.\n"));
         }
 
-        sb.append(buildJobsWithMatchBlock(cappedJobs, matchByJobId));
+        List<CanonicalFact> facts = new ArrayList<>();
+        sb.append(buildJobsWithMatchBlock(cappedJobs, matchByJobId, email, facts));
 
-        return sb.toString();
+        return new ModeContext(sb.toString(), facts);
     }
 
-    private String buildCompanyContext(String email, String language) {
+    private ModeContext buildCompanyContext(String email, String language) {
         List<Job> companyJobs = jobRepository.findByCompanyEmail(email);
         if (companyJobs.size() > 20) {
             companyJobs = companyJobs.subList(0, 20);
@@ -127,7 +156,7 @@ public class AIChatContextService {
                     "This company currently has no job postings.\n",
                     "لا توجد وظائف معلنة حاليًا لهذه الشركة.\n",
                     "לחברה זו אין כרגע משרות פתוחות.\n"));
-            return sb.toString();
+            return new ModeContext(sb.toString(), List.of());
         }
 
         List<Long> jobIds = companyJobs.stream().map(job -> job.getId()).toList();
@@ -156,6 +185,8 @@ public class AIChatContextService {
                 matchScoreByKey.put(score.getCandidateEmail() + "::" + score.getJobId(), score);
             }
         }
+
+        List<CanonicalFact> facts = new ArrayList<>();
 
         for (Job job : companyJobs) {
             sb.append("---\n")
@@ -202,9 +233,22 @@ public class AIChatContextService {
 
                         if (matchScore != null && matchScore.getMatchPercent() != null) {
                             sb.append("    Match percent for this job: ").append(matchScore.getMatchPercent()).append("\n")
+                                    .append("    Field-related: ").append(nullToNA(matchScore.getFieldRelated())).append("\n")
                                     .append("    Match reason: ").append(nullToNA(matchScore.getMatchReason())).append("\n")
                                     .append("    Matched skills for this job: ").append(nullToNA(matchScore.getMatchedSkills())).append("\n")
-                                    .append("    Missing skills for this job: ").append(nullToNA(matchScore.getMissingSkills())).append("\n");
+                                    .append("    Missing skills for this job: ").append(nullToNA(matchScore.getMissingSkills())).append("\n")
+                                    .append("    Experience match: ").append(nullToNA(matchScore.getExperienceMatchPercent())).append("\n")
+                                    .append("    Education match: ").append(nullToNA(matchScore.getEducationMatchPercent())).append("\n")
+                                    .append("    Certification match: ").append(nullToNA(matchScore.getCertificationMatchPercent())).append("\n")
+                                    .append("    Field relevance: ").append(nullToNA(matchScore.getFieldRelevancePercent())).append("\n");
+
+                            facts.add(new CanonicalFact(
+                                    job.getId(), job.getTitle(), app.getCandidateEmail(), app.getCandidateName(),
+                                    matchScore.getMatchPercent(), matchScore.getFieldRelated(),
+                                    splitSkillsString(matchScore.getMatchedSkills()), splitSkillsString(matchScore.getMissingSkills()),
+                                    matchScore.getExperienceMatchPercent(), matchScore.getEducationMatchPercent(),
+                                    matchScore.getCertificationMatchPercent(), matchScore.getFieldRelevancePercent(),
+                                    matchScore.getMatchReason()));
                         } else {
                             sb.append("    Match percent for this job: not yet computed\n");
                         }
@@ -215,7 +259,14 @@ public class AIChatContextService {
             sb.append("\n");
         }
 
-        return sb.toString();
+        return new ModeContext(sb.toString(), facts);
+    }
+
+    private List<String> splitSkillsString(String value) {
+        if (value == null || value.isBlank()) {
+            return List.of();
+        }
+        return List.of(value.split("\\|"));
     }
 
     private String buildCandidateProfileBlock(CVAnalysis analysis) {
@@ -266,7 +317,12 @@ CV quality notes: %s
         return sb.toString();
     }
 
-    private String buildJobsWithMatchBlock(List<Job> jobs, Map<Long, Map<String, Object>> matchByJobId) {
+    // email/facts: email identifies the (single, implicit) candidate these matches belong to -
+    // every fact this appends is for THAT candidate, one per job - and facts is the typed,
+    // structured twin of the text this method also writes into sb (see CanonicalFact's own
+    // comment for why both exist).
+    private String buildJobsWithMatchBlock(
+            List<Job> jobs, Map<Long, Map<String, Object>> matchByJobId, String email, List<CanonicalFact> facts) {
         if (jobs == null || jobs.isEmpty()) {
             return "No jobs currently available in the system.\n";
         }
@@ -290,16 +346,45 @@ CV quality notes: %s
                     .append("Description: ").append(nullToNA(description)).append("\n");
 
             Map<String, Object> match = matchByJobId.get(job.getId());
-            if (match != null) {
+            if (match != null && match.get("matchPercent") != null) {
                 sb.append("Match percent for this candidate: ").append(match.get("matchPercent")).append("\n")
+                        .append("Field-related: ").append(match.get("fieldRelated")).append("\n")
                         .append("Match reason: ").append(match.get("matchReason")).append("\n")
                         .append("Matched skills: ").append(joinList(match.get("matchedSkills"))).append("\n")
-                        .append("Missing skills: ").append(joinList(match.get("missingSkills"))).append("\n");
+                        .append("Missing skills: ").append(joinList(match.get("missingSkills"))).append("\n")
+                        .append("Experience match: ").append(match.get("experienceMatchPercent")).append("\n")
+                        .append("Education match: ").append(match.get("educationMatchPercent")).append("\n")
+                        .append("Certification match: ").append(match.get("certificationMatchPercent")).append("\n")
+                        .append("Field relevance: ").append(match.get("fieldRelevancePercent")).append("\n");
+
+                facts.add(new CanonicalFact(
+                        job.getId(), job.getTitle(), email, null,
+                        asInteger(match.get("matchPercent")), asBoolean(match.get("fieldRelated")),
+                        asStringList(match.get("matchedSkills")), asStringList(match.get("missingSkills")),
+                        asInteger(match.get("experienceMatchPercent")), asInteger(match.get("educationMatchPercent")),
+                        asInteger(match.get("certificationMatchPercent")), asInteger(match.get("fieldRelevancePercent")),
+                        asString(match.get("matchReason"))));
             } else {
                 sb.append("Match percent for this candidate: not yet computed\n");
             }
         }
         return sb.toString();
+    }
+
+    private Integer asInteger(Object value) {
+        return value instanceof Number number ? number.intValue() : null;
+    }
+
+    private Boolean asBoolean(Object value) {
+        return value instanceof Boolean bool ? bool : null;
+    }
+
+    private String asString(Object value) {
+        return value == null ? null : String.valueOf(value);
+    }
+
+    private List<String> asStringList(Object value) {
+        return value instanceof List<?> list ? list.stream().map(String::valueOf).toList() : List.of();
     }
 
     private String joinList(Object value) {

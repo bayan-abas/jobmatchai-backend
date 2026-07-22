@@ -510,7 +510,7 @@ public class ExternalJobService {
             return new JobMatchService.MatchDetailResult(
                     false, externalJobId, null, null, List.of(), List.of(), List.of(), List.of(), List.of(), null, null,
                     null, null, null, null, null, null, null, null, List.of(), List.of(),
-                    null, null, null, null, null, null);
+                    null, null, null, null, null, null, List.of(), List.of());
         }
 
         Job transientJob = new Job(
@@ -555,7 +555,9 @@ public class ExternalJobService {
                 result.candidateHasRequiredExperienceType(),
                 result.requiredEducationLevel(),
                 result.requiredCertificationLevel(),
-                result.lastAnalyzedAt()
+                result.lastAnalyzedAt(),
+                result.matchedRequiredSkills(),
+                result.matchedPreferredSkills()
         );
     }
 

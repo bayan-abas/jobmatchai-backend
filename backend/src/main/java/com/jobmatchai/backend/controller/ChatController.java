@@ -53,7 +53,8 @@ public class ChatController {
 
         AIChatContextService.ChatContext context = aiChatContextService.buildContext(email, language);
 
-        String reply = aiChatService.chat(message, language, context.contextBlock(), context.mode(), historyForService);
+        String reply = aiChatService.chat(
+                message, language, context.contextBlock(), context.mode(), historyForService, context.facts());
 
         if (reply == null || reply.isBlank()) {
             return ResponseEntity.internalServerError().body("No reply from AI.");

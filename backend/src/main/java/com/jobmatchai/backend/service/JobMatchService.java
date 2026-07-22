@@ -9,6 +9,8 @@ import com.jobmatchai.backend.model.JobMatchScore;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
 import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.util.HashUtil;
+import com.jobmatchai.backend.util.SkillClaimMatcher;
+import com.jobmatchai.backend.util.VocationalRoleClassifier;
 import com.jobmatchai.backend.util.MatchScoreCalculator;
 import com.jobmatchai.backend.util.MatchScoreCalculator.Component;
 import com.jobmatchai.backend.util.MatchScoreCalculator.ComponentKey;
@@ -42,6 +44,19 @@ import java.util.stream.Collectors;
 public class JobMatchService {
 
     private static final Logger log = LoggerFactory.getLogger(JobMatchService.class);
+
+    // Bump whenever validateDetailClaims' filtering logic (or computeJobMatchDetail's prompt)
+    // changes in a way that affects which bullets survive. getMatchDetail compares this against
+    // each row's stored detailPromptVersion (see detailStale below) so every existing cached
+    // whyGoodMatch/whyNotPerfectMatch narrative - including ones generated before a given filter
+    // existed at all - gets regenerated through the CURRENT rules the next time its job is opened,
+    // instead of being served forever from whatever guard (or lack of one) happened to be in place
+    // when it was first written. Without this, fixing a filtering bug here only changes behavior
+    // for brand-new rows; every already-cached explanation stays wrong until its unrelated core
+    // score happens to change for some other reason (see applyParsedMatchToScore nulling
+    // recommendation) - which is exactly how a bullet a *current* filter would catch can still be
+    // shown for a job whose core score hasn't moved since it was generated under an older filter.
+    private static final int DETAIL_PROMPT_VERSION = 2;
 
     @Autowired
     private CVAnalysisRepository cvAnalysisRepository;
@@ -225,53 +240,17 @@ public class JobMatchService {
     private static final String MATCH_SCHEMA_VERSION = "v21-fundamental-skill-inference-and-experience-type";
 
     // General/entry-level/vocational roles - ones that don't require specialized prior training,
-    // a degree, or domain-specific tools to perform. Two separate backend overrides key off this
-    // same list: (1) never score the education component for these (below), and (2) never let
-    // fieldRelationCloseness come back "unrelated" for these (see applyParsedMatchToScore) -
-    // almost any reliable adult can work as a cashier or cleaner regardless of their specialized
-    // background, so a software engineer or a doctor applying to one of these must still get a
-    // real percentage, not "-". Verified live: without override (2), a doctor/software engineer/
-    // cleaning supervisor CV against "Office Cleaner"/"Customer Service Representative" postings
-    // came back fieldRelated=false, contradicting this exact design intent - the prompt alone
-    // didn't reliably carry the exception, so it's enforced here instead of trusted to the model.
-    //
-    // Deliberately specific phrases rather than single ambiguous words (see v14 above) - a bare
-    // "delivery", "driver", "warehouse", or "stock" is a substring of plenty of skilled/senior
-    // titles ("Director, Delivery", "Device Driver Engineer", "Warehouse Operations Manager",
-    // "Senior Stock Analyst") that have nothing to do with an entry-level vocational role.
-    private static final List<String> GENERAL_VOCATIONAL_ROLE_KEYWORDS = List.of(
-            "cashier", "sales assistant", "sales associate", "cleaner", "cleaning",
-            "warehouse associate", "warehouse worker", "delivery driver", "delivery associate",
-            "food delivery", "waiter", "waitress", "barista",
-            "security guard", "courier", "stock associate", "stock clerk", "retail assistant",
-            "housekeeping", "kitchen porter", "dishwasher", "receptionist",
-            "customer service representative"
-    );
-
-    // A leadership/strategic-scope title is never "anyone can do this regardless of background" -
-    // it overrides a keyword match above (see isGeneralVocationalRole), catching cases the
-    // narrower phrases in that list alone wouldn't (e.g. "Customer Service Manager" still
-    // contains "customer service representative"? no - but a future keyword addition might
-    // reintroduce this exact false-positive shape, so this guard is a general-purpose backstop,
-    // not just a fix for the one "Director, Delivery" case that surfaced it).
-    private static final List<String> SENIORITY_EXCLUSION_KEYWORDS = List.of(
-            "director", "manager", "head of", " vp ", "vp,", "vice president", "chief",
-            "principal", "executive", "president"
-    );
-
-    private static boolean isGeneralVocationalRole(String jobTitle) {
-        if (jobTitle == null) {
-            return false;
-        }
-
-        String lowerTitle = " " + jobTitle.toLowerCase(Locale.ROOT) + " ";
-
-        if (SENIORITY_EXCLUSION_KEYWORDS.stream().anyMatch(lowerTitle::contains)) {
-            return false;
-        }
-
-        return GENERAL_VOCATIONAL_ROLE_KEYWORDS.stream().anyMatch(lowerTitle::contains);
-    }
+    // a degree, or domain-specific tools to perform (see VocationalRoleClassifier for the actual
+    // keyword list, shared with the job-listing payload's category field). Two separate backend
+    // overrides key off this classification: (1) never score the education component for these
+    // (below), and (2) never let fieldRelationCloseness come back "unrelated" for these (see
+    // applyParsedMatchToScore) - almost any reliable adult can work as a cashier or cleaner
+    // regardless of their specialized background, so a software engineer or a doctor applying to
+    // one of these must still get a real percentage, not "-". Verified live: without override (2),
+    // a doctor/software engineer/cleaning supervisor CV against "Office Cleaner"/"Customer Service
+    // Representative" postings came back fieldRelated=false, contradicting this exact design
+    // intent - the prompt alone didn't reliably carry the exception, so it's enforced here instead
+    // of trusted to the model.
 
     // The deterministic, keyword-free pre-filter gate (see EmbeddingService): decides whether a
     // job is even worth an AI classification call, using ONLY cosine similarity between two
@@ -285,7 +264,7 @@ public class JobMatchService {
         if (!prefilterEnabled || profileVector == null || jobVector == null) {
             return false;
         }
-        if (isGeneralVocationalRole(job.getTitle())) {
+        if (VocationalRoleClassifier.isGeneralVocationalRole(job.getTitle())) {
             return false;
         }
         return EmbeddingService.cosineSimilarity(profileVector, jobVector) < prefilterThreshold;
@@ -430,6 +409,8 @@ public class JobMatchService {
         score.setMatchPercent(null);
         score.setMatchedSkills("");
         score.setMissingSkills("");
+        score.setMatchedRequiredSkills("");
+        score.setMatchedPreferredSkills("");
         score.setMissingRequiredSkills("");
         score.setMissingPreferredSkills("");
         score.setFieldRelevancePercent(null);
@@ -466,7 +447,7 @@ public class JobMatchService {
     // compatible with any candidate's background regardless of profession, and must never be
     // blocked by this gate.
     ProfessionTaxonomy.CompatibilityTier checkProfessionCompatibility(CVAnalysis analysis, Job job) {
-        if (isGeneralVocationalRole(job.getTitle())) {
+        if (VocationalRoleClassifier.isGeneralVocationalRole(job.getTitle())) {
             return ProfessionTaxonomy.CompatibilityTier.UNKNOWN;
         }
 
@@ -583,7 +564,14 @@ public class JobMatchService {
             String requiredEducationLevel,
             String requiredCertificationLevel,
             // When this row's score was last (re)computed - see JobMatchScore#updatedAt.
-            java.time.LocalDateTime lastAnalyzedAt
+            java.time.LocalDateTime lastAnalyzedAt,
+            // matchedSkills split by required/preferred, mirroring missingRequiredSkills/
+            // missingPreferredSkills above - lets the UI badge a matched skill as "required" vs
+            // "preferred" too, not just a missing one. Appended at the end (rather than next to
+            // matchedSkills) so every existing positional constructor call only needs two new
+            // trailing arguments, not a renumbering of everything after an inserted middle field.
+            List<String> matchedRequiredSkills,
+            List<String> matchedPreferredSkills
     ) {}
 
     public MatchScoresResult getMatchScores(String email, List<Job> jobs, String language) {
@@ -605,7 +593,7 @@ public class JobMatchService {
             if (score == null) {
                 continue;
             }
-            matches.add(scoreToPayload(score));
+            matches.add(scoreToPayload(score, job));
         }
 
         return new MatchScoresResult(true, matches);
@@ -613,7 +601,7 @@ public class JobMatchService {
 
     // Shared by getMatchScores (the synchronous list) and computeMatchScoresStreaming (progressive
     // per-job SSE payloads) - one place that defines what a "match" looks like over the wire.
-    private Map<String, Object> scoreToPayload(JobMatchScore score) {
+    private Map<String, Object> scoreToPayload(JobMatchScore score, Job job) {
         Map<String, Object> match = new LinkedHashMap<>();
         match.put("jobId", score.getJobId());
         // fieldRelated is left as-is (including null) rather than coerced to true - null is
@@ -625,6 +613,8 @@ public class JobMatchService {
         match.put("insufficientData", Boolean.TRUE.equals(score.getInsufficientData()));
         match.put("matchedSkills", splitSkillsString(score.getMatchedSkills()));
         match.put("missingSkills", splitSkillsString(score.getMissingSkills()));
+        match.put("matchedRequiredSkills", splitSkillsString(score.getMatchedRequiredSkills()));
+        match.put("matchedPreferredSkills", splitSkillsString(score.getMatchedPreferredSkills()));
         match.put("missingRequiredSkills", splitSkillsString(score.getMissingRequiredSkills()));
         match.put("missingPreferredSkills", splitSkillsString(score.getMissingPreferredSkills()));
         match.put("fieldRelevancePercent", score.getFieldRelevancePercent());
@@ -633,10 +623,26 @@ public class JobMatchService {
         match.put("educationMatchPercent", score.getEducationMatchPercent());
         match.put("certificationMatchPercent", score.getCertificationMatchPercent());
         match.put("locationMatchPercent", score.getLocationMatchPercent());
+
+        // Category for the LISTING (not the score itself): a vocational/general role (see
+        // VocationalRoleClassifier) is a title-only property, independent of any candidate - it's
+        // always routed to its own "General & Vocational Jobs" section rather than mixed into
+        // profession-based results, per product decision (a specialized candidate shouldn't be
+        // blocked from applying, but a Cashier/Delivery Driver posting also shouldn't be presented
+        // as if it were a meaningful professional match). excludedFromListing is the separate,
+        // harder cut: a NON-vocational job the candidate's resolved profession is genuinely
+        // unrelated to (taxonomy hard-block or a real AI "unrelated" verdict) is hidden from the
+        // listing entirely, not just downweighted - "even with a low match percentage" per the
+        // product ask. Only ever true for a CONCRETE fieldRelated=false (never for null, which is
+        // the "couldn't compute yet, please retry" sentinel - an uncertain job must never
+        // disappear from the list).
+        boolean vocational = VocationalRoleClassifier.isGeneralVocationalRole(job.getTitle());
+        match.put("generalVocationalRole", vocational);
+        match.put("excludedFromListing", !vocational && Boolean.FALSE.equals(score.getFieldRelated()));
         return match;
     }
 
-    private Map<String, Object> errorPayload(long jobId) {
+    private Map<String, Object> errorPayload(long jobId, Job job) {
         Map<String, Object> match = new LinkedHashMap<>();
         match.put("jobId", jobId);
         match.put("fieldRelated", null);
@@ -645,6 +651,8 @@ public class JobMatchService {
         match.put("insufficientData", false);
         match.put("matchedSkills", List.of());
         match.put("missingSkills", List.of());
+        match.put("matchedRequiredSkills", List.of());
+        match.put("matchedPreferredSkills", List.of());
         match.put("missingRequiredSkills", List.of());
         match.put("missingPreferredSkills", List.of());
         match.put("fieldRelevancePercent", null);
@@ -653,6 +661,12 @@ public class JobMatchService {
         match.put("educationMatchPercent", null);
         match.put("certificationMatchPercent", null);
         match.put("locationMatchPercent", null);
+        // Never excluded on an error/uncertain result - see scoreToPayload's comment on
+        // excludedFromListing. generalVocationalRole is still computed from the title alone (no
+        // candidate data needed) so a job doesn't visually jump between listing sections on a
+        // transient failure and subsequent retry.
+        match.put("generalVocationalRole", VocationalRoleClassifier.isGeneralVocationalRole(job.getTitle()));
+        match.put("excludedFromListing", false);
         return match;
     }
 
@@ -721,14 +735,14 @@ public class JobMatchService {
 
                 if (!isStale) {
                     matchMetrics.recordCacheHit(jobType);
-                    onJobResult.accept(job.getId(), scoreToPayload(cached));
+                    onJobResult.accept(job.getId(), scoreToPayload(cached, job));
                 } else if (isInsufficientJobData(job)) {
                     matchMetrics.recordInsufficientData();
                     JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
                     applyInsufficientDataVerdict(score, email, job.getId(),
                             cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()));
                     score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
-                    onJobResult.accept(job.getId(), scoreToPayload(score));
+                    onJobResult.accept(job.getId(), scoreToPayload(score, job));
                 } else {
                     ProfessionTaxonomy.CompatibilityTier tier = checkProfessionCompatibility(analysis, job);
                     if (isHardBlockedProfessionTier(tier)) {
@@ -737,7 +751,7 @@ public class JobMatchService {
                         applyProfessionIncompatibleVerdict(score, job, analysis, email, job.getId(),
                                 cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()), tier);
                         score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
-                        onJobResult.accept(job.getId(), scoreToPayload(score));
+                        onJobResult.accept(job.getId(), scoreToPayload(score, job));
                     } else {
                         matchMetrics.recordCacheMiss(jobType);
                         jobsNeedingComputation.add(job);
@@ -746,7 +760,7 @@ public class JobMatchService {
             } catch (Exception e) {
                 log.error("Failed to dispatch match-score gates for candidate={} jobId={} - surfacing the retry sentinel for just this job",
                         email, job.getId(), e);
-                onJobResult.accept(job.getId(), errorPayload(job.getId()));
+                onJobResult.accept(job.getId(), errorPayload(job.getId(), job));
             }
         }
 
@@ -789,7 +803,7 @@ public class JobMatchService {
                 applyPrefilteredUnrelatedVerdict(score, job, analysis, email, job.getId(),
                         cvFingerprint, jobFingerprints.get(job.getId()), jobContentFingerprints.get(job.getId()));
                 score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
-                onJobResult.accept(job.getId(), scoreToPayload(score));
+                onJobResult.accept(job.getId(), scoreToPayload(score, job));
             } else {
                 jobsSentToAi.add(job);
             }
@@ -830,7 +844,7 @@ public class JobMatchService {
                             email, jobId, similarity, fieldRelated);
                 }
 
-                Map<String, Object> payload = (score != null) ? scoreToPayload(score) : errorPayload(jobId);
+                Map<String, Object> payload = (score != null) ? scoreToPayload(score, job) : errorPayload(jobId, job);
                 onJobResult.accept(jobId, payload);
 
                 if (remaining.decrementAndGet() == 0) {
@@ -1069,7 +1083,7 @@ public class JobMatchService {
             effectiveCloseness = "related";
             overrideMatchReason = "This is a related profession to your background - some skills and context "
                     + "transfer, though it's a distinctly different specific role from your own.";
-        } else if ("unrelated".equalsIgnoreCase(effectiveCloseness) && isGeneralVocationalRole(job.getTitle())) {
+        } else if ("unrelated".equalsIgnoreCase(effectiveCloseness) && VocationalRoleClassifier.isGeneralVocationalRole(job.getTitle())) {
             // A general/vocational role must never come back "unrelated" for the candidate's
             // specialized background - see GENERAL_VOCATIONAL_ROLE_KEYWORDS. Only overrides an
             // "unrelated" verdict; a candidate whose own field genuinely IS this role (e.g. a
@@ -1097,6 +1111,8 @@ public class JobMatchService {
             score.setMatchPercent(null);
             score.setMatchedSkills("");
             score.setMissingSkills("");
+            score.setMatchedRequiredSkills("");
+            score.setMatchedPreferredSkills("");
             score.setMissingRequiredSkills("");
             score.setMissingPreferredSkills("");
             score.setFieldRelevancePercent(null);
@@ -1120,9 +1136,9 @@ public class JobMatchService {
         // any other matched skill. See ParsedMatch's own comment for why they're kept in separate
         // AI-response arrays despite being merged again here - the separation is for validation,
         // not for scoring.
-        List<String> allMatched = concat(
-                concat(parsed.matchedMandatorySkills(), parsed.matchedMandatorySkillsInferred()),
-                concat(parsed.matchedPreferredSkills(), parsed.matchedPreferredSkillsInferred()));
+        List<String> matchedRequired = concat(parsed.matchedMandatorySkills(), parsed.matchedMandatorySkillsInferred());
+        List<String> matchedPreferred = concat(parsed.matchedPreferredSkills(), parsed.matchedPreferredSkillsInferred());
+        List<String> allMatched = concat(matchedRequired, matchedPreferred);
         List<String> allMissing = concat(parsed.missingMandatorySkills(), parsed.missingPreferredSkills());
 
         Integer skillsScore = MatchScoreCalculator.computeSkillsScore(
@@ -1133,7 +1149,7 @@ public class JobMatchService {
 
         // Backend override: never score education for a general/vocational role even if the AI
         // mistakenly stated a requirement for one - see isGeneralVocationalRole.
-        boolean isVocationalRole = isGeneralVocationalRole(job.getTitle());
+        boolean isVocationalRole = VocationalRoleClassifier.isGeneralVocationalRole(job.getTitle());
         String requiredEducationLevel = isVocationalRole ? null : parsed.requiredEducationLevel();
 
         boolean sameSpecificRole = "same_role".equals(effectiveCloseness) || "same_specialization".equals(effectiveCloseness);
@@ -1179,6 +1195,8 @@ public class JobMatchService {
         score.setMatchPercent(weighted.overallPercent());
         score.setMatchedSkills(String.join("|", allMatched));
         score.setMissingSkills(String.join("|", allMissing));
+        score.setMatchedRequiredSkills(String.join("|", matchedRequired));
+        score.setMatchedPreferredSkills(String.join("|", matchedPreferred));
         score.setMissingRequiredSkills(String.join("|", parsed.missingMandatorySkills()));
         score.setMissingPreferredSkills(String.join("|", parsed.missingPreferredSkills()));
         score.setFieldRelevancePercent(weighted.componentPercents().get(ComponentKey.FIELD_RELEVANCE));
@@ -1195,7 +1213,7 @@ public class JobMatchService {
         if (analysis == null) {
             return new MatchDetailResult(false, job.getId(), null, null, List.of(), List.of(), List.of(), List.of(), List.of(),
                     null, null, null, null, null, null, null, null, null, null, List.of(), List.of(),
-                    null, null, null, null, null, null);
+                    null, null, null, null, null, null, List.of(), List.of());
         }
 
         // Establishes (or reuses) the exact same core score the job card/list already shows -
@@ -1212,12 +1230,14 @@ public class JobMatchService {
                             : "We couldn't compute your match for this job right now. Please try again shortly.",
                     List.of(), List.of(), List.of(), List.of(), List.of(),
                     null, null, null, null, null, null, null, null, null, null, List.of(), List.of(),
-                    null, null, null, null, null, core != null ? core.getUpdatedAt() : null);
+                    null, null, null, null, null, core != null ? core.getUpdatedAt() : null, List.of(), List.of());
         }
 
         boolean fieldRelated = core.getFieldRelated();
         List<String> matchedSkills = splitSkillsString(core.getMatchedSkills());
         List<String> missingSkills = splitSkillsString(core.getMissingSkills());
+        List<String> matchedRequiredSkills = splitSkillsString(core.getMatchedRequiredSkills());
+        List<String> matchedPreferredSkills = splitSkillsString(core.getMatchedPreferredSkills());
         List<String> missingRequiredSkills = splitSkillsString(core.getMissingRequiredSkills());
         List<String> missingPreferredSkills = splitSkillsString(core.getMissingPreferredSkills());
 
@@ -1228,14 +1248,19 @@ public class JobMatchService {
                     List.of(), List.of(), List.of(), List.of(), List.of(),
                     "A meaningful evaluation isn't possible for this job given the field mismatch.",
                     false, false, null, null, null, null, null, null, null, List.of(), List.of(),
-                    null, null, null, null, null, core.getUpdatedAt());
+                    null, null, null, null, null, core.getUpdatedAt(), List.of(), List.of());
         }
 
         // recommendation is the sentinel for "detail explanation generated for the CURRENT
         // core score": ensureCoreScores clears it whenever the core score changes, so a blank
         // value here means either this job's detail has never been generated, or the score it
         // was generated against is now stale - either way, regenerate against the current score.
-        boolean detailStale = core.getRecommendation() == null || core.getRecommendation().isBlank();
+        // detailPromptVersion catches the other kind of staleness: a narrative that was generated
+        // against the CURRENT core score but under an OLDER version of validateDetailClaims/the
+        // detail prompt - see DETAIL_PROMPT_VERSION's comment for why that must also force a
+        // regeneration rather than being served indefinitely.
+        boolean detailStale = core.getRecommendation() == null || core.getRecommendation().isBlank()
+                || core.getDetailPromptVersion() == null || core.getDetailPromptVersion() != DETAIL_PROMPT_VERSION;
 
         if (detailStale) {
             String result = openAICVAnalysisService.computeJobMatchDetail(
@@ -1272,6 +1297,7 @@ public class JobMatchService {
                 String recommendation = json.path("recommendation").asText("");
                 core.setRecommendation(recommendation.isBlank() ? "No specific recommendation available." : recommendation);
                 core.setShouldApply(resolveShouldApply(core.getMatchPercent(), json.path("shouldApply").asBoolean(true)));
+                core.setDetailPromptVersion(DETAIL_PROMPT_VERSION);
 
                 core = jobMatchScoreRepository.save(core);
             }
@@ -1307,7 +1333,9 @@ public class JobMatchService {
                 core.getCandidateHasRequiredExperienceType(),
                 core.getRequiredEducationLevel(),
                 core.getRequiredCertificationLevel(),
-                core.getUpdatedAt()
+                core.getUpdatedAt(),
+                matchedRequiredSkills,
+                matchedPreferredSkills
         );
     }
 
@@ -1373,44 +1401,6 @@ public class JobMatchService {
             "(maximum|no more than|up to \\d+\\s*years|junior[- ]only|entry[- ]level only)",
             java.util.regex.Pattern.CASE_INSENSITIVE);
 
-    // Phrases pairing a matched skill mention with claimed absence - gates the "matched skill
-    // cited as a gap" check in validateDetailClaims below so a bullet that merely MENTIONS a
-    // matched skill for context (e.g. "you have strong Java skills, but this role's use of Kotlin
-    // specifically isn't reflected in your CV") isn't wrongly dropped just for naming it. Only a
-    // bullet that BOTH names a matched skill AND uses one of these absence phrases is actually
-    // claiming that skill is missing - the real contradiction this exists to catch.
-    private static final List<String> ABSENCE_PHRASES = List.of(
-            "lack", "lacking", "missing", "don't have", "doesn't have", "not reflected",
-            "not evident", "no experience with", "need to develop", "gap in", "not shown", "absent"
-    );
-
-    // Words that, appearing shortly before an ABSENCE_PHRASES match, flip its meaning from a real
-    // gap claim into an explicit denial of one - e.g. "there is no evidence of any missing
-    // skills" or "does not indicate any gaps" CONFIRM there is no gap, even though they contain
-    // "missing"/"gap". Found in production testing: a genuinely gap-free candidate summary
-    // ("The candidate's profile does not indicate any missing skills... all key requirements,
-    // including Java, Spring Boot, REST APIs, are well covered") was getting every one of those
-    // skill names incorrectly flagged as "claimed absent" by a bare ABSENCE_PHRASES substring
-    // check, because it never accounted for the sentence negating its own absence phrase.
-    private static final List<String> NEGATION_WORDS = List.of("no ", "not ", "n't", "never ", "without ", "none ");
-
-    // Same substring-match limitation as evidencedIn (a lightweight heuristic, not real NLP), but
-    // specifically checks that the found ABSENCE_PHRASES occurrence isn't itself negated shortly
-    // before it - see NEGATION_WORDS.
-    private boolean hasGenuineAbsenceClaim(String textLower) {
-        for (String phrase : ABSENCE_PHRASES) {
-            int idx = textLower.indexOf(phrase);
-            while (idx >= 0) {
-                String preceding = textLower.substring(Math.max(0, idx - 25), idx);
-                if (NEGATION_WORDS.stream().noneMatch(preceding::contains)) {
-                    return true;
-                }
-                idx = textLower.indexOf(phrase, idx + 1);
-            }
-        }
-        return false;
-    }
-
     // Filters computeJobMatchDetail's whyGoodMatch/whyNotPerfectMatch/improvementSuggestions
     // bullets against the job's own text. Unlike computeJobMatches (see validateMatch), this
     // free-text narrative call has no fixed-vocabulary classification to check the AI's output
@@ -1434,9 +1424,9 @@ public class JobMatchService {
     // skill as a reason this is a good match is always a contradiction, regardless of phrasing.
     // isPositiveBulletList=false (whyNotPerfectMatch/improvementSuggestions) rejects a bullet only
     // when it BOTH names something the core score already decided is MATCHED and pairs it with an
-    // absence phrase (see ABSENCE_PHRASES) - narrower than the positive-list check because a
-    // matched skill can legitimately be mentioned as context in an honest gap explanation without
-    // claiming it's missing.
+    // absence phrase (see SkillClaimMatcher.hasGenuineAbsenceClaim) - narrower than the
+    // positive-list check because a matched skill can legitimately be mentioned as context in an
+    // honest gap explanation without claiming it's missing.
     private List<String> validateDetailClaims(
             List<String> bullets, Job job, List<String> matchedSkills, List<String> missingSkills,
             boolean isPositiveBulletList) {
@@ -1478,15 +1468,14 @@ public class JobMatchService {
 
             if (isPositiveBulletList) {
                 boolean citesMissingSkillAsPositive = missingSkills.stream()
-                        .anyMatch(skill -> skill != null && skill.length() >= 3 && lower.contains(skill.toLowerCase(Locale.ROOT)));
+                        .anyMatch(skill -> SkillClaimMatcher.mentionsSkill(lower, skill));
                 if (citesMissingSkillAsPositive) {
                     log.info("match-detail-filtered jobId={} reason=praises-missing-skill", job.getId());
                     continue;
                 }
             } else {
-                boolean citesMatchedSkillAsAbsent = hasGenuineAbsenceClaim(lower)
-                        && matchedSkills.stream()
-                                .anyMatch(skill -> skill != null && skill.length() >= 3 && lower.contains(skill.toLowerCase(Locale.ROOT)));
+                boolean citesMatchedSkillAsAbsent = SkillClaimMatcher.hasGenuineAbsenceClaim(lower)
+                        && matchedSkills.stream().anyMatch(skill -> SkillClaimMatcher.mentionsSkill(lower, skill));
                 if (citesMatchedSkillAsAbsent) {
                     log.info("match-detail-filtered jobId={} reason=flags-matched-skill-as-gap", job.getId());
                     continue;

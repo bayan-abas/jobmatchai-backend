@@ -4,6 +4,7 @@ import com.jobmatchai.backend.dto.JobCreateRequest;
 import com.jobmatchai.backend.model.Application;
 import com.jobmatchai.backend.model.CandidateAiSummary;
 import com.jobmatchai.backend.model.Job;
+import com.jobmatchai.backend.model.JobMatchScore;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
 import com.jobmatchai.backend.repository.JobMatchScoreRepository;
@@ -82,6 +83,12 @@ public class JobController {
             String createdAt
     ) {}
 
+    // matchPercent/matchLabel are sourced from JobMatchScore (see getApplicationsForJob) - the
+    // exact same number the candidate's own "Job Matches" page shows for this pair. null means
+    // one of: the candidate never triggered their own match computation for this job before
+    // applying (rare - normal flow sees the score before applying), a transient "AI call failed,
+    // please retry" state, or the job posting itself was too thin to score - all three render the
+    // same "not scored yet" state client-side, mirroring how a missing AI Summary used to.
     public record JobApplicantView(
             Long id,
             Long jobId,
@@ -91,7 +98,13 @@ public class JobController {
             String status,
             String appliedDate,
             Integer matchPercent,
-            String matchLabel
+            String matchLabel,
+            // Whether a CandidateAiSummary already exists for this pair - see
+            // ApplicationController.ApplicantView's identical field for the full rationale (in
+            // short: matchPercent above no longer implies this, now that it's JobMatchScore-
+            // sourced, so the frontend needs this explicit signal to know whether requesting the
+            // AI Summary is a guaranteed cache hit).
+            boolean hasAiSummary
     ) {}
 
     public record JobDetailsView(
@@ -161,27 +174,42 @@ public class JobController {
             return ResponseEntity.status(404).body("Job not found");
         }
 
-        // CandidateAiSummary (the "AI Summary" feature) is the single source of truth for
-        // the score/label shown here - it must never be mixed with the separate candidate-
-        // facing "Job Matches" score, which comes from a different OpenAI prompt entirely.
+        // JobMatchScore (the same deterministic, backend-weighted score shown on the candidate's
+        // own "Job Matches" page) is now the single source of truth for the percentage/label
+        // shown here too - see MatchScoreCalculator. This used to read CandidateAiSummary
+        // instead (a free-form AI-invented number from a completely different prompt, with no
+        // weighting/guardrails behind it); that field still exists and still drives the AI
+        // Summary's own narrative/recommendation (see getCandidateAiSummary below), but is no
+        // longer surfaced as "the match percentage" anywhere on the company side, so a recruiter
+        // and a candidate looking at the same pair always see the same number.
         List<Application> applications = applicationRepository.findByJobId(jobId);
 
-        // One batched query for every applicant's summary instead of one per applicant -
-        // against a remote database each round trip is expensive.
+        // One batched query for every applicant's score instead of one per applicant - against
+        // a remote database each round trip is expensive. Deliberately a plain cache read (no
+        // on-demand JobMatchService computation here) - this is a passive list view, not an
+        // explicit per-candidate action, and matches this endpoint's existing behavior of only
+        // ever showing what's already been computed. In the overwhelming common case the score
+        // already exists by the time a candidate applies (they saw it on the job's own card
+        // first) - see JobApplicantView's own comment for what a still-missing row means.
+        Map<String, JobMatchScore> scoresByEmail = new HashMap<>();
+        // Existence-only lookup (never read for its score) - purely to populate hasAiSummary,
+        // see JobApplicantView's comment on that field.
         Map<String, CandidateAiSummary> summariesByEmail = new HashMap<>();
         if (!applications.isEmpty()) {
             List<String> candidateEmails = applications.stream().map(Application::getCandidateEmail).distinct().toList();
+            for (JobMatchScore score : jobMatchScoreRepository.findByCandidateEmailInAndJobIdIn(candidateEmails, List.of(jobId))) {
+                scoresByEmail.put(score.getCandidateEmail(), score);
+            }
             for (CandidateAiSummary summary : candidateAiSummaryRepository.findByCandidateEmailInAndJobIdIn(candidateEmails, List.of(jobId))) {
-                CandidateAiSummary existing = summariesByEmail.get(summary.getCandidateEmail());
-                if (existing == null || summary.getId() > existing.getId()) {
-                    summariesByEmail.put(summary.getCandidateEmail(), summary);
-                }
+                summariesByEmail.put(summary.getCandidateEmail(), summary);
             }
         }
 
         List<JobApplicantView> applicants = applications.stream()
                 .map(application -> {
-                    CandidateAiSummary summary = summariesByEmail.get(application.getCandidateEmail());
+                    JobMatchScore score = scoresByEmail.get(application.getCandidateEmail());
+                    Integer matchPercent = score != null ? score.getMatchPercent() : null;
+                    boolean hasAiSummary = summariesByEmail.containsKey(application.getCandidateEmail());
 
                     return new JobApplicantView(
                             application.getId(),
@@ -191,8 +219,9 @@ public class JobController {
                             application.getCandidateEmail(),
                             application.getStatus(),
                             application.getAppliedDate(),
-                            summary != null ? summary.getMatchScore() : null,
-                            summary != null ? MatchLabelUtil.fromScore(summary.getMatchScore()) : null
+                            matchPercent,
+                            matchPercent != null ? MatchLabelUtil.fromScore(matchPercent) : null,
+                            hasAiSummary
                     );
                 })
                 .toList();
@@ -211,22 +240,16 @@ public class JobController {
 
         List<Application> applications = applicationRepository.findByJobId(id);
 
-        // Same source/averaging as the company job postings list (getJobsByCompanyEmail +
-        // the client-side average in CompanyJobPostings.tsx) - the latest CandidateAiSummary
-        // per candidate for this job, never the separate candidate-facing JobMatchScore.
+        // Same source as getApplicationsForJob above (JobMatchScore, not CandidateAiSummary) and
+        // the same averaging the company job postings list uses (getJobsByCompanyEmail's
+        // client-side average in CompanyJobPostings.tsx, fed by the identical source via
+        // ApplicationController#getApplicationsByCompany) - one consistent number everywhere.
         Integer averageMatchScore = null;
         if (!applications.isEmpty()) {
             List<String> candidateEmails = applications.stream().map(Application::getCandidateEmail).distinct().toList();
-            Map<String, CandidateAiSummary> summariesByEmail = new HashMap<>();
-            for (CandidateAiSummary summary : candidateAiSummaryRepository.findByCandidateEmailInAndJobIdIn(candidateEmails, List.of(id))) {
-                CandidateAiSummary existing = summariesByEmail.get(summary.getCandidateEmail());
-                if (existing == null || summary.getId() > existing.getId()) {
-                    summariesByEmail.put(summary.getCandidateEmail(), summary);
-                }
-            }
 
-            List<Integer> scores = summariesByEmail.values().stream()
-                    .map(CandidateAiSummary::getMatchScore)
+            List<Integer> scores = jobMatchScoreRepository.findByCandidateEmailInAndJobIdIn(candidateEmails, List.of(id)).stream()
+                    .map(JobMatchScore::getMatchPercent)
                     .filter(java.util.Objects::nonNull)
                     .toList();
 
@@ -507,6 +530,8 @@ public class JobController {
             response.put("locationMatchPercent", result.locationMatchPercent());
             response.put("missingRequiredSkills", result.missingRequiredSkills());
             response.put("missingPreferredSkills", result.missingPreferredSkills());
+            response.put("matchedRequiredSkills", result.matchedRequiredSkills());
+            response.put("matchedPreferredSkills", result.matchedPreferredSkills());
             response.put("requiredExperienceLevel", result.requiredExperienceLevel());
             response.put("requiredEducationLevel", result.requiredEducationLevel());
             response.put("requiredCertificationLevel", result.requiredCertificationLevel());

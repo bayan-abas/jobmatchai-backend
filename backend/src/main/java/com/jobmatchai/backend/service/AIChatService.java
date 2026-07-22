@@ -3,6 +3,11 @@ package com.jobmatchai.backend.service;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import com.jobmatchai.backend.service.AIChatContextService.CanonicalFact;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.stereotype.Service;
@@ -16,11 +21,16 @@ import java.util.Objects;
 @Service
 public class AIChatService {
 
+    private static final Logger log = LoggerFactory.getLogger(AIChatService.class);
+
     @Value("${openai.api.key:}")
     private String apiKey;
 
     @Value("${openai.model}")
     private String model;
+
+    @Autowired
+    private ChatConsistencyValidator chatConsistencyValidator;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -28,7 +38,60 @@ public class AIChatService {
             .baseUrl("https://api.openai.com")
             .build();
 
-    public String chat(String userMessage, String language, String contextBlock, String mode, List<Map<String, String>> history) {
+    // Entry point used by ChatController. Generates a reply, then runs it through
+    // ChatConsistencyValidator against the SAME canonicalFacts the context block was built from
+    // (see AIChatContextService.CanonicalFact) so a reply can never tell the user something that
+    // contradicts the match score/skills/reasoning shown elsewhere in the app. Non-critical
+    // contradictions (a bullet praising a missing skill, a stray wrong percentage outside the
+    // headline "## Match Score" line) are corrected/dropped in place and served immediately - no
+    // extra AI call. A critical one (the "## Match Score" line itself was wrong) is worth one
+    // regeneration attempt with the specific contradiction spelled out as corrective feedback,
+    // mirroring the retry-with-feedback pattern JobMatchService's batch scoring already uses -
+    // capped at one retry so a persistently-wrong model can't turn one chat message into an
+    // unbounded (and increasingly expensive) loop; if the retry is still critical, the
+    // auto-corrected FIRST reply is served rather than a second uncorrected wrong one.
+    public String chat(String userMessage, String language, String contextBlock, String mode,
+            List<Map<String, String>> history, List<CanonicalFact> canonicalFacts) {
+        String reply = generateReply(userMessage, language, contextBlock, mode, history);
+        if (reply == null || reply.isBlank()) {
+            return reply;
+        }
+
+        ChatConsistencyValidator.ValidationResult result = chatConsistencyValidator.validate(reply, canonicalFacts);
+        if (!result.issues().isEmpty()) {
+            log.info("chat-reply-contradictions count={} critical={} issues={}",
+                    result.issues().size(), result.critical(), result.issues());
+        }
+
+        if (!result.critical()) {
+            return result.reply();
+        }
+
+        List<Map<String, String>> retryHistory = new ArrayList<>(history == null ? List.of() : history);
+        retryHistory.add(Map.of("role", "user", "content", userMessage));
+        retryHistory.add(Map.of("role", "assistant", "content", reply));
+
+        String correctionNote = "Your previous reply contradicted the platform's validated match data: "
+                + String.join("; ", result.issues())
+                + ". Re-answer the same question from scratch, using ONLY the match percentages and skill "
+                + "classifications exactly as given in the DATA CONTEXT section below - do not repeat that contradiction.";
+
+        String retryReply = generateReply(correctionNote, language, contextBlock, mode, retryHistory);
+        if (retryReply == null || retryReply.isBlank()) {
+            return result.reply();
+        }
+
+        ChatConsistencyValidator.ValidationResult retryResult = chatConsistencyValidator.validate(retryReply, canonicalFacts);
+        if (retryResult.critical()) {
+            log.warn("chat-reply-still-critical-after-retry issues={} - serving auto-corrected first reply instead",
+                    retryResult.issues());
+            return result.reply();
+        }
+
+        return retryResult.reply();
+    }
+
+    private String generateReply(String userMessage, String language, String contextBlock, String mode, List<Map<String, String>> history) {
         try {
             String languageInstruction = switch (language) {
                 case "ar" -> "You MUST reply in Arabic only. Every single word of your response must be in Arabic. Keep job titles, company names, and skill names as-is (do not translate them).";

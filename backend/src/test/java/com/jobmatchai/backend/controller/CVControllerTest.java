@@ -8,6 +8,7 @@ import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.CVTextExtractorService;
 import com.jobmatchai.backend.service.OpenAICVAnalysisService;
+import com.jobmatchai.backend.service.storage.LocalFileStorageService;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -81,9 +82,15 @@ class CVControllerTest {
         ReflectionTestUtils.setField(cvController, "cvAnalysisCacheRepository", cvAnalysisCacheRepository);
         ReflectionTestUtils.setField(cvController, "applicationRepository", applicationRepository);
         ReflectionTestUtils.setField(cvController, "jobRepository", jobRepository);
-        // Absolute path - Path.resolve (used inside the controller) returns an absolute
-        // uploadDir as-is regardless of the test JVM's working directory.
-        ReflectionTestUtils.setField(cvController, "uploadDir", uploadDir.toString());
+
+        // Real LocalFileStorageService pointed at the @TempDir, not a mock - these tests assert
+        // against actual files on disk (see fileCountInUploadDir/Files.exists below), and this
+        // preserves that. Absolute path - Path.resolve (used inside LocalFileStorageService)
+        // returns an absolute uploadDir as-is regardless of the test JVM's working directory.
+        LocalFileStorageService localFileStorageService = new LocalFileStorageService();
+        ReflectionTestUtils.setField(localFileStorageService, "uploadDir", uploadDir.toString());
+        ReflectionTestUtils.setField(cvController, "fileStorageService", localFileStorageService);
+
         ReflectionTestUtils.setField(cvController, "maxCvUploadSizeBytes", 10L * 1024 * 1024);
     }
 

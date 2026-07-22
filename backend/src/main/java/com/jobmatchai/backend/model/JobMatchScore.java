@@ -28,13 +28,21 @@ public class JobMatchScore {
     private String matchReason;
 
     // Combined (mandatory + preferred) lists, kept for backward compatibility with existing
-    // readers (AI chat context, frontend job cards). missingRequiredSkills/missingPreferredSkills
-    // below are the same data split out for callers that need the mandatory/preferred distinction.
+    // readers (AI chat context, frontend job cards). matchedRequiredSkills/matchedPreferredSkills
+    // and missingRequiredSkills/missingPreferredSkills below are the same data split out for
+    // callers that need the mandatory/preferred distinction (e.g. the UI badging a missing skill
+    // as "required" vs "preferred" instead of showing every gap as equally severe).
     @Column(name = "matched_skills", columnDefinition = "TEXT")
     private String matchedSkills;
 
     @Column(name = "missing_skills", columnDefinition = "TEXT")
     private String missingSkills;
+
+    @Column(name = "matched_required_skills", columnDefinition = "TEXT")
+    private String matchedRequiredSkills;
+
+    @Column(name = "matched_preferred_skills", columnDefinition = "TEXT")
+    private String matchedPreferredSkills;
 
     @Column(name = "missing_required_skills", columnDefinition = "TEXT")
     private String missingRequiredSkills;
@@ -59,6 +67,14 @@ public class JobMatchScore {
 
     @Column(name = "recommendation", columnDefinition = "TEXT")
     private String recommendation;
+
+    // Which version of JobMatchService.DETAIL_PROMPT_VERSION whyGoodMatch/whyNotPerfectMatch/
+    // improvementSuggestions/recommendation were last generated (and filtered) under. Compared
+    // against the current constant in getMatchDetail's detailStale check so a fix to the
+    // contradiction-filtering logic forces every existing cached narrative to regenerate under the
+    // new rules, rather than staying frozen at whatever guard existed when it was first written.
+    @Column(name = "detail_prompt_version")
+    private Integer detailPromptVersion;
 
     @Column(name = "should_apply")
     private Boolean shouldApply;
@@ -247,6 +263,14 @@ public class JobMatchScore {
         this.recommendation = recommendation;
     }
 
+    public Integer getDetailPromptVersion() {
+        return detailPromptVersion;
+    }
+
+    public void setDetailPromptVersion(Integer detailPromptVersion) {
+        this.detailPromptVersion = detailPromptVersion;
+    }
+
     public Boolean getShouldApply() {
         return shouldApply;
     }
@@ -293,6 +317,22 @@ public class JobMatchScore {
 
     public void setLanguageMatchPercent(Integer languageMatchPercent) {
         this.languageMatchPercent = languageMatchPercent;
+    }
+
+    public String getMatchedRequiredSkills() {
+        return matchedRequiredSkills;
+    }
+
+    public void setMatchedRequiredSkills(String matchedRequiredSkills) {
+        this.matchedRequiredSkills = matchedRequiredSkills;
+    }
+
+    public String getMatchedPreferredSkills() {
+        return matchedPreferredSkills;
+    }
+
+    public void setMatchedPreferredSkills(String matchedPreferredSkills) {
+        this.matchedPreferredSkills = matchedPreferredSkills;
     }
 
     public String getMissingRequiredSkills() {
