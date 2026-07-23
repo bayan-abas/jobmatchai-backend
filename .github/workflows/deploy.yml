@@ -33,6 +33,10 @@ jobs:
           cache: maven
           cache-dependency-path: backend/pom.xml
 
+      - name: Make Maven Wrapper executable
+        working-directory: backend
+        run: chmod +x mvnw
+
       - name: Run backend tests
         working-directory: backend
         run: ./mvnw clean test
@@ -40,7 +44,6 @@ jobs:
       - name: Create Elastic Beanstalk deployment ZIP
         working-directory: backend
         run: |
-          chmod +x mvnw
           zip -r ../Dockerfile.zip . \
             -x "target/*" \
                ".git/*" \
