@@ -6,11 +6,13 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.core.io.InputStreamResource;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Service;
+import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
@@ -18,7 +20,6 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -77,15 +78,40 @@ public class S3FileStorageService implements FileStorageService {
 
     @Override
     public Resource loadAsResource(String key) throws IOException {
-        InputStream stream = client.getObject(GetObjectRequest.builder().bucket(bucketName).key(key).build());
+        ResponseInputStream<GetObjectResponse> stream =
+                client.getObject(GetObjectRequest.builder().bucket(bucketName).key(key).build());
+
+        // S3 already reports the object's exact size in the response metadata, with zero need to
+        // read anything - overriding contentLength() below to use it (instead of AbstractResource's
+        // default, which reads the WHOLE stream just to count it) is what keeps this stream
+        // single-read, matching InputStreamResource's own contract.
+        Long knownLength = stream.response().contentLength();
+        long contentLength = knownLength != null ? knownLength : -1;
+
         // InputStreamResource's own getFilename() returns null by default (it has no filename
         // concept for a bare stream) - CVController's serveCvFile uses this purely as a fallback
         // display name when the candidate never had an originalFileName on record, so it still
         // needs to resolve to something rather than null.
+        //
+        // Subclassing InputStreamResource here means Spring's ResourceHttpMessageConverter no
+        // longer recognizes it via its "InputStreamResource.class == resource.getClass()" fast
+        // path (which normally skips ever calling contentLength() on this exact type, for
+        // precisely the reason explained above) - so contentLength() MUST be overridden here too,
+        // or Spring falls through to AbstractResource's stream-draining default, fully consumes
+        // and closes the stream computing the length, then throws IllegalStateException
+        // ("InputStream has already been read") when it tries to read it a second time to
+        // actually write the response body. That 500 happened on every download even though the
+        // object was fetched from S3 successfully - Spring's own message conversion was
+        // reading this stream twice, not S3 failing to serve it.
         return new InputStreamResource(stream) {
             @Override
             public String getFilename() {
                 return key;
+            }
+
+            @Override
+            public long contentLength() {
+                return contentLength;
             }
         };
     }
