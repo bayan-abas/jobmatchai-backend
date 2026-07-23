@@ -41,16 +41,22 @@ jobs:
         working-directory: backend
         run: ./mvnw clean test
 
+      - name: Package application
+        working-directory: backend
+        run: ./mvnw -B package -DskipTests
+
+      # Stages ONLY the prebuilt jar + Dockerfile (not the full source tree) so the EB Docker
+      # platform's on-instance `docker build` is just a jar copy, never a Maven compile - see
+      # Dockerfile's own comment for why that matters (it was timing out deployments).
       - name: Create Elastic Beanstalk deployment ZIP
         working-directory: backend
         run: |
-          zip -r ../Dockerfile.zip . \
-            -x "target/*" \
-               ".git/*" \
-               ".idea/*" \
-               ".vscode/*" \
-               "*.log" \
-               ".env"
+          rm -rf deploy
+          mkdir deploy
+          cp Dockerfile deploy/Dockerfile
+          cp target/*.jar deploy/app.jar
+          cd deploy
+          zip -r ../../Dockerfile.zip .
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
