@@ -3,6 +3,7 @@ package com.jobmatchai.backend.service;
 import com.jobmatchai.backend.model.CVAnalysis;
 import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
+import com.jobmatchai.backend.repository.CandidateAiSummaryNarrativeRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -28,6 +29,8 @@ class CandidateSummaryServiceTest {
     @Mock
     private CandidateAiSummaryRepository candidateAiSummaryRepository;
     @Mock
+    private CandidateAiSummaryNarrativeRepository candidateAiSummaryNarrativeRepository;
+    @Mock
     private OpenAICVAnalysisService openAICVAnalysisService;
 
     private CandidateSummaryService candidateSummaryService;
@@ -39,6 +42,7 @@ class CandidateSummaryServiceTest {
         candidateSummaryService = new CandidateSummaryService();
         ReflectionTestUtils.setField(candidateSummaryService, "cvAnalysisRepository", cvAnalysisRepository);
         ReflectionTestUtils.setField(candidateSummaryService, "candidateAiSummaryRepository", candidateAiSummaryRepository);
+        ReflectionTestUtils.setField(candidateSummaryService, "candidateAiSummaryNarrativeRepository", candidateAiSummaryNarrativeRepository);
         ReflectionTestUtils.setField(candidateSummaryService, "openAICVAnalysisService", openAICVAnalysisService);
 
         CVAnalysis analysis = new CVAnalysis();
@@ -48,6 +52,12 @@ class CandidateSummaryServiceTest {
         when(candidateAiSummaryRepository.findFirstByCandidateEmailAndJobIdOrderByIdDesc(any(), any()))
                 .thenReturn(Optional.empty());
         when(candidateAiSummaryRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        // No cached translation on file for any of these tests, so resolveWithNarrative's
+        // freshly-generated branch seeds the narrative cache directly from the just-generated
+        // (already-correct-language) text instead of calling out to translateCandidateSummaryNarrative.
+        when(candidateAiSummaryNarrativeRepository.findByCandidateEmailAndJobIdAndLanguage(any(), any(), any()))
+                .thenReturn(Optional.empty());
+        when(candidateAiSummaryNarrativeRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
     }
 
     private Job job() {

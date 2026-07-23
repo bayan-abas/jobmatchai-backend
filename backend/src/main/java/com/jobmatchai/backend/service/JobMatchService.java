@@ -407,6 +407,46 @@ public class JobMatchService {
         return !hasStructuredRequirements && !hasEnoughSkills && totalContentChars < MIN_TOTAL_CONTENT_CHARS;
     }
 
+    // Every language the frontend can request (see LanguageContext.tsx) - deterministic verdicts
+    // seed a narrative row for ALL of these up front (see seedDeterministicNarrative), so that
+    // resolveMatchReason/resolveDetailNarrative always find a cache HIT for them no matter which
+    // language is requested and NEVER fall through to a translateJobMatchNarrative AI call for a
+    // result that backend rules - not the AI - already decided.
+    private static final List<String> SUPPORTED_NARRATIVE_LANGUAGES = List.of("en", "ar", "he");
+
+    private static String pickByLanguage(String language, String en, String ar, String he) {
+        if ("ar".equalsIgnoreCase(language)) {
+            return ar;
+        }
+        if ("he".equalsIgnoreCase(language)) {
+            return he;
+        }
+        return en;
+    }
+
+    // Writes a JobMatchNarrative row for EVERY supported language directly from a fixed,
+    // backend-owned template (never OpenAI) - used only for verdicts decided entirely by
+    // deterministic backend rules (insufficient job data, the profession-taxonomy gate, the
+    // embedding pre-filter), so that no matter which language a request later asks for, the row
+    // is already there and resolveMatchReason/resolveDetailNarrative read it as a cache HIT
+    // instead of calling translateJobMatchNarrative on text that was never AI-authored to begin
+    // with. `reasonForLanguage` must be a pure function of `language` with no side effects.
+    private void seedDeterministicNarrative(String email, long jobId, String cvFingerprint, String jobFingerprint,
+            java.util.function.Function<String, String> reasonForLanguage) {
+        for (String lang : SUPPORTED_NARRATIVE_LANGUAGES) {
+            JobMatchNarrative narrative = jobMatchNarrativeRepository
+                    .findByCandidateEmailAndJobIdAndLanguage(email, jobId, lang)
+                    .orElse(new JobMatchNarrative());
+            narrative.setCandidateEmail(email);
+            narrative.setJobId(jobId);
+            narrative.setLanguage(lang);
+            narrative.setMatchReason(reasonForLanguage.apply(lang));
+            narrative.setCvFingerprint(cvFingerprint);
+            narrative.setJobFingerprint(jobFingerprint);
+            jobMatchNarrativeRepository.save(narrative);
+        }
+    }
+
     // Persisted (cacheable, deterministic - never retried on the next visit) unlike the ephemeral
     // "AI call failed" error sentinel elsewhere in this class, which is intentionally NEVER saved.
     // fieldRelated is left null (no verdict was ever possible), matched via insufficientData=true
@@ -441,6 +481,11 @@ public class JobMatchService {
         score.setWhyGoodMatch(null);
         score.setWhyNotPerfectMatch(null);
         score.setImprovementSuggestions(null);
+
+        seedDeterministicNarrative(email, jobId, cvFingerprint, jobFingerprint, lang -> pickByLanguage(lang,
+                "Not enough job information to calculate a reliable match.",
+                "لا تتوفر معلومات كافية عن الوظيفة لحساب نسبة تطابق موثوقة.",
+                "אין מספיק מידע על המשרה כדי לחשב התאמה אמינה."));
     }
 
     // The HIGHEST-priority gate in the whole matching pipeline (see ProfessionTaxonomy's own
@@ -506,7 +551,8 @@ public class JobMatchService {
                 : nullToEmpty(analysis.getCandidateField());
         String jobProfessionLabel = jobProfession != null ? jobProfession.displayName() : nullToEmpty(job.getTitle());
 
-        String reason = tier == ProfessionTaxonomy.CompatibilityTier.DIFFERENT_LICENSED_PROFESSION
+        boolean licensed = tier == ProfessionTaxonomy.CompatibilityTier.DIFFERENT_LICENSED_PROFESSION;
+        String reason = licensed
                 ? "Your background is in " + candidateProfessionLabel + ", and this " + jobProfessionLabel
                         + " role requires its own separate professional license or credential - the two are "
                         + "different regulated professions, so experience in one does not carry over to practicing the other."
@@ -520,6 +566,28 @@ public class JobMatchService {
 
         applyParsedMatchToScore(score, synthetic, job, analysis, email, jobId,
                 cvFingerprint, jobFingerprint, jobContentFingerprint);
+
+        seedDeterministicNarrative(email, jobId, cvFingerprint, jobFingerprint, lang -> licensed
+                ? pickByLanguage(lang,
+                        "Your background is in " + candidateProfessionLabel + ", and this " + jobProfessionLabel
+                                + " role requires its own separate professional license or credential - the two are "
+                                + "different regulated professions, so experience in one does not carry over to practicing the other.",
+                        "خلفيتك المهنية في " + candidateProfessionLabel + "، وهذه الوظيفة كـ " + jobProfessionLabel
+                                + " تتطلب ترخيصًا أو شهادة مهنية منفصلة خاصة بها - فهما مهنتان مرخصتان مختلفتان، "
+                                + "والخبرة في إحداهما لا تنتقل تلقائيًا لممارسة الأخرى.",
+                        "הרקע שלך הוא ב" + candidateProfessionLabel + ", ותפקיד " + jobProfessionLabel
+                                + " דורש רישיון או הסמכה מקצועית נפרדת משלו - מדובר בשני מקצועות מוסדרים שונים, "
+                                + "כך שניסיון באחד אינו עובר אוטומטית לעיסוק בשני.")
+                : pickByLanguage(lang,
+                        "Your background is in " + candidateProfessionLabel + ", and this " + jobProfessionLabel
+                                + " role is a different profession - even though it may share an industry or a few "
+                                + "keywords with your field, the core job itself calls for different training and experience.",
+                        "خلفيتك المهنية في " + candidateProfessionLabel + "، وهذه الوظيفة كـ " + jobProfessionLabel
+                                + " هي مهنة مختلفة - وعلى الرغم من أنها قد تشترك في نفس المجال أو بعض الكلمات المفتاحية "
+                                + "مع تخصصك، إلا أن جوهر هذه الوظيفة يتطلب تدريبًا وخبرة مختلفين.",
+                        "הרקע שלך הוא ב" + candidateProfessionLabel + ", ותפקיד " + jobProfessionLabel
+                                + " הוא מקצוע שונה - למרות ששניהם עשויים לשתף תעשייה או כמה מילות מפתח עם התחום שלך, "
+                                + "מהות התפקיד דורשת הכשרה וניסיון שונים."));
     }
 
     // Persists a pre-filter skip through the exact same code path an AI "unrelated" verdict
@@ -537,6 +605,11 @@ public class JobMatchService {
 
         applyParsedMatchToScore(score, synthetic, job, analysis, email, jobId,
                 cvFingerprint, jobFingerprint, jobContentFingerprint);
+
+        seedDeterministicNarrative(email, jobId, cvFingerprint, jobFingerprint, lang -> pickByLanguage(lang,
+                "Based on your profile, this role appears to be in a different field.",
+                "استنادًا إلى ملفك الشخصي، يبدو أن هذه الوظيفة في مجال مختلف.",
+                "בהתבסס על הפרופיל שלך, נראה שתפקיד זה שייך לתחום אחר."));
     }
 
     public record MatchScoresResult(boolean hasAnalysis, List<Map<String, Object>> matches) {}
@@ -964,14 +1037,16 @@ public class JobMatchService {
                 JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
                 applyInsufficientDataVerdict(score, email, job.getId(),
                         cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()));
-                cachedByJobId.put(job.getId(), jobMatchScoreRepositorySafeSave(score, email, job.getId()));
+                JobMatchScore saved = jobMatchScoreRepositorySafeSave(score, email, job.getId());
+                cachedByJobId.put(job.getId(), saved);
             } else if (isStale && isHardBlockedProfessionTier(checkProfessionCompatibility(analysis, job))) {
                 ProfessionTaxonomy.CompatibilityTier tier = checkProfessionCompatibility(analysis, job);
                 matchMetrics.recordProfessionIncompatible();
                 JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
                 applyProfessionIncompatibleVerdict(score, job, analysis, email, job.getId(),
                         cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()), tier);
-                cachedByJobId.put(job.getId(), jobMatchScoreRepositorySafeSave(score, email, job.getId()));
+                JobMatchScore saved = jobMatchScoreRepositorySafeSave(score, email, job.getId());
+                cachedByJobId.put(job.getId(), saved);
             } else if (isStale) {
                 jobsNeedingComputation.add(job);
             }
@@ -1410,7 +1485,21 @@ public class JobMatchService {
         if (core == null || core.getFieldRelated() == null) {
             // Core computation failed for this job even after its own validation-guided retry -
             // fieldRelated=null is ensureCoreScores' honest sentinel, never a real AI verdict.
+            // CACHE READ ONLY, same as the fieldRelated=false branch below: the insufficient-data
+            // verdict already seeded this row for every supported language, so this is a real
+            // localization for that case; the ephemeral "computation failed" sentinel is
+            // intentionally never persisted, so it always falls back to its own English text.
             String reason = core != null ? core.getMatchReason() : null;
+            JobMatchNarrative localizedInsufficient = core != null ? jobMatchNarrativeRepository
+                    .findByCandidateEmailAndJobIdAndLanguage(email, job.getId(), language)
+                    .orElse(null) : null;
+            boolean localizedFresh = localizedInsufficient != null
+                    && localizedInsufficient.getMatchReason() != null && !localizedInsufficient.getMatchReason().isBlank()
+                    && java.util.Objects.equals(core.getCvFingerprint(), localizedInsufficient.getCvFingerprint())
+                    && java.util.Objects.equals(core.getJobFingerprint(), localizedInsufficient.getJobFingerprint());
+            if (localizedFresh) {
+                reason = localizedInsufficient.getMatchReason();
+            }
             return new MatchDetailResult(true, job.getId(), null,
                     reason != null && !reason.isBlank() ? reason
                             : "We couldn't compute your match for this job right now. Please try again shortly.",
@@ -1430,7 +1519,22 @@ public class JobMatchService {
         if (!fieldRelated) {
             // Already decided by the core computation - no LLM call needed, and no risk of a
             // detail-only prompt second-guessing a "not a fit" verdict the list already showed.
-            return new MatchDetailResult(true, job.getId(), null, core.getMatchReason(),
+            // A CACHE READ ONLY (never translateJobMatchNarrative) - deterministic verdicts (the
+            // profession-taxonomy gate, the embedding pre-filter) already seeded this row for
+            // every supported language via seedDeterministicNarrative, so this is a real
+            // localization for those; a genuine AI-decided "unrelated" verdict has no such row and
+            // simply falls back to core's own (English) text exactly as before, never triggering a
+            // translate call from this branch.
+            JobMatchNarrative localizedUnrelated = jobMatchNarrativeRepository
+                    .findByCandidateEmailAndJobIdAndLanguage(email, job.getId(), language)
+                    .orElse(null);
+            boolean localizedFresh = localizedUnrelated != null
+                    && localizedUnrelated.getMatchReason() != null && !localizedUnrelated.getMatchReason().isBlank()
+                    && java.util.Objects.equals(core.getCvFingerprint(), localizedUnrelated.getCvFingerprint())
+                    && java.util.Objects.equals(core.getJobFingerprint(), localizedUnrelated.getJobFingerprint());
+            String unrelatedReason = localizedFresh ? localizedUnrelated.getMatchReason() : core.getMatchReason();
+
+            return new MatchDetailResult(true, job.getId(), null, unrelatedReason,
                     List.of(), List.of(), List.of(), List.of(), List.of(),
                     "A meaningful evaluation isn't possible for this job given the field mismatch.",
                     false, false, null, null, null, null, null, null, null, List.of(), List.of(),

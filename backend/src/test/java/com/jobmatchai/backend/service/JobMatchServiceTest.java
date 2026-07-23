@@ -3,8 +3,10 @@ package com.jobmatchai.backend.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jobmatchai.backend.model.CVAnalysis;
 import com.jobmatchai.backend.model.Job;
+import com.jobmatchai.backend.model.JobMatchNarrative;
 import com.jobmatchai.backend.model.JobMatchScore;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
+import com.jobmatchai.backend.repository.JobMatchNarrativeRepository;
 import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -20,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -44,6 +47,9 @@ class JobMatchServiceTest {
     private JobMatchScoreRepository jobMatchScoreRepository;
 
     @Mock
+    private JobMatchNarrativeRepository jobMatchNarrativeRepository;
+
+    @Mock
     private NotificationService notificationService;
 
     @Mock
@@ -66,11 +72,25 @@ class JobMatchServiceTest {
     private final ObjectMapper objectMapper = new ObjectMapper();
     private static final String EMAIL = "candidate@example.com";
 
+    // A real (in-memory) fake rather than a stateless stub: production code now seeds a
+    // JobMatchNarrative row for a deterministic verdict and expects find() to see that exact row
+    // moments later in the SAME request (see JobMatchService.seedDeterministicNarrative) - a
+    // stateless `thenReturn(Optional.empty())` mock can never reflect that read-your-own-write,
+    // which would make every "never calls AI" assertion below pass for the wrong reason (the mock
+    // just always reporting a miss, rather than production code genuinely finding its own seeded
+    // cache entry).
+    private final Map<String, JobMatchNarrative> narrativeStore = new ConcurrentHashMap<>();
+
+    private static String narrativeKey(String email, Long jobId, String language) {
+        return email + "::" + jobId + "::" + language;
+    }
+
     @BeforeEach
     void setUp() {
         jobMatchService = new JobMatchService();
         ReflectionTestUtils.setField(jobMatchService, "cvAnalysisRepository", cvAnalysisRepository);
         ReflectionTestUtils.setField(jobMatchService, "jobMatchScoreRepository", jobMatchScoreRepository);
+        ReflectionTestUtils.setField(jobMatchService, "jobMatchNarrativeRepository", jobMatchNarrativeRepository);
         ReflectionTestUtils.setField(jobMatchService, "notificationService", notificationService);
         ReflectionTestUtils.setField(jobMatchService, "openAICVAnalysisService", openAICVAnalysisService);
         ReflectionTestUtils.setField(jobMatchService, "matchMetrics", matchMetrics);
@@ -90,6 +110,27 @@ class JobMatchServiceTest {
         // save() is NEVER called for an unvalidated result - that's the behavior under test,
         // not an oversight, so it must not trip strict-stubs' unused-stub check.
         lenient().when(jobMatchScoreRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        // Backed by narrativeStore (see its own comment) instead of a fixed thenReturn - find()
+        // must see whatever save() most recently wrote for the same (email, jobId, language) key,
+        // exactly like the real JpaRepository this is standing in for.
+        lenient().when(jobMatchNarrativeRepository.findByCandidateEmailAndJobIdAndLanguage(any(), any(), any()))
+                .thenAnswer(invocation -> Optional.ofNullable(narrativeStore.get(narrativeKey(
+                        invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2)))));
+        lenient().when(jobMatchNarrativeRepository.findByCandidateEmailAndJobIdInAndLanguage(any(), any(), any()))
+                .thenAnswer(invocation -> {
+                    String email = invocation.getArgument(0);
+                    List<Long> jobIds = invocation.getArgument(1);
+                    String language = invocation.getArgument(2);
+                    return jobIds.stream()
+                            .map(jobId -> narrativeStore.get(narrativeKey(email, jobId, language)))
+                            .filter(java.util.Objects::nonNull)
+                            .toList();
+                });
+        lenient().when(jobMatchNarrativeRepository.save(any())).thenAnswer(invocation -> {
+            JobMatchNarrative narrative = invocation.getArgument(0);
+            narrativeStore.put(narrativeKey(narrative.getCandidateEmail(), narrative.getJobId(), narrative.getLanguage()), narrative);
+            return narrative;
+        });
     }
 
     // ---- fixtures ----
@@ -331,6 +372,72 @@ class JobMatchServiceTest {
         assertIncompatible(lawyer, job(107L, "Police Officer", "Law enforcement, patrol", "Police academy graduate required."));
         assertIncompatible(teacher, job(108L, "Social Worker", "Case management, client advocacy", "MSW preferred."));
         assertIncompatible(mechanicalEngineer, job(109L, "Civil Engineer", "Structural analysis, site planning", "PE license preferred."));
+
+        verifyNoInteractions(openAICVAnalysisService);
+    }
+
+    // ---- deterministic verdicts must return the CORRECT localized narrative, seed EVERY
+    // supported language's cache row up front, make ZERO OpenAI calls in ANY of those languages,
+    // and never let the score itself (matchPercent/fieldRelated/insufficientData) vary by
+    // language - see JobMatchService.seedDeterministicNarrative. Covers the exact regression this
+    // was written for: translateJobMatchNarrative being reached for a result backend rules alone
+    // already decided, the moment a non-English language was requested. ----
+
+    @Test
+    void insufficientData_returnsLocalizedNarrativeInEveryLanguage_seedsCacheAndNeverCallsAi() {
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(doctorAnalysis()));
+        Job titleOnlyJob = new Job("Doctor", "Acme Co", null, "Tel Aviv", "Full-time", "20000", "", "", "");
+        titleOnlyJob.setId(500L);
+
+        Map<String, String> expectedByLanguage = Map.of(
+                "en", "Not enough job information to calculate a reliable match.",
+                "ar", "لا تتوفر معلومات كافية عن الوظيفة لحساب نسبة تطابق موثوقة.",
+                "he", "אין מספיק מידע על המשרה כדי לחשב התאמה אמינה.");
+
+        for (String language : List.of("en", "ar", "he")) {
+            JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(titleOnlyJob), language);
+            Map<String, Object> match = result.matches().get(0);
+
+            assertThat(match.get("matchReason")).as("language=" + language).isEqualTo(expectedByLanguage.get(language));
+            assertThat(match.get("insufficientData")).as("language=" + language).isEqualTo(true);
+            assertThat(match.get("fieldRelated")).as("language=" + language).isNull();
+            assertThat(match.get("matchPercent")).as("language=" + language).isNull();
+        }
+
+        // The very first (English) computation must have eagerly seeded ALL THREE supported
+        // languages' rows, not just the one that request actually asked for.
+        for (String language : List.of("en", "ar", "he")) {
+            JobMatchNarrative seeded = narrativeStore.get(narrativeKey(EMAIL, titleOnlyJob.getId(), language));
+            assertThat(seeded).as("seeded narrative for language=" + language).isNotNull();
+            assertThat(seeded.getMatchReason()).isEqualTo(expectedByLanguage.get(language));
+        }
+
+        verifyNoInteractions(openAICVAnalysisService);
+    }
+
+    @Test
+    void professionIncompatible_returnsLocalizedNarrativeInEveryLanguage_seedsCacheAndNeverCallsAi() {
+        when(cvAnalysisRepository.findByUserEmail(EMAIL)).thenReturn(Optional.of(doctorAnalysis()));
+        Job nurseJob = job(501L, "Registered Nurse", "Patient care, Nursing license, Medication administration",
+                "Requires an active nursing license.");
+
+        for (String language : List.of("en", "ar", "he")) {
+            JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(nurseJob), language);
+            Map<String, Object> match = result.matches().get(0);
+
+            assertThat(match.get("fieldRelated")).as("language=" + language).isEqualTo(false);
+            assertThat(match.get("matchPercent")).as("language=" + language).isNull();
+            assertThat((String) match.get("matchReason")).as("language=" + language).isNotBlank();
+        }
+
+        // Each supported language got its OWN localized template (not the English text reused
+        // verbatim for ar/he), while still naming the candidate's actual profession in every one.
+        String en = narrativeStore.get(narrativeKey(EMAIL, nurseJob.getId(), "en")).getMatchReason();
+        String ar = narrativeStore.get(narrativeKey(EMAIL, nurseJob.getId(), "ar")).getMatchReason();
+        String he = narrativeStore.get(narrativeKey(EMAIL, nurseJob.getId(), "he")).getMatchReason();
+        assertThat(en).contains("Doctor");
+        assertThat(ar).contains("Doctor").isNotEqualTo(en);
+        assertThat(he).contains("Doctor").isNotEqualTo(en).isNotEqualTo(ar);
 
         verifyNoInteractions(openAICVAnalysisService);
     }
