@@ -5,8 +5,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import com.jobmatchai.backend.model.CVAnalysis;
 import com.jobmatchai.backend.model.CandidateAiSummary;
+import com.jobmatchai.backend.model.CandidateAiSummaryNarrative;
 import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
+import com.jobmatchai.backend.repository.CandidateAiSummaryNarrativeRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
 import com.jobmatchai.backend.util.HashUtil;
 import com.jobmatchai.backend.util.MatchLabelUtil;
@@ -30,6 +32,9 @@ public class CandidateSummaryService {
 
     @Autowired
     private CandidateAiSummaryRepository candidateAiSummaryRepository;
+
+    @Autowired
+    private CandidateAiSummaryNarrativeRepository candidateAiSummaryNarrativeRepository;
 
     @Autowired
     private OpenAICVAnalysisService openAICVAnalysisService;
@@ -98,7 +103,7 @@ public class CandidateSummaryService {
                 log.info("[AI-SUMMARY] candidate={} jobId={} -> cache HIT (matchScore={}, matchLabel={}); OpenAI NOT called",
                         candidateEmail, job.getId(), cached.getMatchScore(), MatchLabelUtil.fromScore(cached.getMatchScore()));
 
-                return toResult(cached);
+                return resolveWithNarrative(cached, language, false);
             }
 
             log.info("[AI-SUMMARY] candidate={} jobId={} -> cache MISS ({}); calling OpenAI now",
@@ -141,19 +146,100 @@ public class CandidateSummaryService {
             log.info("[AI-SUMMARY] candidate={} jobId={} -> generated and saved new matchScore={}, matchLabel={}",
                     candidateEmail, job.getId(), resolved.getMatchScore(), MatchLabelUtil.fromScore(resolved.getMatchScore()));
 
-            return toResult(resolved);
+            return resolveWithNarrative(resolved, language, true);
         }
     }
 
-    private SummaryResult toResult(CandidateAiSummary resolved) {
+    // Resolves the narrative text (professionalBackground/strengths/weaknesses/overallSuitability)
+    // for `language`, independently of `resolved`'s own matchScore/keySkills/yearsOfExperience
+    // (which are ALWAYS taken from `resolved` regardless of language - never recomputed, never
+    // duplicated). `freshlyGeneratedInLanguage` is true only when `resolved` was JUST generated (or
+    // regenerated) by computeCandidateSummary using `language` as its target language - in that
+    // case its own text fields ARE already the correct-language text, so this seeds the narrative
+    // cache directly from them instead of paying for a redundant self-translate call.
+    private SummaryResult resolveWithNarrative(CandidateAiSummary resolved, String language, boolean freshlyGeneratedInLanguage) {
+        String candidateEmail = resolved.getCandidateEmail();
+        Long jobId = resolved.getJobId();
+
+        if (freshlyGeneratedInLanguage) {
+            CandidateAiSummaryNarrative narrative = candidateAiSummaryNarrativeRepository
+                    .findByCandidateEmailAndJobIdAndLanguage(candidateEmail, jobId, language)
+                    .orElse(new CandidateAiSummaryNarrative());
+            narrative.setCandidateEmail(candidateEmail);
+            narrative.setJobId(jobId);
+            narrative.setLanguage(language);
+            narrative.setProfessionalBackground(resolved.getProfessionalBackground());
+            narrative.setStrengths(resolved.getStrengths());
+            narrative.setWeaknesses(resolved.getWeaknesses());
+            narrative.setOverallSuitability(resolved.getOverallSuitability());
+            narrative.setCvFingerprint(resolved.getCvFingerprint());
+            narrative.setJobFingerprint(resolved.getJobFingerprint());
+            candidateAiSummaryNarrativeRepository.save(narrative);
+
+            log.info("[AI-SUMMARY-NARRATIVE] candidate={} jobId={} language={} -> native generation, seeded narrative cache",
+                    candidateEmail, jobId, language);
+
+            return toResult(resolved, resolved.getProfessionalBackground(), resolved.getStrengths(),
+                    resolved.getWeaknesses(), resolved.getOverallSuitability());
+        }
+
+        CandidateAiSummaryNarrative cachedNarrative = candidateAiSummaryNarrativeRepository
+                .findByCandidateEmailAndJobIdAndLanguage(candidateEmail, jobId, language)
+                .orElse(null);
+
+        boolean narrativeStale = cachedNarrative == null
+                || !resolved.getCvFingerprint().equals(cachedNarrative.getCvFingerprint())
+                || !resolved.getJobFingerprint().equals(cachedNarrative.getJobFingerprint());
+
+        if (!narrativeStale) {
+            log.info("[AI-SUMMARY-NARRATIVE] candidate={} jobId={} language={} -> cache HIT; OpenAI NOT called",
+                    candidateEmail, jobId, language);
+            return toResult(resolved, cachedNarrative.getProfessionalBackground(), cachedNarrative.getStrengths(),
+                    cachedNarrative.getWeaknesses(), cachedNarrative.getOverallSuitability());
+        }
+
+        log.info("[AI-SUMMARY-NARRATIVE] candidate={} jobId={} language={} -> cache MISS ({}); translating now",
+                candidateEmail, jobId, language,
+                cachedNarrative == null ? "no translation saved yet" : "CV or job content changed since last translation");
+
+        String translated = openAICVAnalysisService.translateCandidateSummaryNarrative(
+                resolved.getProfessionalBackground(), resolved.getStrengths(), resolved.getWeaknesses(),
+                resolved.getOverallSuitability(), language);
+        JsonNode json = readObject(translated);
+
+        String professionalBackground = json.path("professionalBackground").asText(resolved.getProfessionalBackground());
+        String strengths = json.path("strengths").asText(resolved.getStrengths());
+        String weaknesses = json.path("weaknesses").asText(resolved.getWeaknesses());
+        String overallSuitability = json.path("overallSuitability").asText(resolved.getOverallSuitability());
+
+        CandidateAiSummaryNarrative narrative = cachedNarrative != null ? cachedNarrative : new CandidateAiSummaryNarrative();
+        narrative.setCandidateEmail(candidateEmail);
+        narrative.setJobId(jobId);
+        narrative.setLanguage(language);
+        narrative.setProfessionalBackground(professionalBackground);
+        narrative.setStrengths(strengths);
+        narrative.setWeaknesses(weaknesses);
+        narrative.setOverallSuitability(overallSuitability);
+        narrative.setCvFingerprint(resolved.getCvFingerprint());
+        narrative.setJobFingerprint(resolved.getJobFingerprint());
+        candidateAiSummaryNarrativeRepository.save(narrative);
+
+        log.info("[AI-SUMMARY-NARRATIVE] candidate={} jobId={} language={} -> translated and saved",
+                candidateEmail, jobId, language);
+
+        return toResult(resolved, professionalBackground, strengths, weaknesses, overallSuitability);
+    }
+
+    private SummaryResult toResult(CandidateAiSummary resolved, String professionalBackground, String strengths,
+            String weaknesses, String overallSuitability) {
         return new SummaryResult(
                 true,
-                resolved.getProfessionalBackground(),
+                professionalBackground,
                 splitToList(resolved.getKeySkills()),
                 resolved.getYearsOfExperience(),
-                resolved.getStrengths(),
-                resolved.getWeaknesses(),
-                resolved.getOverallSuitability(),
+                strengths,
+                weaknesses,
+                overallSuitability,
                 resolved.getMatchScore(),
                 MatchLabelUtil.fromScore(resolved.getMatchScore()),
                 MatchLabelUtil.recommendationFromScore(resolved.getMatchScore())

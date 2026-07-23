@@ -4,9 +4,11 @@ import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
+import com.jobmatchai.backend.repository.CandidateAiSummaryNarrativeRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
 import com.jobmatchai.backend.repository.EmailVerificationCodeRepository;
 import com.jobmatchai.backend.repository.InterviewRepository;
+import com.jobmatchai.backend.repository.JobMatchNarrativeRepository;
 import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.MatchScoreJobRepository;
@@ -47,10 +49,16 @@ public class UserDeletionService {
     private JobMatchScoreRepository jobMatchScoreRepository;
 
     @Autowired
+    private JobMatchNarrativeRepository jobMatchNarrativeRepository;
+
+    @Autowired
     private MatchScoreJobRepository matchScoreJobRepository;
 
     @Autowired
     private CandidateAiSummaryRepository candidateAiSummaryRepository;
+
+    @Autowired
+    private CandidateAiSummaryNarrativeRepository candidateAiSummaryNarrativeRepository;
 
     @Autowired
     private InterviewRepository interviewRepository;
@@ -94,8 +102,10 @@ public class UserDeletionService {
         applicationRepository.deleteByCandidateEmail(email);
         savedJobRepository.deleteByCandidateEmail(email);
         jobMatchScoreRepository.deleteByCandidateEmail(email);
+        jobMatchNarrativeRepository.deleteByCandidateEmail(email);
         matchScoreJobRepository.deleteByCandidateEmail(email);
         candidateAiSummaryRepository.deleteByCandidateEmail(email);
+        candidateAiSummaryNarrativeRepository.deleteByCandidateEmail(email);
         interviewRepository.deleteByCandidateEmail(email);
         messageRepository.deleteByRecipientEmail(email);
         recentlyViewedJobRepository.deleteByCandidateEmail(email);
@@ -113,8 +123,10 @@ public class UserDeletionService {
             if (!jobIds.isEmpty()) {
                 savedJobRepository.deleteByJobIdInAndJobType(jobIds, "internal");
                 jobMatchScoreRepository.deleteByJobIdIn(jobIds);
+                jobMatchNarrativeRepository.deleteByJobIdIn(jobIds);
                 matchScoreJobRepository.deleteByJobIdInAndJobType(jobIds, "internal");
                 candidateAiSummaryRepository.deleteByJobIdIn(jobIds);
+                candidateAiSummaryNarrativeRepository.deleteByJobIdIn(jobIds);
                 recentlyViewedJobRepository.deleteByJobIdInAndJobType(jobIds, "internal");
             }
 

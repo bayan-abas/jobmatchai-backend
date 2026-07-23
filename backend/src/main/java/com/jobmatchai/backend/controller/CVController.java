@@ -8,6 +8,7 @@ import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CVAnalysisCacheRepository;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
+import com.jobmatchai.backend.repository.JobMatchNarrativeRepository;
 import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.MatchScoreJobRepository;
@@ -72,6 +73,9 @@ public class CVController {
 
     @Autowired
     private JobMatchScoreRepository jobMatchScoreRepository;
+
+    @Autowired
+    private JobMatchNarrativeRepository jobMatchNarrativeRepository;
 
     @Autowired
     private MatchScoreJobRepository matchScoreJobRepository;
@@ -293,6 +297,7 @@ public class CVController {
             // leaving them as invisible orphans, is what actually frees the DB space and keeps a
             // subsequent re-upload from having any stale state to collide with.
             jobMatchScoreRepository.deleteByCandidateEmail(email);
+            jobMatchNarrativeRepository.deleteByCandidateEmail(email);
             matchScoreJobRepository.deleteByCandidateEmail(email);
 
             return ResponseEntity.ok("CV deleted successfully");
@@ -660,6 +665,7 @@ public class CVController {
     // guarantee instead of something that only happens incidentally as each job is next viewed.
     private void discardStaleMatchScores(String email) {
         jobMatchScoreRepository.deleteByCandidateEmail(email);
+        jobMatchNarrativeRepository.deleteByCandidateEmail(email);
         matchScoreJobRepository.deleteByCandidateEmail(email);
     }
 

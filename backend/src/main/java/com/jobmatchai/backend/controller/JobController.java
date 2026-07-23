@@ -7,6 +7,7 @@ import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.model.JobMatchScore;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
+import com.jobmatchai.backend.repository.JobMatchNarrativeRepository;
 import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.MatchScoreJobRepository;
@@ -49,6 +50,9 @@ public class JobController {
 
     @Autowired
     private JobMatchScoreRepository jobMatchScoreRepository;
+
+    @Autowired
+    private JobMatchNarrativeRepository jobMatchNarrativeRepository;
 
     @Autowired
     private MatchScoreJobRepository matchScoreJobRepository;
@@ -405,6 +409,7 @@ public class JobController {
             // deleted job can never be recomputed for, so leaving these behind would just be
             // permanent orphans (the worker's own jobId lookups would all resolve to nothing).
             jobMatchScoreRepository.deleteByJobIdIn(List.of(id));
+            jobMatchNarrativeRepository.deleteByJobIdIn(List.of(id));
             matchScoreJobRepository.deleteByJobIdInAndJobType(List.of(id), "internal");
             jobRepository.deleteById(id);
 

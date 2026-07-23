@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jobmatchai.backend.model.ExternalJob;
 import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.repository.ExternalJobRepository;
+import com.jobmatchai.backend.repository.JobMatchNarrativeRepository;
 import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.repository.MatchScoreJobRepository;
 import com.jobmatchai.backend.service.provider.ExternalJobData;
@@ -48,6 +49,9 @@ public class ExternalJobService {
 
     @Autowired
     private JobMatchScoreRepository jobMatchScoreRepository;
+
+    @Autowired
+    private JobMatchNarrativeRepository jobMatchNarrativeRepository;
 
     @Autowired
     private MatchScoreJobRepository matchScoreJobRepository;
@@ -729,6 +733,7 @@ public class ExternalJobService {
         // jobType column - see MatchScoreJob's own comment for why the two differ.
         List<Long> offsetIds = idsToPrune.stream().map(id -> EXTERNAL_ID_OFFSET + id).toList();
         jobMatchScoreRepository.deleteByJobIdIn(offsetIds);
+        jobMatchNarrativeRepository.deleteByJobIdIn(offsetIds);
         matchScoreJobRepository.deleteByJobIdInAndJobType(idsToPrune, "external");
 
         // Not wrapped in one @Transactional spanning all three deletes: pruneExpiredJobs is a

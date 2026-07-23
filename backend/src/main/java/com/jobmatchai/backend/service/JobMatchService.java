@@ -5,8 +5,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import com.jobmatchai.backend.model.CVAnalysis;
 import com.jobmatchai.backend.model.Job;
+import com.jobmatchai.backend.model.JobMatchNarrative;
 import com.jobmatchai.backend.model.JobMatchScore;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
+import com.jobmatchai.backend.repository.JobMatchNarrativeRepository;
 import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.util.HashUtil;
 import com.jobmatchai.backend.util.SkillClaimMatcher;
@@ -65,6 +67,9 @@ public class JobMatchService {
     private JobMatchScoreRepository jobMatchScoreRepository;
 
     @Autowired
+    private JobMatchNarrativeRepository jobMatchNarrativeRepository;
+
+    @Autowired
     private com.jobmatchai.backend.repository.JobRepository jobRepository;
 
     @Autowired
@@ -111,6 +116,14 @@ public class JobMatchService {
     // backstop for the same race.
     private final ConcurrentHashMap<String, CompletableFuture<JobMatchScore>> inFlightComputations =
             new ConcurrentHashMap<>();
+
+    // Guards the read-or-translate-and-save sequence for a single (candidateEmail, jobId,
+    // language) narrative row (see resolveMatchReason/resolveDetailNarrative below) so two
+    // concurrent requests for the same candidate+job in the same not-yet-cached language can't
+    // both call translateJobMatchNarrative and race on JobMatchNarrative's unique constraint.
+    // Only ever acquired AFTER the core JobMatchScore is already resolved - never held while
+    // waiting on inFlightComputations - so this can't deadlock against that map.
+    private final ConcurrentHashMap<String, Object> narrativeLocks = new ConcurrentHashMap<>();
 
     // Bump this whenever the AI prompt/response schema for computeJobMatches changes, OR
     // whenever a fix could change what the AI decides for an already-cached candidate+job pair
@@ -587,13 +600,23 @@ public class JobMatchService {
 
         Map<Long, JobMatchScore> cachedByJobId = ensureCoreScores(email, jobs, language, analysis);
 
+        // Batch-loaded once for the whole page of jobs (not per-job) to avoid N+1 queries -
+        // resolveMatchReason falls through to its own single-job translate-and-save only for
+        // whichever jobs this preloaded map doesn't already have a fresh row for.
+        List<Long> jobIds = jobs.stream().map(Job::getId).toList();
+        Map<Long, JobMatchNarrative> narrativeByJobId = new HashMap<>();
+        for (JobMatchNarrative narrative : jobMatchNarrativeRepository.findByCandidateEmailAndJobIdInAndLanguage(email, jobIds, language)) {
+            narrativeByJobId.put(narrative.getJobId(), narrative);
+        }
+
         List<Map<String, Object>> matches = new ArrayList<>();
         for (Job job : jobs) {
             JobMatchScore score = cachedByJobId.get(job.getId());
             if (score == null) {
                 continue;
             }
-            matches.add(scoreToPayload(score, job));
+            String matchReason = resolveMatchReason(email, score, language, narrativeByJobId.get(job.getId()));
+            matches.add(scoreToPayload(score, job, matchReason));
         }
 
         return new MatchScoresResult(true, matches);
@@ -601,7 +624,7 @@ public class JobMatchService {
 
     // Shared by getMatchScores (the synchronous list) and computeMatchScoresStreaming (progressive
     // per-job SSE payloads) - one place that defines what a "match" looks like over the wire.
-    private Map<String, Object> scoreToPayload(JobMatchScore score, Job job) {
+    private Map<String, Object> scoreToPayload(JobMatchScore score, Job job, String resolvedMatchReason) {
         Map<String, Object> match = new LinkedHashMap<>();
         match.put("jobId", score.getJobId());
         // fieldRelated is left as-is (including null) rather than coerced to true - null is
@@ -609,7 +632,7 @@ public class JobMatchService {
         // true would misrepresent a failed computation as a real, AI-decided verdict.
         match.put("fieldRelated", score.getFieldRelated());
         match.put("matchPercent", score.getMatchPercent());
-        match.put("matchReason", score.getMatchReason());
+        match.put("matchReason", resolvedMatchReason);
         match.put("insufficientData", Boolean.TRUE.equals(score.getInsufficientData()));
         match.put("matchedSkills", splitSkillsString(score.getMatchedSkills()));
         match.put("missingSkills", splitSkillsString(score.getMissingSkills()));
@@ -735,14 +758,14 @@ public class JobMatchService {
 
                 if (!isStale) {
                     matchMetrics.recordCacheHit(jobType);
-                    onJobResult.accept(job.getId(), scoreToPayload(cached, job));
+                    onJobResult.accept(job.getId(), scoreToPayload(cached, job, resolveMatchReason(email, cached, language, null)));
                 } else if (isInsufficientJobData(job)) {
                     matchMetrics.recordInsufficientData();
                     JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
                     applyInsufficientDataVerdict(score, email, job.getId(),
                             cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()));
                     score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
-                    onJobResult.accept(job.getId(), scoreToPayload(score, job));
+                    onJobResult.accept(job.getId(), scoreToPayload(score, job, resolveMatchReason(email, score, language, null)));
                 } else {
                     ProfessionTaxonomy.CompatibilityTier tier = checkProfessionCompatibility(analysis, job);
                     if (isHardBlockedProfessionTier(tier)) {
@@ -751,7 +774,7 @@ public class JobMatchService {
                         applyProfessionIncompatibleVerdict(score, job, analysis, email, job.getId(),
                                 cvFingerprint, jobFingerprint, jobContentFingerprints.get(job.getId()), tier);
                         score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
-                        onJobResult.accept(job.getId(), scoreToPayload(score, job));
+                        onJobResult.accept(job.getId(), scoreToPayload(score, job, resolveMatchReason(email, score, language, null)));
                     } else {
                         matchMetrics.recordCacheMiss(jobType);
                         jobsNeedingComputation.add(job);
@@ -803,7 +826,7 @@ public class JobMatchService {
                 applyPrefilteredUnrelatedVerdict(score, job, analysis, email, job.getId(),
                         cvFingerprint, jobFingerprints.get(job.getId()), jobContentFingerprints.get(job.getId()));
                 score = jobMatchScoreRepositorySafeSave(score, email, job.getId());
-                onJobResult.accept(job.getId(), scoreToPayload(score, job));
+                onJobResult.accept(job.getId(), scoreToPayload(score, job, resolveMatchReason(email, score, language, null)));
             } else {
                 jobsSentToAi.add(job);
             }
@@ -844,7 +867,9 @@ public class JobMatchService {
                             email, jobId, similarity, fieldRelated);
                 }
 
-                Map<String, Object> payload = (score != null) ? scoreToPayload(score, job) : errorPayload(jobId, job);
+                Map<String, Object> payload = (score != null)
+                        ? scoreToPayload(score, job, resolveMatchReason(email, score, language, null))
+                        : errorPayload(jobId, job);
                 onJobResult.accept(jobId, payload);
 
                 if (remaining.decrementAndGet() == 0) {
@@ -1207,6 +1232,167 @@ public class JobMatchService {
         score.setLocationMatchPercent(weighted.componentPercents().get(ComponentKey.LOCATION));
     }
 
+    // Holds the language-resolved copy of JobMatchScore's narrative fields - matchReason plus the
+    // 4 detail-page fields - never a score. See resolveDetailNarrative/resolveMatchReason below.
+    private record ResolvedNarrative(
+            String matchReason, List<String> whyGoodMatch, List<String> whyNotPerfectMatch,
+            List<String> improvementSuggestions, String recommendation) {}
+
+    // Upserts a JobMatchNarrative row for `language` directly from `core`'s CURRENT canonical
+    // fields - called right after a NATIVE (re)generation in that exact language (either the
+    // batch scoring call for matchReason, or computeJobMatchDetail for the 4 detail fields), so
+    // the language that triggered the (re)generation never needs a redundant self-translate call
+    // the first time it's read back. `includeDetailFields=false` (list-view-only path) leaves any
+    // existing detail fields on the row untouched rather than clobbering them with null.
+    private void seedNativeNarrative(String email, JobMatchScore core, String language, boolean includeDetailFields) {
+        JobMatchNarrative narrative = jobMatchNarrativeRepository
+                .findByCandidateEmailAndJobIdAndLanguage(email, core.getJobId(), language)
+                .orElse(new JobMatchNarrative());
+        narrative.setCandidateEmail(email);
+        narrative.setJobId(core.getJobId());
+        narrative.setLanguage(language);
+        narrative.setMatchReason(core.getMatchReason());
+        narrative.setCvFingerprint(core.getCvFingerprint());
+        narrative.setJobFingerprint(core.getJobFingerprint());
+        if (includeDetailFields) {
+            narrative.setWhyGoodMatch(core.getWhyGoodMatch());
+            narrative.setWhyNotPerfectMatch(core.getWhyNotPerfectMatch());
+            narrative.setImprovementSuggestions(core.getImprovementSuggestions());
+            narrative.setRecommendation(core.getRecommendation());
+            narrative.setDetailPromptVersion(core.getDetailPromptVersion());
+        }
+        jobMatchNarrativeRepository.save(narrative);
+    }
+
+    // Resolves the 4 detail-page narrative fields (plus matchReason) for `language`, translating
+    // from core's canonical text ONLY when content is unchanged but this exact language hasn't
+    // been cached yet - never re-calling computeJobMatchDetail (which would risk a different
+    // languageMatchPercent/shouldApply on a fresh call). Every score field on `core` itself is
+    // completely untouched by this method.
+    private ResolvedNarrative resolveDetailNarrative(String email, JobMatchScore core, String language) {
+        String lockKey = email + "::" + core.getJobId() + "::" + language;
+        Object lock = narrativeLocks.computeIfAbsent(lockKey, k -> new Object());
+
+        synchronized (lock) {
+            JobMatchNarrative cached = jobMatchNarrativeRepository
+                    .findByCandidateEmailAndJobIdAndLanguage(email, core.getJobId(), language)
+                    .orElse(null);
+
+            boolean detailFieldsPresent = cached != null
+                    && cached.getRecommendation() != null && !cached.getRecommendation().isBlank();
+
+            boolean fresh = detailFieldsPresent
+                    && java.util.Objects.equals(core.getCvFingerprint(), cached.getCvFingerprint())
+                    && java.util.Objects.equals(core.getJobFingerprint(), cached.getJobFingerprint())
+                    && java.util.Objects.equals(core.getDetailPromptVersion(), cached.getDetailPromptVersion());
+
+            if (fresh) {
+                log.info("match-narrative-detail candidate={} jobId={} language={} -> cache HIT; OpenAI NOT called",
+                        email, core.getJobId(), language);
+                return new ResolvedNarrative(
+                        cached.getMatchReason() != null ? cached.getMatchReason() : core.getMatchReason(),
+                        splitSkillsString(cached.getWhyGoodMatch()),
+                        splitSkillsString(cached.getWhyNotPerfectMatch()),
+                        splitSkillsString(cached.getImprovementSuggestions()),
+                        cached.getRecommendation());
+            }
+
+            log.info("match-narrative-detail candidate={} jobId={} language={} -> cache MISS ({}); translating now",
+                    email, core.getJobId(), language,
+                    cached == null ? "no translation saved yet" : "content or detail-prompt version changed since last translation");
+
+            String translated = openAICVAnalysisService.translateJobMatchNarrative(
+                    core.getMatchReason(),
+                    splitSkillsString(core.getWhyGoodMatch()),
+                    splitSkillsString(core.getWhyNotPerfectMatch()),
+                    splitSkillsString(core.getImprovementSuggestions()),
+                    core.getRecommendation(),
+                    language);
+            JsonNode json = readDetailObject(translated);
+
+            String matchReason = json != null ? json.path("matchReason").asText(core.getMatchReason()) : core.getMatchReason();
+            List<String> whyGoodMatch = json != null && json.has("whyGoodMatch")
+                    ? toStringList(json.path("whyGoodMatch")) : splitSkillsString(core.getWhyGoodMatch());
+            List<String> whyNotPerfectMatch = json != null && json.has("whyNotPerfectMatch")
+                    ? toStringList(json.path("whyNotPerfectMatch")) : splitSkillsString(core.getWhyNotPerfectMatch());
+            List<String> improvementSuggestions = json != null && json.has("improvementSuggestions")
+                    ? toStringList(json.path("improvementSuggestions")) : splitSkillsString(core.getImprovementSuggestions());
+            String recommendation = json != null ? json.path("recommendation").asText(core.getRecommendation()) : core.getRecommendation();
+
+            JobMatchNarrative narrative = cached != null ? cached : new JobMatchNarrative();
+            narrative.setCandidateEmail(email);
+            narrative.setJobId(core.getJobId());
+            narrative.setLanguage(language);
+            narrative.setMatchReason(matchReason);
+            narrative.setWhyGoodMatch(String.join("|", whyGoodMatch));
+            narrative.setWhyNotPerfectMatch(String.join("|", whyNotPerfectMatch));
+            narrative.setImprovementSuggestions(String.join("|", improvementSuggestions));
+            narrative.setRecommendation(recommendation);
+            narrative.setCvFingerprint(core.getCvFingerprint());
+            narrative.setJobFingerprint(core.getJobFingerprint());
+            narrative.setDetailPromptVersion(core.getDetailPromptVersion());
+            jobMatchNarrativeRepository.save(narrative);
+
+            log.info("match-narrative-detail candidate={} jobId={} language={} -> translated and saved",
+                    email, core.getJobId(), language);
+
+            return new ResolvedNarrative(matchReason, whyGoodMatch, whyNotPerfectMatch, improvementSuggestions, recommendation);
+        }
+    }
+
+    // Resolves ONLY matchReason (the list-view sentence) for `language`, same translate-once-and-
+    // cache principle as resolveDetailNarrative but far cheaper - used by scoreToPayload for every
+    // job in a list/streaming response. Falls back to core's own matchReason untranslated if the
+    // translate call fails, rather than showing nothing.
+    private String resolveMatchReason(String email, JobMatchScore core, String language, JobMatchNarrative preloaded) {
+        if (core.getMatchReason() == null || core.getMatchReason().isBlank()) {
+            return core.getMatchReason();
+        }
+
+        boolean preloadedFresh = preloaded != null
+                && preloaded.getMatchReason() != null && !preloaded.getMatchReason().isBlank()
+                && java.util.Objects.equals(core.getCvFingerprint(), preloaded.getCvFingerprint())
+                && java.util.Objects.equals(core.getJobFingerprint(), preloaded.getJobFingerprint());
+
+        if (preloadedFresh) {
+            return preloaded.getMatchReason();
+        }
+
+        String lockKey = email + "::" + core.getJobId() + "::" + language;
+        Object lock = narrativeLocks.computeIfAbsent(lockKey, k -> new Object());
+
+        synchronized (lock) {
+            JobMatchNarrative cached = preloaded != null ? preloaded : jobMatchNarrativeRepository
+                    .findByCandidateEmailAndJobIdAndLanguage(email, core.getJobId(), language)
+                    .orElse(null);
+
+            boolean fresh = cached != null
+                    && cached.getMatchReason() != null && !cached.getMatchReason().isBlank()
+                    && java.util.Objects.equals(core.getCvFingerprint(), cached.getCvFingerprint())
+                    && java.util.Objects.equals(core.getJobFingerprint(), cached.getJobFingerprint());
+
+            if (fresh) {
+                return cached.getMatchReason();
+            }
+
+            String translated = openAICVAnalysisService.translateJobMatchNarrative(
+                    core.getMatchReason(), List.of(), List.of(), List.of(), null, language);
+            JsonNode json = readDetailObject(translated);
+            String matchReason = json != null ? json.path("matchReason").asText(core.getMatchReason()) : core.getMatchReason();
+
+            JobMatchNarrative narrative = cached != null ? cached : new JobMatchNarrative();
+            narrative.setCandidateEmail(email);
+            narrative.setJobId(core.getJobId());
+            narrative.setLanguage(language);
+            narrative.setMatchReason(matchReason);
+            narrative.setCvFingerprint(core.getCvFingerprint());
+            narrative.setJobFingerprint(core.getJobFingerprint());
+            jobMatchNarrativeRepository.save(narrative);
+
+            return matchReason;
+        }
+    }
+
     public MatchDetailResult getMatchDetail(String email, Job job, String language) {
         CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(email).orElse(null);
 
@@ -1300,23 +1486,39 @@ public class JobMatchService {
                 core.setDetailPromptVersion(DETAIL_PROMPT_VERSION);
 
                 core = jobMatchScoreRepository.save(core);
+
+                // This exact language just got a NATIVE (re)generation - seed its narrative cache
+                // row directly from what was just produced, so reading it back in this same
+                // language never pays for a redundant self-translate call.
+                seedNativeNarrative(email, core, language, true);
             }
             // A null/unparsable response leaves core's detail fields as whatever they were
             // (blank on first attempt, or the last successful generation if this was a retry) -
             // the core score itself is still shown correctly either way.
         }
 
+        // Only bother resolving a per-language narrative when the core actually has a completed
+        // narrative to translate from - if generation just failed above (json was null/unparsable
+        // and this was the very first attempt), core's fields are still blank/default, and
+        // translating blank text is pointless; fall through with core's own (blank) fields exactly
+        // as before this change.
+        ResolvedNarrative narrative = (core.getRecommendation() != null && !core.getRecommendation().isBlank())
+                ? resolveDetailNarrative(email, core, language)
+                : new ResolvedNarrative(core.getMatchReason(), splitSkillsString(core.getWhyGoodMatch()),
+                        splitSkillsString(core.getWhyNotPerfectMatch()), splitSkillsString(core.getImprovementSuggestions()),
+                        core.getRecommendation());
+
         return new MatchDetailResult(
                 true,
                 core.getJobId(),
                 core.getMatchPercent(),
-                core.getMatchReason(),
+                narrative.matchReason(),
                 matchedSkills,
                 missingSkills,
-                splitSkillsString(core.getWhyGoodMatch()),
-                splitSkillsString(core.getWhyNotPerfectMatch()),
-                splitSkillsString(core.getImprovementSuggestions()),
-                core.getRecommendation(),
+                narrative.whyGoodMatch(),
+                narrative.whyNotPerfectMatch(),
+                narrative.improvementSuggestions(),
+                narrative.recommendation(),
                 core.getShouldApply(),
                 fieldRelated,
                 core.getSkillsMatchPercent(),

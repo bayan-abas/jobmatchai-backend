@@ -831,6 +831,98 @@ Field instructions:
         }
     }
 
+    // Translation-only calls used when a candidate+job's score/analysis is already fully computed
+    // and unchanged, but the requesting caller's UI language differs from whatever language the
+    // narrative text currently on file is in (see JobMatchService#getMatchDetail/scoreToPayload
+    // and CandidateSummaryService#getCandidateSummary). Deliberately take ONLY text fields, never
+    // any score/number - unlike computeJobMatches/computeJobMatchDetail/computeCandidateSummary,
+    // which decide a score alongside their narrative, these two methods CANNOT alter any score,
+    // by construction, because no score is ever passed in or asked for. This is what lets a
+    // language switch be served without ever risking a different match percentage/component on a
+    // fresh AI call for the same candidate+job.
+    private String translateJsonFields(Map<String, Object> fields, String targetLanguage) {
+        try {
+            String languageName = switch (targetLanguage == null ? "en" : targetLanguage) {
+                case "ar" -> "Arabic";
+                case "he" -> "Hebrew";
+                default -> "English";
+            };
+
+            String fieldsJson;
+            try {
+                fieldsJson = objectMapper.writeValueAsString(fields);
+            } catch (Exception e) {
+                return "{}";
+            }
+
+            String prompt = """
+Return ONLY a raw valid JSON object. No markdown. No explanations outside the JSON.
+
+You are translating already-finalized text into """ + languageName + """
+. This text was already written and approved earlier in a different language - you are NOT
+evaluating, re-judging, or regenerating it, only translating it faithfully.
+
+STRICT RULES:
+- Do not add, remove, reinterpret, invent, or omit any information.
+- Do not change the meaning, tone, or level of detail of any sentence.
+- Do not change any numbers, percentages, or counts that might appear inside the text.
+- Preserve the exact same JSON keys and value shapes (string stays a string, array stays an
+  array with the same number of items) as the input below - translate each string value in
+  place, do not merge, split, reorder, or drop any array items.
+- If a value is an empty string or empty array in the input, return it unchanged (empty), do not
+  invent content for it.
+
+INPUT JSON (translate every string value in here into """ + languageName + """
+):
+""" + fieldsJson + """
+""";
+
+            Map<String, Object> body = Map.of(
+                    "model", model,
+                    "input", prompt,
+                    "store", false,
+                    "temperature", 0,
+                    "text", Map.of("format", Map.of("type", "json_object"))
+            );
+
+            Map<String, Object> response = callOpenAI(body);
+            String result = extractTextFromOpenAIResponse(response);
+
+            if (result == null || result.isBlank()) {
+                return "{}";
+            }
+
+            return result;
+
+        } catch (Exception e) {
+            log.error("translateJsonFields failed against OpenAI", e);
+            return "{}";
+        }
+    }
+
+    public String translateJobMatchNarrative(
+            String matchReason, List<String> whyGoodMatch, List<String> whyNotPerfectMatch,
+            List<String> improvementSuggestions, String recommendation, String targetLanguage) {
+        Map<String, Object> fields = new java.util.LinkedHashMap<>();
+        fields.put("matchReason", matchReason == null ? "" : matchReason);
+        fields.put("whyGoodMatch", whyGoodMatch == null ? List.of() : whyGoodMatch);
+        fields.put("whyNotPerfectMatch", whyNotPerfectMatch == null ? List.of() : whyNotPerfectMatch);
+        fields.put("improvementSuggestions", improvementSuggestions == null ? List.of() : improvementSuggestions);
+        fields.put("recommendation", recommendation == null ? "" : recommendation);
+        return translateJsonFields(fields, targetLanguage);
+    }
+
+    public String translateCandidateSummaryNarrative(
+            String professionalBackground, String strengths, String weaknesses,
+            String overallSuitability, String targetLanguage) {
+        Map<String, Object> fields = new java.util.LinkedHashMap<>();
+        fields.put("professionalBackground", professionalBackground == null ? "" : professionalBackground);
+        fields.put("strengths", strengths == null ? "" : strengths);
+        fields.put("weaknesses", weaknesses == null ? "" : weaknesses);
+        fields.put("overallSuitability", overallSuitability == null ? "" : overallSuitability);
+        return translateJsonFields(fields, targetLanguage);
+    }
+
     private String buildSingleJobBlock(Job job) {
         // No truncation - this explanation call must be grounded in the same complete
         // posting the match score itself was computed from (see buildJobsBlock).
