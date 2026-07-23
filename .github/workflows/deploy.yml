@@ -1,0 +1,74 @@
+name: Deploy Backend to Elastic Beanstalk
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: jobmatchai-backend-production
+  cancel-in-progress: false
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: backend/pom.xml
+
+      - name: Make Maven Wrapper executable
+        working-directory: backend
+        run: chmod +x mvnw
+
+      - name: Run backend tests
+        working-directory: backend
+        run: ./mvnw clean test
+
+      - name: Create Elastic Beanstalk deployment ZIP
+        working-directory: backend
+        run: |
+          zip -r ../Dockerfile.zip . \
+            -x "target/*" \
+               ".git/*" \
+               ".idea/*" \
+               ".vscode/*" \
+               "*.log" \
+               ".env"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-JobMatchAI-Deploy
+          aws-region: eu-central-1
+
+      - name: Deploy to Elastic Beanstalk
+        uses: aws-actions/aws-elasticbeanstalk-deploy@v1
+        with:
+          aws-region: eu-central-1
+          application-name: JobMatchAI
+          environment-name: JobMatchAI-env
+          deployment-package-path: Dockerfile.zip
+          version-label: github-${{ github.run_number }}-${{ github.sha }}
+          create-application-if-not-exists: false
+          create-environment-if-not-exists: false
+          wait-for-deployment: true
+          wait-for-environment-recovery: true
+          deployment-timeout: 1800
