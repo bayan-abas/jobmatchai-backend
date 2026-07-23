@@ -975,6 +975,24 @@ public class JobMatchService {
                     return null;
                 }
 
+                // Re-checked HERE (right before persisting), not just at the top of the request
+                // that kicked this off - `analysis`/`cvFingerprint` were captured when this
+                // CompletableFuture was created, but it runs on its own executor and can still be
+                // mid-flight (awaiting OpenAI) when a SEPARATE request replaces this candidate's
+                // CV, which deletes every JobMatchScore row via discardStaleMatchScores. Without
+                // this check, this stale computation would land afterwards and re-INSERT a row
+                // scored against the CV that no longer exists - silently resurrecting exactly the
+                // data discardStaleMatchScores was just asked to remove. Discarding (never saving,
+                // returning null) routes it through the same "please retry" path a genuine AI
+                // failure already uses, which is safe here: the NEXT request re-reads the current
+                // CV and recomputes correctly.
+                CVAnalysis currentAnalysis = cvAnalysisRepository.findByUserEmail(email).orElse(null);
+                if (currentAnalysis == null || !cvFingerprint.equals(fingerprintCv(currentAnalysis))) {
+                    log.info("match-scores-timing jobId={} candidate={} -> CV changed mid-computation, discarding stale result",
+                            job.getId(), email);
+                    return null;
+                }
+
                 ParsedMatch parsed = parseMatch(match);
                 JobMatchScore score = cachedByJobId.getOrDefault(job.getId(), new JobMatchScore());
                 applyParsedMatchToScore(score, parsed, job, analysis, email, job.getId(),

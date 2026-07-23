@@ -8,6 +8,8 @@ import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CVAnalysisCacheRepository;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
+import com.jobmatchai.backend.repository.CandidateAiSummaryNarrativeRepository;
+import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
 import com.jobmatchai.backend.repository.JobMatchNarrativeRepository;
 import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.repository.JobRepository;
@@ -79,6 +81,12 @@ public class CVController {
 
     @Autowired
     private MatchScoreJobRepository matchScoreJobRepository;
+
+    @Autowired
+    private CandidateAiSummaryRepository candidateAiSummaryRepository;
+
+    @Autowired
+    private CandidateAiSummaryNarrativeRepository candidateAiSummaryNarrativeRepository;
 
     @Autowired
     private FileStorageService fileStorageService;
@@ -658,15 +666,21 @@ public class CVController {
 
     // Called once a candidate's CV content is CONFIRMED different from what was last analyzed
     // (new upload, or the same account's CV replaced) and the new CVAnalysis is already safely
-    // saved - every JobMatchScore/MatchScoreJob row still on file at that point was computed
-    // against the OLD CV and is no longer valid. Deleting them outright (rather than leaving them
-    // for the existing cvFingerprint-mismatch check to quietly skip one job at a time) is what
-    // makes "upload a new CV -> every job gets re-analyzed against it" an explicit, immediate
-    // guarantee instead of something that only happens incidentally as each job is next viewed.
+    // saved - every JobMatchScore/MatchScoreJob/CandidateAiSummary row still on file at that
+    // point was computed against the OLD CV and is no longer valid. Deleting them outright
+    // (rather than leaving them for the existing cvFingerprint-mismatch check to quietly skip one
+    // row at a time) is what makes "upload a new CV -> every job/summary gets re-analyzed against
+    // it" an explicit, immediate guarantee instead of something that only happens incidentally as
+    // each one is next viewed. Also covers the two per-language narrative caches
+    // (JobMatchNarrative/CandidateAiSummaryNarrative) - without this they'd be orphaned rows that
+    // linger indefinitely (never read back once their parent score/summary row is gone, but never
+    // cleaned up either).
     private void discardStaleMatchScores(String email) {
         jobMatchScoreRepository.deleteByCandidateEmail(email);
         jobMatchNarrativeRepository.deleteByCandidateEmail(email);
         matchScoreJobRepository.deleteByCandidateEmail(email);
+        candidateAiSummaryRepository.deleteByCandidateEmail(email);
+        candidateAiSummaryNarrativeRepository.deleteByCandidateEmail(email);
     }
 
     @GetMapping("/analysis")

@@ -1228,6 +1228,42 @@ class JobMatchServiceTest {
         verify(openAICVAnalysisService, times(1)).computeJobMatches(any(), anyList(), anyMap(), any(), any());
     }
 
+    // ---- scenario 17b: the CV is replaced WHILE a computation for the OLD CV is still in flight
+    // (e.g. a slow OpenAI call started before the replace) - singleflightComputeJob's own
+    // fingerprint re-check (see JobMatchService.java) must discard that stale result instead of
+    // saving it, exactly like a genuine AI failure. Simulated here via cvAnalysisRepository
+    // returning a DIFFERENT CVAnalysis on its second invocation - the first is getMatchScores'
+    // own entry-point read, the second is the guard's re-check right before persisting. ----
+
+    @Test
+    void cvReplacedWhileComputationInFlight_discardsStaleResultInsteadOfSaving() {
+        CVAnalysis originalCv = doctorAnalysis();
+        CVAnalysis replacedCv = doctorAnalysis();
+        replacedCv.setCvTextHash("different-cv-hash-simulating-a-mid-flight-replace");
+
+        when(cvAnalysisRepository.findByUserEmail(EMAIL))
+                .thenReturn(Optional.of(originalCv), Optional.of(replacedCv));
+
+        Job physicianJob = job(600L, "Physician", "Patient diagnosis, Patient care", "Active medical license required.");
+        stubAi(Map.of(600L, relatedFixture("same_role",
+                List.of("Patient diagnosis", "Patient care"), List.of(),
+                "mid", "relevant_degree", "specific_license")));
+
+        JobMatchService.MatchScoresResult result = jobMatchService.getMatchScores(EMAIL, List.of(physicianJob), "en");
+
+        // Routed through the exact same ephemeral "please retry" sentinel a genuine AI failure
+        // already uses (see ensureCoreScores) - never the real verdict computed against the CV
+        // that's already gone, and never persisted, so the very next request recomputes cleanly
+        // against whichever CV is current then.
+        Map<String, Object> match = result.matches().get(0);
+        assertThat(match.get("matchReason"))
+                .as("a result computed against a CV that no longer exists must never be shown as real")
+                .isEqualTo("We couldn't calculate a match for this job right now. Please try again.");
+        assertThat(match.get("fieldRelated")).isNull();
+        assertThat(match.get("matchPercent")).isNull();
+        verify(jobMatchScoreRepository, never()).save(any());
+    }
+
     // ---- scenario 18: computeMatchScoresStreaming (the dashboard/job-list path) no longer
     // computes AI matches inline - a stale job is enqueued onto the persistent queue and awaited,
     // never computed directly on the request thread. This is what "the dashboard does not trigger

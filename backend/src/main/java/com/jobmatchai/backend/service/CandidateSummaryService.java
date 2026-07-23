@@ -72,24 +72,30 @@ public class CandidateSummaryService {
     ) {}
 
     public SummaryResult getCandidateSummary(String candidateEmail, Job job, String language) {
-        CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(candidateEmail).orElse(null);
-
-        if (analysis == null) {
-            log.info("[AI-SUMMARY] candidate={} jobId={} -> no CVAnalysis on file, cannot generate a summary",
-                    candidateEmail, job.getId());
-            return new SummaryResult(false, null, List.of(), null, null, null, null, null, null, null);
-        }
-
-        String cvFingerprint = fingerprintCv(analysis);
         String jobFingerprint = fingerprintJob(job);
         String lockKey = candidateEmail + "::" + job.getId();
         Object lock = locks.computeIfAbsent(lockKey, k -> new Object());
 
-        // Everything from the cache read to the cache write happens under this lock, so a
+        // Everything from the CVAnalysis read to the cache write happens under this lock, so a
         // second request for the same candidate+job that arrives while the first is still
         // waiting on OpenAI blocks here instead of racing it, then simply reads the row the
-        // first request just saved.
+        // first request just saved. `analysis`/`cvFingerprint` are deliberately read INSIDE the
+        // lock (not before it) - reading them before blocking would risk this request being
+        // granted the lock only after a CONCURRENT CV replace on the same account has already run
+        // (which deletes this candidate's rows via CVController.discardStaleMatchScores), in which
+        // case a pre-lock snapshot would silently resurrect a summary generated against the CV
+        // that request just invalidated.
         synchronized (lock) {
+            CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(candidateEmail).orElse(null);
+
+            if (analysis == null) {
+                log.info("[AI-SUMMARY] candidate={} jobId={} -> no CVAnalysis on file, cannot generate a summary",
+                        candidateEmail, job.getId());
+                return new SummaryResult(false, null, List.of(), null, null, null, null, null, null, null);
+            }
+
+            String cvFingerprint = fingerprintCv(analysis);
+
             CandidateAiSummary cached = candidateAiSummaryRepository
                     .findFirstByCandidateEmailAndJobIdOrderByIdDesc(candidateEmail, job.getId())
                     .orElse(null);
