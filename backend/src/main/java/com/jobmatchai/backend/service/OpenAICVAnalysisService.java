@@ -308,11 +308,20 @@ CV Text:
             return objectMapper.writeValueAsString(finalJson);
 
         } catch (HttpClientErrorException e) {
+            // Previously swallowed with no log line at all - a bad/expired API key or an OpenAI
+            // rate limit/4xx in production showed up ONLY as a generic 500 to the client, with
+            // nothing server-side to diagnose it from. Logged the same way computeJobMatches
+            // already does for its own OpenAI failures.
+            log.error("analyzeCV failed against OpenAI: {} {}", e.getStatusCode(), e.getResponseBodyAsString());
             return emptyAnalysisJson(pickByLanguage(language,
                     "OpenAI API Error: " + e.getStatusCode(),
                     "خطأ في واجهة OpenAI: " + e.getStatusCode(),
                     "שגיאת API של OpenAI: " + e.getStatusCode()));
         } catch (Exception e) {
+            // Same gap as above, for every other failure this method can hit - a missing/blank
+            // OPENAI_API_KEY (see requireConfiguredApiKey), a connection timeout, or a JSON parse
+            // failure all used to return a 500 to the client with zero trace of why.
+            log.error("analyzeCV failed", e);
             return emptyAnalysisJson(pickByLanguage(language,
                     "Error analyzing CV: " + e.getMessage(),
                     "حدث خطأ أثناء تحليل السيرة الذاتية: " + e.getMessage(),
@@ -419,11 +428,13 @@ Document text:
             return objectMapper.writeValueAsString(fixedJson);
 
         } catch (HttpClientErrorException e) {
+            log.error("validateCV failed against OpenAI: {} {}", e.getStatusCode(), e.getResponseBodyAsString());
             return invalidCVJson(pickByLanguage(language,
                     "OpenAI API Error: " + e.getStatusCode(),
                     "خطأ في واجهة OpenAI: " + e.getStatusCode(),
                     "שגיאת API של OpenAI: " + e.getStatusCode()), 0);
         } catch (Exception e) {
+            log.error("validateCV failed", e);
             return invalidCVJson(pickByLanguage(language,
                     "Error validating CV: " + e.getMessage(),
                     "حدث خطأ أثناء التحقق من السيرة الذاتية: " + e.getMessage(),
