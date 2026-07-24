@@ -122,21 +122,32 @@ public class ExternalJobService {
     private int retentionDays;
 
     // How many jobs' content-prep (requirements/skills + about-summary) runs at once during
-    // import - found via production incident: firing ~200 sequential OpenAI calls (50 jobs x up
-    // to 4 calls each) back-to-back with zero throttling burned through OpenAI's rate limit
-    // partway through, silently leaving most of the batch unprepared (only ~14/50 jobs got
-    // requirements/skills). A small bounded concurrency, paired with the rate limiter below,
-    // keeps the batch fast without bursting past what the API actually allows.
-    @Value("${externaljobs.import.content-prep-concurrency:4}")
+    // import - low on purpose. A production incident proved a request-count-based rate limit
+    // (3/sec = 180/min) is nowhere near the real constraint: OpenAI's actual cap here is 30,000
+    // TOKENS per minute for this account/model, and each call costs ~1,500-2,200 tokens - a real
+    // budget of roughly 15-20 calls/minute, not 180. Concurrency beyond a couple of jobs doesn't
+    // make the batch finish faster once the token-per-minute bucket below is the true bottleneck
+    // (see contentPrepRateLimitBucket) - it only makes more callers collide into a 429
+    // simultaneously and waste retries. This is also a SHARED org-wide budget with
+    // MatchScoreQueueWorker's own OpenAI calls (candidate match scoring) - low concurrency here
+    // leaves headroom for that traffic too instead of content-prep dominating the whole quota.
+    @Value("${externaljobs.import.content-prep-concurrency:2}")
     private int contentPrepConcurrency;
 
-    // Independent of the concurrency cap above - a hard calls-per-second ceiling shared across
-    // every concurrent job, so a wider concurrency setting can never spike faster than this.
-    // Mirrors MatchScoreQueueWorker's identical rate-limit-vs-concurrency split.
-    @Value("${externaljobs.import.content-prep-rate-limit-per-second:3}")
-    private int contentPrepRateLimitPerSecond;
+    // A calls-PER-MINUTE ceiling (not per-second) - matches the actual token-per-minute constraint
+    // above rather than a request-count constraint. bucket4j's asBlocking().consume(1) blocks the
+    // calling (virtual) thread until a token refills, so this is the primary defense that keeps
+    // calls paced under the real budget in the first place, rather than relying on 429s happening
+    // and being retried after the fact. Deliberately conservative (well under the theoretical
+    // 15-20/min ceiling) to leave room for MatchScoreQueueWorker's concurrent usage of the same
+    // per-minute budget.
+    @Value("${externaljobs.import.content-prep-rate-limit-per-minute:10}")
+    private int contentPrepRateLimitPerMinute;
 
-    @Value("${externaljobs.import.content-prep-max-attempts:3}")
+    // Higher than a typical retry count, and paired with a much longer backoff (see
+    // callWithRetry) - a rate-limit failure needs to wait out a meaningful slice of the 60s token
+    // window to have a real chance of succeeding, not a handful of quick retries.
+    @Value("${externaljobs.import.content-prep-max-attempts:5}")
     private int contentPrepMaxAttempts;
 
     private Semaphore contentPrepConcurrencyLimiter;
@@ -147,8 +158,8 @@ public class ExternalJobService {
     void initContentPrep() {
         contentPrepConcurrencyLimiter = new Semaphore(Math.max(1, contentPrepConcurrency));
         contentPrepRateLimitBucket = Bucket.builder()
-                .addLimit(limit -> limit.capacity(Math.max(1, contentPrepRateLimitPerSecond))
-                        .refillGreedy(Math.max(1, contentPrepRateLimitPerSecond), Duration.ofSeconds(1)))
+                .addLimit(limit -> limit.capacity(Math.max(1, contentPrepRateLimitPerMinute))
+                        .refillGreedy(Math.max(1, contentPrepRateLimitPerMinute), Duration.ofMinutes(1)))
                 .build();
         // Cheap to dispatch generously on virtual threads - a job waiting for its turn just blocks
         // on contentPrepConcurrencyLimiter in memory, holding no DB connection or OS thread.
@@ -666,13 +677,17 @@ public class ExternalJobService {
 
     // Shared retry wrapper for every content-prep AI call (requirements/skills extraction, and
     // each language's about-summary) - retries on ANY failure (OpenAI rate limit, transient
-    // network error, etc.) up to contentPrepMaxAttempts times with exponential backoff (1s, 2s,
-    // 4s, ...), rate-limited via contentPrepRateLimitBucket so concurrent jobs' calls stay under
-    // OpenAI's actual per-second allowance instead of bursting. Every attempt (and the final
+    // network error, etc.) up to contentPrepMaxAttempts times, rate-limited via
+    // contentPrepRateLimitBucket (a calls-per-MINUTE budget, not per-second - see its own doc
+    // comment) so calls stay paced under OpenAI's actual token-per-minute allowance in the first
+    // place, rather than relying purely on retrying after a 429. Backoff is deliberately long
+    // (15s, 30s, 60s, 60s, ...) - a production incident showed a short 1s/2s/4s backoff barely
+    // dents a per-MINUTE token budget once it's exhausted; only waiting out a real slice of that
+    // 60s window gives a retry an actual chance of succeeding. Every attempt (and the final
     // giving-up) is logged with the specific job id/title/operation, so a failure is traceable
     // instead of silently disappearing. Returns null (never throws) after exhausting all
     // attempts - callers already treat a null/failed extraction as "leave this field blank, the
-    // existing lazy on-demand path will retry it later."
+    // existing lazy on-demand path (or a later backfillMissingContent run) will retry it later."
     private String callWithRetry(ExternalJob job, String operation, List<ContentPrepFailure> failures, Callable<String> call) {
         Exception lastError = null;
         for (int attempt = 1; attempt <= Math.max(1, contentPrepMaxAttempts); attempt++) {
@@ -684,7 +699,7 @@ public class ExternalJobService {
                 if (attempt >= contentPrepMaxAttempts) {
                     break;
                 }
-                long backoffMs = 1000L << (attempt - 1);
+                long backoffMs = Math.min(60_000L, 15_000L << (attempt - 1));
                 log.warn("content-prep '{}' attempt {}/{} failed for external job id={} title='{}' - retrying in {}ms: {}",
                         operation, attempt, contentPrepMaxAttempts, job.getId(), job.getTitle(), backoffMs, e.toString());
                 sleepQuietly(backoffMs);
