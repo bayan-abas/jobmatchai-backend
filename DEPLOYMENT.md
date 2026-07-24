@@ -1,206 +1,179 @@
-# JobMatchAI — AWS Production Deployment Guide
+# JobMatchAI — Render + Firebase Hosting Deployment Guide
 
-This document covers what's required to deploy the existing application to AWS. It does not
-describe any change in application behavior — matching/scoring, caching, queue processing, and UI
-behavior are unchanged from local dev; only packaging, storage backend selection, and
-configuration are new.
+This document covers what's required to deploy the application to its current target platforms.
+It does not describe any change in application behavior — matching/scoring, caching, queue
+processing, and UI behavior are unchanged; only packaging, storage backend selection, and
+configuration are covered here.
 
-Architecture: Spring Boot backend on **Elastic Beanstalk**, React/Vite frontend on **Amplify
-Hosting** (or S3+CloudFront), existing **Supabase Postgres** (Frankfurt) unchanged, CV files in a
-private **S3** bucket, OpenAI API called only from the backend.
+**Architecture:** Spring Boot backend on **Render** (Docker runtime), React/Vite frontend on
+**Firebase Hosting**, existing **Supabase Postgres** database (unchanged), CV files in **Supabase
+Storage**, OpenAI API called only from the backend. No AWS services are used anywhere.
+
+---
+
+## 0. What you need to fill in before this works (placeholders in the repo today)
+
+Nothing below is guessed or invented for you — these are genuinely yours to provide:
+
+| Placeholder | Where | Replace with |
+|---|---|---|
+| `REPLACE_WITH_YOUR_FIREBASE_PROJECT_ID` | `jobMatchAi-frontend/.firebaserc` | Your real Firebase project ID (create one at console.firebase.google.com if you haven't, or `firebase projects:list` if you have). |
+| `REPLACE_WITH_YOUR_PRODUCTION_BACKEND_URL` | `jobMatchAi-frontend/.env.production` | Your Render service's public URL (e.g. `https://jobmatchai-backend.onrender.com`), known only after step 3 in §3. |
+| Supabase pooler connection string | Set directly as `SPRING_DATASOURCE_URL` on Render (not stored in any file) | From Supabase dashboard → Project Settings → Database → Connection pooling → **Session mode**. Not the direct `db.<ref>.supabase.co` host — see §5. |
+| All secrets (`JWT_SECRET`, `OPENAI_API_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `MAIL_PASSWORD`, DB password, etc.) | Set directly on Render's Environment tab (not stored in any file) | Your real values — see §1's table. |
+
+Everything else below is already correct and doesn't need editing.
 
 ---
 
 ## 1. Required environment variables
 
-### Backend (Elastic Beanstalk environment properties)
+### Backend (Render service → Environment tab)
 
 Every property below already has a safe fallback in `application.properties` — only the ones
-marked **required** must actually be set for a real production deployment; the rest are optional
-tuning knobs.
+marked **Required** must actually be set for a real production deployment.
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `SPRING_DATASOURCE_URL` | **Yes** | Supabase Postgres JDBC URL. Must NOT be left unset — the app refuses to start in `prod` if it falls back to the in-memory H2 default (`ProductionConfigGuard`). |
-| `SPRING_DATASOURCE_USERNAME` | **Yes** | Supabase DB user. |
-| `SPRING_DATASOURCE_PASSWORD` | **Yes** | Supabase DB password. Store in Secrets Manager, not plain EB env config. |
-| `JWT_SECRET` | **Yes** | Long random secret (`openssl rand -base64 48`). App refuses to start in `prod` if left at the dev default (`JwtService` guard). Store in Secrets Manager. |
-| `OPENAI_API_KEY` | **Yes** | Backend-only; never sent to or read by the frontend. Store in Secrets Manager. |
-| `APP_ENVIRONMENT` | **Yes** | Set to `prod` (also set by activating the `production` Spring profile below). Enables the H2/JWT-secret startup guards and switches password-reset links to email-only. |
-| `APP_CORS_ALLOWED_ORIGIN` | **Yes** | Comma-separated list of allowed frontend origin(s), e.g. `https://app.yourdomain.com`. |
-| `APP_FRONTEND_URL` | **Yes** | Production frontend URL — used to build password-reset links. Must be the real HTTPS domain, not `localhost`. |
-| `APP_STORAGE_TYPE` | Yes (or via profile) | `s3` in production. Already set by `application-production.properties`; only needed here if not activating that profile. |
-| `APP_S3_BUCKET_NAME` | **Yes** (if `APP_STORAGE_TYPE=s3`) | Name of the private S3 bucket for CVs. |
-| `APP_S3_REGION` | Recommended | Defaults to `eu-central-1`; set explicitly to match your bucket's region. |
-| `APP_PROXY_TRUST_X_FORWARDED_FOR` | **Yes** | Set to `true` — EB's ELB sits in front of the app; without this, IP-based rate limiting can be bypassed via a forged header. Already set by `application-production.properties`. |
-| `SPRING_PROFILES_ACTIVE` | Recommended | Set to `production` to load `application-production.properties`. |
-| `PORT` | No | EB injects this automatically on the Docker platform; the app already reads it with an `8080` fallback. |
-| `SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE` | Recommended | `8` — see connection-pool sizing note below. |
-| `SPRING_DATASOURCE_HIKARI_MINIMUM_IDLE` | Recommended | `2` — see connection-pool sizing note below. |
-| `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` / `STRIPE_PREMIUM_PRICE_ID` | If payments are used | Store secret/webhook values in Secrets Manager. |
-| `MAIL_HOST` / `MAIL_PORT` / `MAIL_USERNAME` / `MAIL_PASSWORD` | If email is used | Without these, verification/reset emails are only logged, not sent — fine for a soft launch, not for real users. Store `MAIL_PASSWORD` in Secrets Manager. |
-| `INTERNAL_API_KEY` | If external-jobs import is used | Generate with `openssl rand -hex 32`. |
-| `JOOBLE_API_KEY` / `RAPIDAPI_KEY` | If external-jobs import is used | Third-party job-board API keys. |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | **Fallback only** | Do NOT set these on the EB environment. Use an EB instance IAM role instead (see §4). Only relevant for local testing against a real S3 bucket outside of AWS. |
+| `SPRING_PROFILES_ACTIVE` | **Yes** | Set to `production`. This is the single flag that activates `application-production.properties` — without it, storage silently stays on ephemeral local disk, `app.environment` never becomes `prod`, and X-Forwarded-For isn't trusted. Also transitively sets `app.environment=prod` for you — you do not need to separately set `APP_ENVIRONMENT`. |
+| `SPRING_DATASOURCE_URL` | **Yes** | Supabase Postgres **connection pooler** URL, session mode: `jdbc:postgresql://aws-0-<region>.pooler.supabase.com:5432/postgres` (get the exact host from Supabase dashboard → Project Settings → Database → Connection pooling). Do not use the direct `db.<ref>.supabase.co` host in production — see §5. |
+| `SPRING_DATASOURCE_USERNAME` | **Yes** | Pooler username, formatted `postgres.<project-ref>` (not plain `postgres` — the pooler requires the project ref suffix). |
+| `SPRING_DATASOURCE_PASSWORD` | **Yes** | Your Supabase database password. |
+| `JWT_SECRET` | **Yes** | Long random secret (`openssl rand -base64 48`). The app refuses to start in `prod` if left at the insecure dev default (`JwtService`'s own guard). |
+| `OPENAI_API_KEY` | **Yes** | Backend-only; never sent to or read by the frontend. |
+| `APP_CORS_ALLOWED_ORIGIN` | **Yes** | Your Firebase Hosting URL, e.g. `https://<project-id>.web.app`. Comma-separate multiple origins if needed. |
+| `APP_FRONTEND_URL` | **Yes** | Same Firebase Hosting URL — used to build password-reset email links. |
+| `SUPABASE_URL` | **Yes** | Your Supabase project's HTTPS URL, e.g. `https://<project-ref>.supabase.co` (Project Settings → API). |
+| `SUPABASE_SERVICE_ROLE_KEY` | **Yes** | Full-access storage key (Project Settings → API). Bypasses RLS — treat like a database password. |
+| `SUPABASE_STORAGE_BUCKET` | **Yes** | Name of the Supabase Storage bucket for CVs (defaults to `cvs` if unset — only needed here if you used a different name). |
+| `MAIL_HOST` / `MAIL_USERNAME` / `MAIL_PASSWORD` | **Yes** | Once `app.environment=prod`, password-reset/verification links are **only** emailed, never returned in the API response — without working mail, that flow is silently broken for real users. |
+| `PORT` | No | Set automatically by Render; the app already reads it with an `8080` fallback. |
+| `SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE` | Recommended | `8`–`10` against the pooler (the default of `10` is fine; lower if you also run other services against the same Supabase project). |
+| `INTERNAL_API_KEY` | Optional | Only needed to manually trigger `POST /api/external-jobs/import`; the scheduled cron runs regardless. Generate with `openssl rand -hex 32`. |
+| `JOOBLE_API_KEY` / `RAPIDAPI_KEY` | Optional | Third-party external-job-board keys. Jooble alone is enough for external job imports to work; RapidAPI/JSearch is a second, optional source. |
 
-Everything else in `application.properties` (rate limits, matching/queue tuning, external-jobs
-keywords, OpenAI model names) has sensible defaults and does not need to be touched for
-deployment — changing any of it would be a behavioral change, which is explicitly out of scope
-here.
+**Deliberately not needed at all:** `STRIPE_*` (this app uses the demo/mock payment flow —
+see `PaymentController`'s `/demo/*` routes, no real Stripe account required),
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`APP_S3_*` (CV storage is Supabase Storage,
+authenticated with `SUPABASE_SERVICE_ROLE_KEY` above, not AWS-style keys).
 
-### Frontend (Amplify Console build-time environment variable)
+### Frontend (`jobMatchAi-frontend/.env.production`, baked in at build time)
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `VITE_API_BASE_URL` | **Yes** | The backend's public HTTPS URL (e.g. the EB environment URL or a custom domain). Baked into the static build at build time — must be set in Amplify Console's environment variables (or your CI), not just locally. |
+| `VITE_API_BASE_URL` | **Yes** | Your Render backend's public HTTPS URL. Vite bakes this into the static build — it must be the real value **before** you run `npm run build`, not something you can change afterward without rebuilding. |
 
-No other frontend env var exists; the codebase already has no hardcoded localhost URLs outside
-this one documented dev fallback.
-
----
-
-## 2. AWS resources to create (none of this has been done — nothing has been deployed)
-
-1. **S3 bucket** for CV storage — private, all public access blocked, no bucket policy granting
-   public read. Versioning optional. Note the bucket name/region for `APP_S3_BUCKET_NAME`/
-   `APP_S3_REGION`.
-2. **Elastic Beanstalk application + environment** — Docker platform (matches the existing
-   `Dockerfile`), single-instance or load-balanced as desired.
-3. **EB instance IAM role** (see §4) — scoped to `s3:GetObject`, `s3:PutObject`,
-   `s3:DeleteObject`, `s3:HeadObject` on just the CV bucket (`arn:aws:s3:::<bucket-name>/*`).
-4. **AWS Secrets Manager secrets** (recommended) for `SPRING_DATASOURCE_PASSWORD`, `JWT_SECRET`,
-   `OPENAI_API_KEY`, `MAIL_PASSWORD`, `STRIPE_SECRET_KEY` — referenced from the EB environment
-   configuration rather than stored as plain env vars.
-5. **Amplify Hosting app** (or an S3 bucket + CloudFront distribution) for the frontend static
-   build.
+No other frontend env var exists. There is no build-time environment variable panel to configure
+on Firebase Hosting's side — deployment is local (`npm run build && firebase deploy`), so this
+file is the only place it's set.
 
 ---
 
-## 3. Build artifacts and deployment commands
+## 2. Supabase resources (already created — reference only)
 
-### Backend
-
-```bash
-cd backend
-./mvnw clean package -DskipTests
-# Produces backend/target/backend-<version>.jar
-```
-
-Deploy via the existing `Dockerfile` (already aligned to Java 21 to match `pom.xml`) — EB's
-Docker platform builds the image from this Dockerfile and runs the packaged jar. No changes
-needed to the EB deployment mechanism beyond setting the environment variables in §1.
-
-```bash
-# From the backend directory, to build the image locally for a sanity check before deploying:
-docker build -t jobmatchai-backend .
-```
-
-### Frontend
-
-```bash
-cd jobMatchAi-frontend
-npm ci
-npm run build
-# Produces jobMatchAi-frontend/dist/ - the static site to publish
-```
-
-Amplify Hosting will run this automatically via the new `amplify.yml` at the frontend root once
-connected to the repo, using `VITE_API_BASE_URL` from Amplify Console's environment variables. If
-deploying to S3+CloudFront instead, upload the contents of `dist/` to the bucket and invalidate
-the CloudFront distribution on each deploy.
+1. **Database**: the existing Supabase Postgres project, unchanged. For Render specifically, use
+   the **connection pooler** (session mode) instead of the direct host — see §1 and §5.
+2. **Storage bucket**: a private bucket (default name `cvs`) already exists in this project's
+   Supabase Storage, verified reachable with the current `SUPABASE_SERVICE_ROLE_KEY`. No
+   additional setup needed unless you want a differently-named or differently-configured bucket.
 
 ---
 
-## 4. IAM role setup for S3 (recommended primary approach)
+## 3. Render setup steps (backend)
 
-The backend uses the AWS SDK's default credential provider chain (`S3Client.builder()` with no
-explicit credentials) — it will automatically pick up whichever credential source is available,
-in this order: environment variables, then an EC2/Elastic Beanstalk instance IAM role, then other
-standard SDK sources. No code differs between these paths.
+1. Create a new **Web Service** on Render, connect this GitHub repository.
+2. **Root Directory**: set this to `backend` — the Dockerfile lives at `backend/Dockerfile`, one
+   level below the git repo root, not at the repo root itself.
+3. **Runtime**: Docker (Render auto-detects the `Dockerfile` once Root Directory is set correctly).
+4. Set every environment variable from §1's table.
+5. **Health Check Path** (Render dashboard setting, not a file): `/actuator/health` — already
+   unauthenticated and detail-free (`management.endpoint.health.show-details=never`), exactly for
+   this purpose.
+6. Deploy. Confirm the build logs show a successful `mvn package` inside the Docker build stage,
+   then confirm `GET https://<your-service>.onrender.com/actuator/health` returns
+   `{"status":"UP"}`.
 
-**Recommended for production**: attach an IAM role to the EB environment's EC2 instance profile,
-scoped to only the CV bucket:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:HeadObject"],
-      "Resource": "arn:aws:s3:::<bucket-name>/*"
-    }
-  ]
-}
-```
-
-This needs no `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars at all. Static access keys are
-documented here only as a fallback for local testing against a real bucket outside AWS — do not
-use them as the production credential source.
+**Note on Render's free tier:** it spins the service down after ~15 minutes of inactivity. This
+app has several `@Scheduled` background jobs (the external-jobs import cron, the match-score
+queue poller, a stale-job reaper) that simply don't run while the service is asleep, and the first
+request after idle will be slow (cold start). If that matters for your use case, use a paid
+always-on plan instead of the free tier.
 
 ---
 
-## 5. SPA routing (React Router deep-link/refresh support)
+## 4. Firebase Hosting setup steps (frontend)
 
-The frontend uses `BrowserRouter`, so the hosting layer must serve `index.html` for any unmatched
-path (a direct visit or refresh on e.g. `/jobs/42` must not 404).
-
-- **Amplify Hosting**: Console → App settings → Rewrites and redirects → add the built-in
-  "Single Page App" rewrite (`</^[^.]+$|\.(?!(css|gif|ico|jpg|js|png|txt|svg|woff|woff2|ttf|map|json)$)([^.]+$)/>` → `/index.html`, 200).
-- **S3+CloudFront**: add a CloudFront custom error response mapping both 403 and 404 →
-  `/index.html` with an HTTP response code of 200.
+1. Install the Firebase CLI if you haven't: `npm install -g firebase-tools`, then `firebase login`.
+2. Replace the placeholder in `jobMatchAi-frontend/.firebaserc` with your real Firebase project ID.
+3. Once your Render service is deployed and you have its URL, replace the placeholder in
+   `jobMatchAi-frontend/.env.production` with that real URL.
+4. From `jobMatchAi-frontend/`: `npm run build` (or `npm run deploy`, which runs build + deploy
+   together).
+5. `firebase deploy --only hosting` (skip if you used `npm run deploy` above).
+6. SPA routing is already handled — `firebase.json`'s rewrite (`**` → `/index.html`) means a
+   direct visit or refresh on a deep link (e.g. `/jobs/42`) will not 404. Nothing to configure
+   here.
 
 ---
 
-## 6. Deployment checklist
+## 5. Closing the loop between the two deployments
 
-1. Create the S3 bucket (§2.1) and confirm public access is fully blocked.
-2. Create the EB application/environment and attach the scoped instance IAM role (§4).
-3. Set all required backend env vars (§1) on the EB environment, using Secrets Manager for the
-   sensitive ones.
-4. Deploy the backend (`docker build` via EB's own pipeline, or `eb deploy`).
-5. Confirm `GET /<eb-environment-url>/actuator/health` returns `200 {"status":"UP"}` — this is
-   the endpoint EB's health checker uses and is now unauthenticated with no sensitive details
-   exposed (`management.endpoint.health.show-details=never`).
-6. Set `VITE_API_BASE_URL` in Amplify Console (or CI) to the EB environment's public URL.
-7. Connect/deploy the frontend (Amplify auto-builds via `amplify.yml`, or push `dist/` to
-   S3+CloudFront).
-8. Configure the SPA rewrite rule (§5) on whichever frontend host was chosen.
-9. Set `APP_CORS_ALLOWED_ORIGIN` and `APP_FRONTEND_URL` on the backend to the frontend's real
-   domain, and redeploy the backend if they were placeholders until now.
-10. Smoke test end-to-end against production: register/login, CV upload/download/delete, job
-    matching, password reset email/link.
-11. Confirm `S3FileStorageService` works against the real bucket (upload, download, delete) —
-    this could not be verified in the development environment (no AWS credentials available
-    there) and must be checked manually here.
+The backend and frontend URLs depend on each other, so there's an unavoidable two-step:
+
+1. Deploy the backend first (§3) to get its real Render URL.
+2. Put that URL into the frontend's `.env.production` and deploy the frontend (§4).
+3. Put the frontend's real Firebase Hosting URL into `APP_CORS_ALLOWED_ORIGIN` and
+   `APP_FRONTEND_URL` on Render, then redeploy the backend so CORS actually allows the real
+   frontend origin (it will reject requests from the frontend until this step is done, since
+   those two vars default to `localhost:5173`).
+
+### Why the Supabase connection pooler, not the direct host
+
+Supabase's direct connection (`db.<ref>.supabase.co:5432`) has a low, fixed connection cap shared
+across everything using your project (local dev, Render, the Supabase dashboard itself, etc.). The
+pooler (`aws-0-<region>.pooler.supabase.com`) is built to absorb many concurrent short-lived
+connections from a hosted platform like Render. **Session mode** (not transaction mode) is
+required here specifically because this app uses normal JDBC/Hikari connections, not one-shot
+pooled statements — transaction-mode pooling doesn't support the connection-level features Hikari
+relies on. The pooler username is formatted `postgres.<project-ref>`, not plain `postgres`.
+
+---
+
+## 6. Smoke test after both are live
+
+Register/login (candidate + company), upload/download/delete a CV (exercises Supabase Storage
+end-to-end), run a job match, and trigger a password reset email (exercises real mail delivery,
+which only activates once `app.environment=prod` — dev mode returns the link directly instead).
 
 ---
 
 ## 7. Rollback plan
 
-- **Backend**: Elastic Beanstalk retains previous application versions — roll back via
-  `eb deploy --version <previous-label>` or the EB console's "Application versions" →
-  "Deploy" on an earlier version.
-- **Frontend**: Amplify Hosting keeps previous build deployments — roll back via the Amplify
-  Console's deployment history ("Redeploy this version"). For S3+CloudFront, re-upload the
-  previous `dist/` build and invalidate the distribution.
+- **Backend**: Render keeps prior deploys — roll back via the Render dashboard's deploy history
+  ("Manual Deploy" → pick an earlier commit/deploy).
+- **Frontend**: Firebase Hosting keeps release history — roll back via Firebase Console →
+  Hosting → release history, or `firebase hosting:clone`.
 - **Database — known limitation, not fixed by this work**: this application has no migration
   framework (Flyway/Liquibase); schema changes are applied automatically by Hibernate
-  (`spring.jpa.hibernate.ddl-auto=update`) the moment a new version of the backend starts up
-  against the database. Rolling back the *application code* does **not** undo any schema change
-  Hibernate already applied. Before deploying any backend version that adds/changes/removes an
-  entity field, take a manual Supabase backup first — rolling back to the previous jar after such
-  a deploy will not restore the previous schema, only the previous code.
+  (`spring.jpa.hibernate.ddl-auto=update`) the moment a new backend version starts up against the
+  database. Rolling back the *application code* does **not** undo any schema change Hibernate
+  already applied. Take a manual Supabase backup before deploying any backend version that
+  adds/changes/removes an entity field.
 
 ---
 
-## 8. Known limitations / not addressed by this work
+## 8. Alternative: self-hosting instead of Render
 
-These were identified during the audit but intentionally left unchanged, since fixing them would
-be a real behavioral or architectural change beyond deployment packaging:
+`docker-compose.yml` at the repo root remains a valid alternative if you ever want to run this
+backend on your own server instead of Render — it builds from the same `Dockerfile`, persists CV
+uploads to a named volume (`cv-uploads`) instead of Supabase Storage, and needs a reverse proxy
+(Caddy/nginx) in front for TLS. See `README.md`'s "Self-hosted deployment" section. Render is the
+documented, primary path in this guide; the two are independent choices — pick one, not both.
+
+---
+
+## 9. Known limitations / not addressed by this work
 
 - No migration framework — see §7's database rollback caveat.
 - `spring.jpa.hibernate.ddl-auto=update` stays as-is in production (switching to `validate` would
   require introducing a migration framework first).
-- `S3FileStorageService` has not been exercised against a real AWS account — no AWS credentials
-  were available in the development environment. Verify manually per checklist step 11.

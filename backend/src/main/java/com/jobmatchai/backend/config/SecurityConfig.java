@@ -87,10 +87,10 @@ public class SecurityConfig {
                         // "permitAll + its own independent secret check" pattern already used for
                         // the Stripe webhook above.
                         .requestMatchers(HttpMethod.POST, "/api/external-jobs/import").permitAll()
-                        // AWS Elastic Beanstalk's (and any ALB target group's) health checker
+                        // The deployment platform's health checker (Render, or any load balancer)
                         // calls this with no credentials at all - without this exception it fell
-                        // under .anyRequest().authenticated() below and returned 401, which EB
-                        // reads as "instance unhealthy" regardless of the app's actual state.
+                        // under .anyRequest().authenticated() below and returned 401, which reads
+                        // as "instance unhealthy" regardless of the app's actual state.
                         // Safe to leave open: management.endpoint.health.show-details=never
                         // (application.properties) means this path never reveals more than an
                         // UP/DOWN status. /actuator/metrics is deliberately NOT added here - it

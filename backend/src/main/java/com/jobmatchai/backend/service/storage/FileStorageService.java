@@ -6,8 +6,9 @@ import java.io.File;
 import java.io.IOException;
 
 // Abstraction over WHERE a candidate's CV file physically lives - local disk in dev
-// (LocalFileStorageService, the default), Amazon S3 in production (S3FileStorageService,
-// selected via app.storage.type=s3 - see application-production.properties). Every method here
+// (LocalFileStorageService, the default), Supabase Storage in production
+// (SupabaseFileStorageService, selected via app.storage.type=supabase - see
+// application-production.properties). Every method here
 // mirrors an operation CVController/UserDeletionService already performed ad hoc, directly
 // against java.nio.file/java.io, before this abstraction existed - a drop-in replacement for
 // that inline logic, not a new feature: same keys (the existing UUID.<ext> convention, generated

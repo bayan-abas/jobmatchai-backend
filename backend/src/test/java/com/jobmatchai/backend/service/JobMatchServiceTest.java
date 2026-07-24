@@ -1242,7 +1242,8 @@ class JobMatchServiceTest {
         replacedCv.setCvTextHash("different-cv-hash-simulating-a-mid-flight-replace");
 
         when(cvAnalysisRepository.findByUserEmail(EMAIL))
-                .thenReturn(Optional.of(originalCv), Optional.of(replacedCv));
+                .thenReturn(Optional.of(originalCv))
+                .thenReturn(Optional.of(replacedCv));
 
         Job physicianJob = job(600L, "Physician", "Patient diagnosis, Patient care", "Active medical license required.");
         stubAi(Map.of(600L, relatedFixture("same_role",

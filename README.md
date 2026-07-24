@@ -25,12 +25,20 @@ $env:OPENAI_API_KEY="sk-your-openai-api-key-here"
 .\mvnw.cmd spring-boot:run
 ```
 
-## Self-hosted deployment (Docker Compose)
+## Deploying to Render + Firebase Hosting
 
-This backend has no dependency on any specific hosting provider - `docker-compose.yml` in
+This is the documented, primary deployment path — backend on Render (Docker), frontend on
+Firebase Hosting, database and CV storage on Supabase. See [`DEPLOYMENT.md`](DEPLOYMENT.md) for
+the full guide: required environment variables, Render/Firebase setup steps, and exactly which
+placeholders (Firebase project ID, Render backend URL, Supabase pooler connection string) still
+need your real values filled in.
+
+## Alternative: self-hosted deployment (Docker Compose)
+
+This backend has no hard dependency on any specific hosting provider - `docker-compose.yml` in
 the repo root builds and runs it from the included `Dockerfile` on any server with Docker
-installed. The database stays on Supabase (or any Postgres you point it at); only the
-backend's compute needs a home.
+installed, as an alternative to Render. The database stays on Supabase (or any Postgres you point
+it at); only the backend's compute needs a home. Pick one deployment path or the other, not both.
 
 1. Copy `.env.example` to `.env` in the repo root and fill in real values:
    - `SPRING_DATASOURCE_URL` / `SPRING_DATASOURCE_USERNAME` / `SPRING_DATASOURCE_PASSWORD` -
@@ -56,9 +64,3 @@ backend's compute needs a home.
 
 3. Point the frontend at it: set `VITE_API_BASE_URL` in the frontend's `.env` to your
    backend's public URL, then rebuild/redeploy the frontend (`npm run build`).
-
-4. Decommission Railway: this repo has never contained any Railway-specific configuration
-   (build settings, env vars, etc. were only ever set in Railway's dashboard), so there is
-   nothing to remove from the code. Delete the Railway project/service from
-   [Railway's dashboard](https://railway.app) once the self-hosted deployment above is live
-   and verified.

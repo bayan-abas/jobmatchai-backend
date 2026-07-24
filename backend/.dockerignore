@@ -1,0 +1,12 @@
+# The Dockerfile only ever COPYs pom.xml, .mvn, mvnw, and src explicitly - never a blanket
+# COPY . . - so nothing here can leak into the image regardless. This file exists purely to keep
+# the build CONTEXT small: Render (and any Docker builder) uploads the whole context before the
+# first COPY even runs, and target/ alone can be 100MB+ of stale local build output that has no
+# business being sent over the network on every deploy.
+target/
+.idea/
+*.iml
+.vscode/
+.env
+.env.*
+!.env.example
