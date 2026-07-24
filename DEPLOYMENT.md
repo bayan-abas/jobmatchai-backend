@@ -41,7 +41,7 @@ marked **Required** must actually be set for a real production deployment.
 | `SPRING_DATASOURCE_PASSWORD` | **Yes** | Your Supabase database password. |
 | `JWT_SECRET` | **Yes** | Long random secret (`openssl rand -base64 48`). The app refuses to start in `prod` if left at the insecure dev default (`JwtService`'s own guard). |
 | `OPENAI_API_KEY` | **Yes** | Backend-only; never sent to or read by the frontend. |
-| `APP_CORS_ALLOWED_ORIGIN` | **Yes** | Your Firebase Hosting URL, e.g. `https://<project-id>.web.app`. Comma-separate multiple origins if needed. |
+| `APP_CORS_ALLOWED_ORIGIN` | **Yes** | Your Firebase Hosting URL, e.g. `https://<project-id>.web.app`. If you've also pointed a custom domain at Firebase Hosting, add it too - comma-separated, no spaces needed either side (e.g. `https://<project-id>.web.app,https://www.yourdomain.com`). Every origin the frontend is actually served from must be listed here or its requests fail CORS, including the preflight for non-GET/POST methods like the job-status PATCH endpoint. |
 | `APP_FRONTEND_URL` | **Yes** | Same Firebase Hosting URL — used to build password-reset email links. |
 | `SUPABASE_URL` | **Yes** | Your Supabase project's HTTPS URL, e.g. `https://<project-ref>.supabase.co` (Project Settings → API). |
 | `SUPABASE_SERVICE_ROLE_KEY` | **Yes** | Full-access storage key (Project Settings → API). Bypasses RLS — treat like a database password. |

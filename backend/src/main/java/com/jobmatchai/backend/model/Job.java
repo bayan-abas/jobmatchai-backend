@@ -43,14 +43,22 @@ public class Job {
     @Column(name = "content_embedding_model")
     private String contentEmbeddingModel;
 
-    // Defaults every existing row (via the column's own DB default, for rows added before this
-    // field existed) and every newly-constructed Job (via this field initializer, for addJob's
-    // brand-new Job()) to ACTIVE - a job is open for applications unless a company explicitly
-    // closes it. columnDefinition carries the same default down to the DDL itself so ddl-auto's
-    // ALTER TABLE ADD COLUMN on an already-populated table backfills existing rows instead of
-    // failing on a NOT NULL column with no default.
+    // Defaults every newly-constructed Job (via this field initializer, for addJob's brand-new
+    // Job()) to ACTIVE - a job is open for applications unless a company explicitly closes it.
+    // Deliberately NO "default" in columnDefinition, even though the column itself does carry a
+    // DB-level default (see db/migration/add_job_status.sql, which is what actually adds it on an
+    // already-populated table) - reproduced live against a real Postgres database: once the
+    // column exists, Hibernate's ddl-auto=update re-evaluates it on every subsequent boot and,
+    // seeing "default" in columnDefinition, re-issues
+    // "alter table jobs alter column status set data type varchar(20) default 'ACTIVE'" - which
+    // Postgres rejects outright ("syntax error at or near default", since ALTER COLUMN ... SET
+    // DATA TYPE cannot carry a DEFAULT clause in the same statement; that requires a separate SET
+    // DEFAULT). Leaving "default" out here stops Hibernate from retrying that broken statement on
+    // every restart - the column's actual DB-level default (set once, by the migration) and this
+    // field's own initializer together still guarantee every row - old and new - resolves to
+    // ACTIVE without it being declared here too.
     @Enumerated(EnumType.STRING)
-    @Column(nullable = false, columnDefinition = "varchar(20) default 'ACTIVE'")
+    @Column(nullable = false, columnDefinition = "varchar(20)")
     private JobStatus status = JobStatus.ACTIVE;
 
     public Job() {}

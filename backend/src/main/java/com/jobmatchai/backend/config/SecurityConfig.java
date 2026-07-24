@@ -158,7 +158,11 @@ public class SecurityConfig {
 
         CorsConfiguration configuration = new CorsConfiguration();
         configuration.setAllowedOrigins(origins);
-        configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
+        // PATCH was missing here - the browser's preflight OPTIONS request for
+        // PATCH /api/jobs/{id}/status (Close Job/Reopen Job) checks this list before ever sending
+        // the real request, and Spring's CORS filter rejects the preflight outright for a method
+        // that isn't in it, independent of any @PatchMapping/@PreAuthorize on the endpoint itself.
+        configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
         configuration.setAllowedHeaders(List.of("*"));
 
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
