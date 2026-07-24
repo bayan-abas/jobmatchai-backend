@@ -42,25 +42,33 @@ public class ExternalJob {
     // AI-generated structured summary of the full description (JSON: roleOverview,
     // responsibilities, requiredQualifications, preferredQualifications, experienceLevel,
     // workArrangement, importantConditions - see OpenAICVAnalysisService#summarizeJobDescription)
-    // shown in the frontend's "About this job" section instead of the long raw description,
-    // which stays available in full for match scoring. Generated lazily on first request and
-    // cached here rather than regenerated on every view - see
-    // ExternalJobService#getOrGenerateAboutSummary.
+    // shown in the frontend's "About this job" section instead of the long raw description, which
+    // stays available in full for match scoring. One column PER SUPPORTED LANGUAGE (not one column
+    // plus a content hash) - the app supports en/ar/he, and a single shared slot meant a candidate
+    // viewing in Hebrew right after another viewed in English would silently discard and
+    // regenerate over the previous language's cached copy every time. Prepared proactively for all
+    // three languages at import time (see ExternalJobService#prepareJobContent); a job imported
+    // before this existed, or whose import-time generation failed, still falls back to lazy
+    // per-language generation on first request (see ExternalJobService#getOrGenerateAboutSummary),
+    // it just won't have already been ready in advance.
     @Column(columnDefinition = "TEXT")
-    private String aboutSummary;
+    private String aboutSummaryEn;
 
-    // sha256(description + "|" + language) at the time aboutSummary was generated - a mismatch
-    // (description changed on re-import, or a different language was requested) means the cached
-    // summary is stale and must be regenerated.
-    private String aboutSummaryContentHash;
+    @Column(columnDefinition = "TEXT")
+    private String aboutSummaryAr;
 
-    // Blank for every job as imported today (no provider currently supplies a separate
-    // structured requirements/skills field - see JobicyJobProvider#resolveDescription) - lazily
-    // backfilled once per job by ExternalJobService#ensureRequirementsAndSkills the first time a
-    // candidate opens that job's details page, extracted from the raw description via AI and
-    // persisted here permanently so every later match computation (any candidate, any code path)
-    // reads real structured text instead of "N/A". TEXT (not the JPA default VARCHAR(255)) since
-    // that default silently caps out far below what a real requirements paragraph needs -
+    @Column(columnDefinition = "TEXT")
+    private String aboutSummaryHe;
+
+    // Populated for every job proactively at import time (see
+    // ExternalJobService#prepareJobContent) since no provider currently supplies a separate
+    // structured requirements/skills field of its own (see JobicyJobProvider#resolveDescription) -
+    // extracted from the raw description via AI and persisted here permanently so every match
+    // computation (any candidate, any code path) reads real structured text instead of "N/A". A
+    // job imported before this existed, or whose import-time extraction failed, still falls back
+    // to a lazy backfill the first time its match detail is requested (see
+    // ExternalJobService#ensureRequirementsAndSkills). TEXT (not the JPA default VARCHAR(255))
+    // since that default silently caps out far below what a real requirements paragraph needs -
     // description already had to make the same change for the same reason.
     @Column(columnDefinition = "TEXT")
     private String requirements;
@@ -267,19 +275,27 @@ public class ExternalJob {
         this.contentEmbeddingModel = contentEmbeddingModel;
     }
 
-    public String getAboutSummary() {
-        return aboutSummary;
+    public String getAboutSummaryEn() {
+        return aboutSummaryEn;
     }
 
-    public void setAboutSummary(String aboutSummary) {
-        this.aboutSummary = aboutSummary;
+    public void setAboutSummaryEn(String aboutSummaryEn) {
+        this.aboutSummaryEn = aboutSummaryEn;
     }
 
-    public String getAboutSummaryContentHash() {
-        return aboutSummaryContentHash;
+    public String getAboutSummaryAr() {
+        return aboutSummaryAr;
     }
 
-    public void setAboutSummaryContentHash(String aboutSummaryContentHash) {
-        this.aboutSummaryContentHash = aboutSummaryContentHash;
+    public void setAboutSummaryAr(String aboutSummaryAr) {
+        this.aboutSummaryAr = aboutSummaryAr;
+    }
+
+    public String getAboutSummaryHe() {
+        return aboutSummaryHe;
+    }
+
+    public void setAboutSummaryHe(String aboutSummaryHe) {
+        this.aboutSummaryHe = aboutSummaryHe;
     }
 }

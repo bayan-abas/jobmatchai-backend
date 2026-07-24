@@ -44,6 +44,10 @@ public class ExternalJobService {
      */
     private static final long EXTERNAL_ID_OFFSET = 1_000_000_000L;
 
+    // Every language getOrGenerateAboutSummary/prepareJobContent generate an about-summary for -
+    // must match LanguageContext's supported languages on the frontend.
+    private static final List<String> SUPPORTED_LANGUAGES = List.of("en", "ar", "he");
+
     @Autowired
     private ExternalJobRepository externalJobRepository;
 
@@ -259,6 +263,20 @@ public class ExternalJobService {
         needingEmbeddings.addAll(changedJobs);
         attachEmbeddings(needingEmbeddings);
 
+        // Content actually changing (title/description) invalidates any about-summary generated
+        // from the old description - unlike requirements/skills, which applyJobData already reset
+        // to whatever the fresh provider data gives (null, for every provider today), nothing
+        // upstream clears these, so it's done explicitly here before regenerating them below.
+        for (ExternalJob job : changedJobs) {
+            job.setAboutSummaryEn(null);
+            job.setAboutSummaryAr(null);
+            job.setAboutSummaryHe(null);
+        }
+        // Same list as the embeddings above: every new AND changed job gets requirements/skills
+        // and an about-summary in every language prepared now, off the user-facing request path,
+        // instead of the first candidate to open the job paying for it (see prepareJobContent).
+        prepareJobContent(needingEmbeddings);
+
         externalJobRepository.saveAll(newJobs);
         // Covers both changed and unchanged existing rows in one call - every touched row needs
         // its bumped importedAt persisted regardless of whether its content also changed.
@@ -425,10 +443,12 @@ public class ExternalJobService {
     // Lazily generates (on first request per job+language) and caches a structured AI summary
     // of the posting's full description for the frontend's "About this job" section - never
     // used for match scoring, which always reads the raw description directly (see
-    // getMatchScoresForExternalJobs/getMatchDetailForExternalJob above). Cached in
-    // ExternalJob#aboutSummary, keyed by a hash of description+language so a re-import that
-    // actually changes the description (or a candidate viewing in a different language)
-    // correctly regenerates instead of serving a stale/wrong-language summary.
+    // getMatchScoresForExternalJobs/getMatchDetailForExternalJob above). One cached column PER
+    // language (see ExternalJob), rather than a single slot plus a content hash - a candidate
+    // viewing in Hebrew right after another viewed in English no longer discards the other
+    // language's cached copy. prepareJobContent proactively fills all three at import time, so
+    // this on-demand path is mainly a fallback for jobs imported before that existed, or whose
+    // import-time generation failed.
     //
     // Returns a plain Map (not the JsonNode it's built from) - a JsonNode embedded directly in a
     // Map<String,Object> controller response gets serialized via bean introspection (its own
@@ -446,11 +466,10 @@ public class ExternalJobService {
             return Map.of();
         }
 
-        String effectiveLanguage = language == null ? "en" : language;
-        String contentHash = HashUtil.sha256(description + "|" + effectiveLanguage);
-
-        if (contentHash.equals(job.getAboutSummaryContentHash()) && job.getAboutSummary() != null) {
-            Map<String, Object> cached = parseJsonToMap(job.getAboutSummary());
+        String effectiveLanguage = SUPPORTED_LANGUAGES.contains(language) ? language : "en";
+        String cachedSummary = getAboutSummaryField(job, effectiveLanguage);
+        if (cachedSummary != null) {
+            Map<String, Object> cached = parseJsonToMap(cachedSummary);
             if (cached != null) {
                 return cached;
             }
@@ -466,57 +485,146 @@ public class ExternalJobService {
             return Map.of();
         }
 
-        job.setAboutSummary(rawSummary);
-        job.setAboutSummaryContentHash(contentHash);
+        setAboutSummaryField(job, effectiveLanguage, rawSummary);
         externalJobRepository.save(job);
 
         return parsed;
     }
 
-    // Lazily backfills ExternalJob#requirements/#skills the first time this specific job's match
-    // detail is requested (see getMatchDetailForExternalJob) - every provider today leaves these
-    // blank (see JobicyJobProvider#resolveDescription), so the match-scoring prompt was showing
-    // the AI "Required skills: N/A" / "Requirements: N/A" even for postings whose full description
-    // clearly states real requirements, which measurably made the AI less likely to return a
-    // matched/missing-skills breakdown at all for jobs whose description reads as narrative prose
-    // rather than an obviously bulleted skills list (confirmed via production data: internal jobs,
-    // which always have a company-typed skills/requirements field, essentially never come back
-    // with empty skill arrays; external jobs frequently did). Unlike aboutSummary, this result IS a
-    // scoring input from now on and is never regenerated once set - there's no equivalent of
-    // aboutSummary's language/content-hash staleness check needed, since requirements/skills (like
-    // an internal job's own company-typed text) are read as opaque matching input, not displayed
-    // prose, and a re-import updating the description would already bump this job's row via a
-    // fresh externalJobId in practice rather than silently editing description in place.
-    private void ensureRequirementsAndSkills(ExternalJob job) {
-        if (!nullToEmpty(job.getRequirements()).isBlank() || !nullToEmpty(job.getSkills()).isBlank()) {
-            return;
-        }
+    private String getAboutSummaryField(ExternalJob job, String language) {
+        return switch (language) {
+            case "ar" -> job.getAboutSummaryAr();
+            case "he" -> job.getAboutSummaryHe();
+            default -> job.getAboutSummaryEn();
+        };
+    }
 
+    private void setAboutSummaryField(ExternalJob job, String language, String value) {
+        switch (language) {
+            case "ar" -> job.setAboutSummaryAr(value);
+            case "he" -> job.setAboutSummaryHe(value);
+            default -> job.setAboutSummaryEn(value);
+        }
+    }
+
+    // Proactively generates the about-summary for all three supported languages in memory only
+    // (no save) - used by prepareJobContent at import time so a candidate opening this job for
+    // the first time, in any language, already has a ready summary instead of waiting on
+    // getOrGenerateAboutSummary's on-demand path above. Each language is independent and
+    // best-effort: one language's AI failure must never block the other two, or the
+    // requirements/skills extraction, from completing for this job.
+    private void populateAboutSummaryAllLanguages(ExternalJob job) {
         String description = nullToEmpty(job.getDescription());
         if (description.isBlank()) {
             return;
         }
 
-        String raw = openAICVAnalysisService.extractRequirementsAndSkills(
-                job.getTitle(), job.getCompanyName(), description);
-        Map<String, Object> parsed = parseJsonToMap(raw);
-        if (parsed == null) {
-            return;
+        for (String language : SUPPORTED_LANGUAGES) {
+            if (getAboutSummaryField(job, language) != null) {
+                continue;
+            }
+            try {
+                String rawSummary = openAICVAnalysisService.summarizeJobDescription(
+                        job.getTitle(), job.getCompanyName(), description, language);
+                Map<String, Object> parsed = parseJsonToMap(rawSummary);
+                if (parsed == null || parsed.isEmpty()) {
+                    continue;
+                }
+                setAboutSummaryField(job, language, rawSummary);
+            } catch (Exception e) {
+                log.warn("Failed to generate '{}' about-summary for external job id={} - will fall back to "
+                        + "on-demand generation on first view", language, job.getId(), e);
+            }
+        }
+    }
+
+    // Proactively prepares everything about a newly-imported or content-changed external job that
+    // doesn't depend on any specific candidate - requirements/skills extraction, and the
+    // about-summary in every language - so that when a candidate opens it for the first time,
+    // only the actual candidate-specific match score computation remains; there's no more
+    // job-side AI extraction to wait on. Mutates in memory only, exactly like attachEmbeddings
+    // above - the caller's own saveAll persists the result in the same batch.
+    //
+    // Match Score itself is deliberately NOT computed here: it's a function of a specific
+    // candidate's CV, and there's no fixed, enumerable set of candidates to precompute it for at
+    // import time - it still gets computed (and cached) the first time any candidate actually
+    // requests it, same as before, just now against already-complete job data from the start.
+    private void prepareJobContent(List<ExternalJob> jobs) {
+        for (ExternalJob job : jobs) {
+            populateRequirementsAndSkills(job);
+            populateAboutSummaryAllLanguages(job);
+        }
+    }
+
+    // Lazily backfills ExternalJob#requirements/#skills the first time this specific job's match
+    // detail is requested (see getMatchDetailForExternalJob), for any job that missed the
+    // proactive import-time extraction below (see prepareJobContent) - e.g. a job imported before
+    // this existed, or whose import-time extraction failed.
+    private void ensureRequirementsAndSkills(ExternalJob job) {
+        if (populateRequirementsAndSkills(job)) {
+            externalJobRepository.save(job);
+        }
+    }
+
+    // Extracts and sets requirements/skills in memory only (no save) - shared by the lazy
+    // per-request backfill above and the batch import-time preparation below, which need the
+    // exact same extraction logic but save on different schedules (immediately vs. batched with
+    // the rest of an import cycle). Returns whether anything actually changed, so callers only
+    // pay for a save when there's something new to persist.
+    //
+    // Every provider today leaves requirements/skills blank (see
+    // JobicyJobProvider#resolveDescription), so the match-scoring prompt was showing the AI
+    // "Required skills: N/A" / "Requirements: N/A" even for postings whose full description
+    // clearly states real requirements, which measurably made the AI less likely to return a
+    // matched/missing-skills breakdown at all for jobs whose description reads as narrative prose
+    // rather than an obviously bulleted skills list (confirmed via production data: internal jobs,
+    // which always have a company-typed skills/requirements field, essentially never come back
+    // with empty skill arrays; external jobs frequently did).
+    private boolean populateRequirementsAndSkills(ExternalJob job) {
+        if (!nullToEmpty(job.getRequirements()).isBlank() || !nullToEmpty(job.getSkills()).isBlank()) {
+            return false;
         }
 
-        String requirements = String.valueOf(parsed.getOrDefault("requirements", "")).trim();
-        String skills = String.valueOf(parsed.getOrDefault("skills", "")).trim();
-        if (requirements.isBlank() && skills.isBlank()) {
-            // Generation failed, returned nothing usable, or the posting genuinely names no
-            // concrete requirements/skills - don't write empty strings as a "cached" result, so
-            // the next view retries instead of a transient failure permanently looking identical
-            // to "this posting truly has none".
-            return;
+        String description = nullToEmpty(job.getDescription());
+        if (description.isBlank()) {
+            return false;
         }
 
-        job.setRequirements(requirements.isBlank() ? null : requirements);
-        job.setSkills(skills.isBlank() ? null : skills);
-        externalJobRepository.save(job);
+        // Best-effort only. A production incident (see the "value too long for type character
+        // varying(255)" case that motivated this try/catch - the columns were still their old
+        // JPA-default width when this first shipped) proved that an uncaught failure HERE was
+        // taking the entire match-detail request down with it, denying the candidate their match
+        // score/skills breakdown entirely over something that has nothing to do with computing
+        // it. Any failure here - AI error, JSON parse failure, a future DB constraint, anything -
+        // must never prevent the real match computation, or the rest of an import batch, from
+        // proceeding; the next view (or the next import cycle's changedJobs pass) simply retries
+        // this (still-blank) extraction from scratch.
+        try {
+            String raw = openAICVAnalysisService.extractRequirementsAndSkills(
+                    job.getTitle(), job.getCompanyName(), description);
+            Map<String, Object> parsed = parseJsonToMap(raw);
+            if (parsed == null) {
+                return false;
+            }
+
+            String requirements = String.valueOf(parsed.getOrDefault("requirements", "")).trim();
+            String skills = String.valueOf(parsed.getOrDefault("skills", "")).trim();
+            if (requirements.isBlank() && skills.isBlank()) {
+                // Generation failed, returned nothing usable, or the posting genuinely names no
+                // concrete requirements/skills - don't write empty strings as a "cached" result,
+                // so the next attempt retries instead of a transient failure permanently looking
+                // identical to "this posting truly has none".
+                return false;
+            }
+
+            job.setRequirements(requirements.isBlank() ? null : requirements);
+            job.setSkills(skills.isBlank() ? null : skills);
+            return true;
+        } catch (Exception e) {
+            log.warn("Failed to extract requirements/skills for external job id={} - match scoring will proceed without them",
+                    job.getId(), e);
+            return false;
+        }
     }
 
     @SuppressWarnings("unchecked")
