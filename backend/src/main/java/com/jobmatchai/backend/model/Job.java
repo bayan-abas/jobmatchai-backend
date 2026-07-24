@@ -43,6 +43,16 @@ public class Job {
     @Column(name = "content_embedding_model")
     private String contentEmbeddingModel;
 
+    // Defaults every existing row (via the column's own DB default, for rows added before this
+    // field existed) and every newly-constructed Job (via this field initializer, for addJob's
+    // brand-new Job()) to ACTIVE - a job is open for applications unless a company explicitly
+    // closes it. columnDefinition carries the same default down to the DDL itself so ddl-auto's
+    // ALTER TABLE ADD COLUMN on an already-populated table backfills existing rows instead of
+    // failing on a NOT NULL column with no default.
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, columnDefinition = "varchar(20) default 'ACTIVE'")
+    private JobStatus status = JobStatus.ACTIVE;
+
     public Job() {}
 
     public Job(String title, String companyName, String companyEmail,
@@ -170,6 +180,14 @@ public class Job {
 
     public void setContentEmbeddingModel(String contentEmbeddingModel) {
         this.contentEmbeddingModel = contentEmbeddingModel;
+    }
+
+    public JobStatus getStatus() {
+        return status;
+    }
+
+    public void setStatus(JobStatus status) {
+        this.status = status;
     }
 
     @PrePersist

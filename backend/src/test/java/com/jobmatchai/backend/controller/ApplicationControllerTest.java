@@ -1,7 +1,11 @@
 package com.jobmatchai.backend.controller;
 
 import com.jobmatchai.backend.model.Application;
+import com.jobmatchai.backend.model.Job;
+import com.jobmatchai.backend.model.JobStatus;
 import com.jobmatchai.backend.repository.ApplicationRepository;
+import com.jobmatchai.backend.repository.JobRepository;
+import com.jobmatchai.backend.repository.UserRepository;
 import com.jobmatchai.backend.service.NotificationService;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -13,6 +17,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.security.core.Authentication;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -36,6 +41,12 @@ class ApplicationControllerTest {
     private ApplicationRepository applicationRepository;
 
     @Mock
+    private JobRepository jobRepository;
+
+    @Mock
+    private UserRepository userRepository;
+
+    @Mock
     private NotificationService notificationService;
 
     @Mock
@@ -47,7 +58,19 @@ class ApplicationControllerTest {
     void setUp() {
         applicationController = new ApplicationController();
         ReflectionTestUtils.setField(applicationController, "applicationRepository", applicationRepository);
+        ReflectionTestUtils.setField(applicationController, "jobRepository", jobRepository);
+        ReflectionTestUtils.setField(applicationController, "userRepository", userRepository);
         ReflectionTestUtils.setField(applicationController, "notificationService", notificationService);
+    }
+
+    private Job jobWithStatus(long id, String companyEmail, JobStatus status) {
+        Job job = new Job();
+        job.setId(id);
+        job.setTitle("Backend Engineer");
+        job.setCompanyName("Acme Corp");
+        job.setCompanyEmail(companyEmail);
+        job.setStatus(status);
+        return job;
     }
 
     private Application pendingApplication(long id, String companyEmail) {
@@ -230,5 +253,84 @@ class ApplicationControllerTest {
         assertThat(application.getStatus()).isEqualTo("AI Screening");
         verify(applicationRepository, never()).save(any(Application.class));
         verify(notificationService, never()).createNotification(any(), any(), any(), any());
+    }
+
+    // ---- applyToJob (POST /api/applications/apply) - CLOSED jobs must reject new applications
+    // even when called directly, regardless of how the frontend got the jobId ----
+
+    @Test
+    void applyToJob_isRejected_whenJobIsClosed_evenWhenCalledDirectlyWithoutGoingThroughTheListing() {
+        Job closedJob = jobWithStatus(50L, "owner@company.com", JobStatus.CLOSED);
+        when(jobRepository.findById(50L)).thenReturn(Optional.of(closedJob));
+        when(authentication.getName()).thenReturn("candidate@example.com");
+
+        ApplicationController.ApplyRequest request =
+                new ApplicationController.ApplyRequest(50L, "Backend Engineer", "Acme Corp", null);
+
+        Map<String, Object> response = applicationController.applyToJob(request, authentication);
+
+        assertThat(response.get("success")).isEqualTo(false);
+        assertThat(response.get("message")).isEqualTo("This job is no longer accepting applications.");
+        verify(applicationRepository, never()).save(any(Application.class));
+        verify(notificationService, never()).createNotification(any(), any(), any(), any());
+    }
+
+    @Test
+    void applyToJob_succeeds_whenJobIsActive() {
+        Job activeJob = jobWithStatus(51L, "owner@company.com", JobStatus.ACTIVE);
+        when(jobRepository.findById(51L)).thenReturn(Optional.of(activeJob));
+        when(authentication.getName()).thenReturn("candidate@example.com");
+        when(applicationRepository.findByCandidateEmailAndJobId("candidate@example.com", 51L))
+                .thenReturn(Optional.empty());
+        when(applicationRepository.save(any(Application.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        ApplicationController.ApplyRequest request =
+                new ApplicationController.ApplyRequest(51L, "Backend Engineer", "Acme Corp", null);
+
+        Map<String, Object> response = applicationController.applyToJob(request, authentication);
+
+        assertThat(response.get("success")).isEqualTo(true);
+        verify(applicationRepository).save(any(Application.class));
+    }
+
+    // ---- getApplicationsByCandidate (GET /api/applications/candidate/{email}) - enriches each
+    // application with the referenced job's CURRENT status, so a candidate keeps seeing an
+    // application whose job has since closed, marked accordingly ----
+
+    @Test
+    void getApplicationsByCandidate_enrichesEachApplicationWithTheJobsCurrentStatus() {
+        Application forClosedJob = pendingApplication(1L, "owner@company.com");
+        forClosedJob.setJobId(60L);
+        Application forActiveJob = pendingApplication(2L, "owner@company.com");
+        forActiveJob.setJobId(61L);
+
+        when(authentication.getName()).thenReturn("candidate@example.com");
+        when(applicationRepository.findByCandidateEmail("candidate@example.com"))
+                .thenReturn(List.of(forClosedJob, forActiveJob));
+        when(jobRepository.findAllById(List.of(60L, 61L))).thenReturn(List.of(
+                jobWithStatus(60L, "owner@company.com", JobStatus.CLOSED),
+                jobWithStatus(61L, "owner@company.com", JobStatus.ACTIVE)));
+
+        List<Application> result = applicationController.getApplicationsByCandidate(authentication);
+
+        assertThat(result).hasSize(2);
+        assertThat(forClosedJob.getJobStatus()).isEqualTo("CLOSED");
+        assertThat(forActiveJob.getJobStatus()).isEqualTo("ACTIVE");
+    }
+
+    @Test
+    void getApplicationsByCandidate_setsNullJobStatus_whenTheJobNoLongerExists() {
+        Application forDeletedJob = pendingApplication(3L, "owner@company.com");
+        forDeletedJob.setJobId(70L);
+
+        when(authentication.getName()).thenReturn("candidate@example.com");
+        when(applicationRepository.findByCandidateEmail("candidate@example.com"))
+                .thenReturn(List.of(forDeletedJob));
+        when(jobRepository.findAllById(List.of(70L))).thenReturn(List.of());
+
+        List<Application> result = applicationController.getApplicationsByCandidate(authentication);
+
+        assertThat(result).hasSize(1);
+        assertThat(forDeletedJob.getJobStatus()).isNull();
     }
 }

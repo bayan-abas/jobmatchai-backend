@@ -67,6 +67,15 @@ public class Application {
     @Column(columnDefinition = "TEXT")
     private String rejectionReason;
 
+    // Not persisted - the underlying Job's CURRENT status (see JobStatus), looked up and set by
+    // ApplicationController#getApplicationsByCandidate at read time so a candidate's "My
+    // Applications" list can show a Closed badge for an application whose job has since closed,
+    // without ever needing a real FK/join from Application to Job (there isn't one - jobId is a
+    // bare Long everywhere else in this class). Null when the referenced job no longer exists at
+    // all (e.g. deleted), same as before this field existed.
+    @Transient
+    private String jobStatus;
+
     public Application() {}
 
     public Application(Long jobId, String jobTitle, String companyName, String companyEmail,
@@ -210,5 +219,13 @@ public class Application {
 
     public void setRejectionReason(String rejectionReason) {
         this.rejectionReason = rejectionReason;
+    }
+
+    public String getJobStatus() {
+        return jobStatus;
+    }
+
+    public void setJobStatus(String jobStatus) {
+        this.jobStatus = jobStatus;
     }
 }

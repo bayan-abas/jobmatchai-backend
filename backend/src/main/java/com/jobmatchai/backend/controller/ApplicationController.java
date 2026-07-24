@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jobmatchai.backend.model.Application;
 import com.jobmatchai.backend.model.Job;
+import com.jobmatchai.backend.model.JobStatus;
 import com.jobmatchai.backend.model.User;
 import com.jobmatchai.backend.model.CandidateAiSummary;
 import com.jobmatchai.backend.model.CVAnalysis;
@@ -91,9 +92,29 @@ public class ApplicationController {
         return "Applications API is working";
     }
 
+    // Deliberately NOT filtered/blocked by the referenced job's status - a candidate must keep
+    // seeing an application here even after the company closes that job (see JobStatus). The
+    // jobStatus enrichment below is what lets the frontend show a "Closed" badge on it instead.
     @GetMapping("/candidate/{email}")
     public List<Application> getApplicationsByCandidate(Authentication authentication) {
-        return applicationRepository.findByCandidateEmail(authentication.getName());
+        List<Application> applications = applicationRepository.findByCandidateEmail(authentication.getName());
+
+        List<Long> jobIds = applications.stream().map(Application::getJobId).distinct().toList();
+        Map<Long, JobStatus> statusByJobId = new HashMap<>();
+        for (Job job : jobRepository.findAllById(jobIds)) {
+            statusByJobId.put(job.getId(), job.getStatus());
+        }
+
+        for (Application application : applications) {
+            JobStatus status = statusByJobId.get(application.getJobId());
+            // Null (rather than defaulting to ACTIVE) when the job no longer exists at all - e.g.
+            // deleted via JobController#deleteJob, which never cascade-deletes applications -
+            // deliberately distinct from "still active", so the frontend doesn't falsely imply
+            // the job is still open.
+            application.setJobStatus(status != null ? status.name() : null);
+        }
+
+        return applications;
     }
 
     public record ApplicantView(
@@ -262,6 +283,16 @@ public class ApplicationController {
             if (job == null) {
                 response.put("success", false);
                 response.put("message", "Job not found");
+                return response;
+            }
+
+            // Authoritative server-side gate - never trust that the candidate only ever reached
+            // this jobId through the (already-filtered-to-ACTIVE) listing endpoint. A closed job
+            // must reject a new application even when called directly with a stale/bookmarked
+            // jobId, exactly like the id-hijack checks elsewhere in this controller.
+            if (job.getStatus() == JobStatus.CLOSED) {
+                response.put("success", false);
+                response.put("message", "This job is no longer accepting applications.");
                 return response;
             }
 

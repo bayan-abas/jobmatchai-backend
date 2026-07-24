@@ -5,6 +5,7 @@ import com.jobmatchai.backend.model.Application;
 import com.jobmatchai.backend.model.CandidateAiSummary;
 import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.model.JobMatchScore;
+import com.jobmatchai.backend.model.JobStatus;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
 import com.jobmatchai.backend.repository.JobMatchNarrativeRepository;
@@ -85,8 +86,11 @@ public class JobController {
             String requirements,
             String skills,
             long applicantsCount,
-            String createdAt
+            String createdAt,
+            String status
     ) {}
+
+    public record JobStatusUpdateRequest(String status) {}
 
     // matchPercent/matchLabel are sourced from JobMatchScore (see getApplicationsForJob) - the
     // exact same number the candidate's own "Job Matches" page shows for this pair. null means
@@ -134,9 +138,13 @@ public class JobController {
         return "Jobs API is working";
     }
 
+    // Candidate/public listing - a CLOSED job must never appear here (see the ACTIVE/CLOSED
+    // lifecycle rationale on JobStatus). A candidate who already applied before a job closed
+    // still sees it via GET /api/applications/candidate/{email} (which is enriched with the
+    // job's current status separately, not sourced from this endpoint).
     @GetMapping("/all")
     public List<Job> getAllJobs() {
-        return jobRepository.findAll();
+        return jobRepository.findByStatus(JobStatus.ACTIVE);
     }
 
     @GetMapping("/company/{companyEmail}")
@@ -165,7 +173,8 @@ public class JobController {
                         job.getRequirements(),
                         job.getSkills(),
                         applicantCounts.getOrDefault(job.getId(), 0L),
-                        job.getCreatedAt() != null ? job.getCreatedAt().toString() : null
+                        job.getCreatedAt() != null ? job.getCreatedAt().toString() : null,
+                        job.getStatus().name()
                 ))
                 .toList();
     }
@@ -277,10 +286,7 @@ public class JobController {
                 job.getCreatedAt() != null ? job.getCreatedAt().toString() : null,
                 applications.size(),
                 averageMatchScore,
-                // No status column exists on Job yet - every job is treated as Active
-                // everywhere else in the app (see CompanyJobPostings.tsx), so this mirrors
-                // that same convention rather than inventing a new value.
-                "Active"
+                job.getStatus().name()
         );
 
         return ResponseEntity.ok(view);
@@ -385,6 +391,45 @@ public class JobController {
             response.put("message", "Failed to update job. Please try again.");
             return response;
         }
+    }
+
+    // Dedicated status-only endpoint (deliberately separate from the full-replace updateJob
+    // above) so the company job-postings card's Close/Reopen action never has to resend the
+    // entire job payload just to flip one field. Same ownership check as every other
+    // company-scoped job endpoint. Never touches applications or any match-score/queue data -
+    // closing a job is reversible (see reopen) and must never cascade into deleting anything,
+    // unlike deleteJob below.
+    @PatchMapping("/{id}/status")
+    @PreAuthorize("hasRole('COMPANY')")
+    public ResponseEntity<Map<String, Object>> updateJobStatus(
+            @PathVariable long id, @RequestBody JobStatusUpdateRequest request, Authentication authentication) {
+        Map<String, Object> response = new HashMap<>();
+
+        Job job = jobRepository.findById(id).orElse(null);
+
+        if (job == null || !authentication.getName().equals(job.getCompanyEmail())) {
+            response.put("success", false);
+            response.put("message", "Job not found");
+            return ResponseEntity.status(404).body(response);
+        }
+
+        JobStatus newStatus;
+        try {
+            newStatus = JobStatus.valueOf(
+                    request.status() == null ? "" : request.status().trim().toUpperCase());
+        } catch (IllegalArgumentException e) {
+            response.put("success", false);
+            response.put("message", "Invalid status. Must be ACTIVE or CLOSED.");
+            return ResponseEntity.badRequest().body(response);
+        }
+
+        job.setStatus(newStatus);
+        Job savedJob = jobRepository.save(job);
+
+        response.put("success", true);
+        response.put("message", "Job status updated successfully");
+        response.put("job", savedJob);
+        return ResponseEntity.ok(response);
     }
 
     // Transactional so the job row and its match-score/queue cleanup either all commit or all

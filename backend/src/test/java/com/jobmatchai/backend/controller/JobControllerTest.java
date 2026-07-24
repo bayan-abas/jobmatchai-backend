@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jobmatchai.backend.dto.JobCreateRequest;
 import com.jobmatchai.backend.model.Job;
+import com.jobmatchai.backend.model.JobStatus;
 import com.jobmatchai.backend.repository.JobRepository;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -12,9 +13,11 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -203,6 +206,85 @@ class JobControllerTest {
 
         assertThat(response.get("success")).isEqualTo(false);
         assertThat(existingJob.getTitle()).isEqualTo("Original Title");
+        verify(jobRepository, never()).save(any(Job.class));
+    }
+
+    // ---- getAllJobs (GET /api/jobs/all) - candidate/public listing must exclude CLOSED jobs ----
+
+    @Test
+    void getAllJobs_returnsOnlyActiveJobs_neverAllJobsRegardlessOfStatus() {
+        Job activeJob = existingJobOwnedBy(1L, "owner@company.com");
+        when(jobRepository.findByStatus(JobStatus.ACTIVE)).thenReturn(List.of(activeJob));
+
+        List<Job> result = jobController.getAllJobs();
+
+        assertThat(result).containsExactly(activeJob);
+        verify(jobRepository, never()).findAll();
+    }
+
+    // ---- updateJobStatus (PATCH /api/jobs/{id}/status) ----
+
+    @Test
+    void updateJobStatus_closesJob_whenCallerOwnsIt() {
+        long jobId = 7L;
+        Job existingJob = existingJobOwnedBy(jobId, "owner@company.com");
+        when(jobRepository.findById(jobId)).thenReturn(Optional.of(existingJob));
+        when(authentication.getName()).thenReturn("owner@company.com");
+        when(jobRepository.save(any(Job.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        ResponseEntity<Map<String, Object>> response = jobController.updateJobStatus(
+                jobId, new JobController.JobStatusUpdateRequest("CLOSED"), authentication);
+
+        assertThat(response.getStatusCode().is2xxSuccessful()).isTrue();
+        assertThat(response.getBody().get("success")).isEqualTo(true);
+        assertThat(existingJob.getStatus()).isEqualTo(JobStatus.CLOSED);
+        verify(jobRepository).save(existingJob);
+    }
+
+    @Test
+    void updateJobStatus_reopensClosedJob_whenCallerOwnsIt() {
+        long jobId = 8L;
+        Job existingJob = existingJobOwnedBy(jobId, "owner@company.com");
+        existingJob.setStatus(JobStatus.CLOSED);
+        when(jobRepository.findById(jobId)).thenReturn(Optional.of(existingJob));
+        when(authentication.getName()).thenReturn("owner@company.com");
+        when(jobRepository.save(any(Job.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        ResponseEntity<Map<String, Object>> response = jobController.updateJobStatus(
+                jobId, new JobController.JobStatusUpdateRequest("active"), authentication);
+
+        // Lowercase input accepted too - the endpoint normalizes before JobStatus.valueOf.
+        assertThat(response.getStatusCode().is2xxSuccessful()).isTrue();
+        assertThat(existingJob.getStatus()).isEqualTo(JobStatus.ACTIVE);
+    }
+
+    @Test
+    void updateJobStatus_isRejected_whenCallerDoesNotOwnJob() {
+        long jobId = 9L;
+        Job existingJob = existingJobOwnedBy(jobId, "real-owner@company.com");
+        when(jobRepository.findById(jobId)).thenReturn(Optional.of(existingJob));
+        when(authentication.getName()).thenReturn("attacker@evil.com");
+
+        ResponseEntity<Map<String, Object>> response = jobController.updateJobStatus(
+                jobId, new JobController.JobStatusUpdateRequest("CLOSED"), authentication);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(404);
+        assertThat(existingJob.getStatus()).isEqualTo(JobStatus.ACTIVE);
+        verify(jobRepository, never()).save(any(Job.class));
+    }
+
+    @Test
+    void updateJobStatus_isRejected_whenStatusValueIsInvalid() {
+        long jobId = 10L;
+        Job existingJob = existingJobOwnedBy(jobId, "owner@company.com");
+        when(jobRepository.findById(jobId)).thenReturn(Optional.of(existingJob));
+        when(authentication.getName()).thenReturn("owner@company.com");
+
+        ResponseEntity<Map<String, Object>> response = jobController.updateJobStatus(
+                jobId, new JobController.JobStatusUpdateRequest("PAUSED"), authentication);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(400);
+        assertThat(existingJob.getStatus()).isEqualTo(JobStatus.ACTIVE);
         verify(jobRepository, never()).save(any(Job.class));
     }
 }
