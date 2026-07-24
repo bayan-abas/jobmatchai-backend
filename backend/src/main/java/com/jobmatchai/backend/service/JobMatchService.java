@@ -250,7 +250,17 @@ public class JobMatchService {
     // because they cleared the YEARS bar) or scoring it as if the candidate had no experience at
     // all (which would misrepresent a genuinely senior candidate). Every previously-cached score
     // used neither of these signals, so this version bump forces a full recompute.
-    private static final String MATCH_SCHEMA_VERSION = "v21-fundamental-skill-inference-and-experience-type";
+    // v22: the SYNONYM RULE and FUNDAMENTAL-SKILL INFERENCE RULE already existed in v21, but a
+    // real case showed the AI wasn't reliably applying them - a doctor CV mentioning "Electronic
+    // Medical Records (EMR)" still came back with "Electronic Health Records" listed as a missing
+    // skill (a synonym miss - EMR/EHR are the same category of system), and "Pharmacology" listed
+    // as missing instead of matchedMandatorySkillsInferred despite being the prompt's own
+    // canonical physician-inference example. Added an explicit EMR/EHR example to the SYNONYM
+    // RULE, and a new CHECKING ORDER bullet spelling out the required sequence (literal match ->
+    // synonym -> fundamental inference -> only then missing) - the rules themselves didn't change,
+    // just how explicitly/early the prompt states them, so this bump forces a full recompute to
+    // give the sharper wording a chance to actually change the AI's output.
+    private static final String MATCH_SCHEMA_VERSION = "v22-synonym-and-inference-checking-order";
 
     // General/entry-level/vocational roles - ones that don't require specialized prior training,
     // a degree, or domain-specific tools to perform (see VocationalRoleClassifier for the actual
