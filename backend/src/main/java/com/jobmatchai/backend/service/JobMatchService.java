@@ -1577,7 +1577,9 @@ public class JobMatchService {
             JsonNode json = readDetailObject(result);
 
             if (json != null) {
-                core.setLanguageMatchPercent(json.has("languageMatchPercent") ? json.path("languageMatchPercent").asInt() : null);
+                core.setLanguageMatchPercent(json.has("languageMatchPercent")
+                        ? MatchScoreCalculator.clamp(json.path("languageMatchPercent").asInt())
+                        : null);
 
                 // computeJobMatches' matchedSkills/missingSkills go through validateMatch before
                 // ever being trusted - this free-text narrative call has no equivalent fixed-

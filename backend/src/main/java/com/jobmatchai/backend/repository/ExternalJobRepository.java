@@ -3,12 +3,27 @@ package com.jobmatchai.backend.repository;
 import com.jobmatchai.backend.model.ExternalJob;
 
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
 
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 
 public interface ExternalJobRepository extends JpaRepository<ExternalJob, Long> {
+
+    // Lightweight projection (just id/title/companyName, not the full row with its description/
+    // embedding/etc.) backing importFromProviders' title+company duplicate check against every
+    // ALREADY-STORED external job, not just the current fetch batch - see that method's own
+    // comment for why the batch-scoped check alone let a provider reassigning a new external id
+    // to an already-imported posting slip through as a true duplicate row.
+    interface TitleCompanyProjection {
+        Long getId();
+        String getTitle();
+        String getCompanyName();
+    }
+
+    @Query("SELECT e.id AS id, e.title AS title, e.companyName AS companyName FROM ExternalJob e")
+    List<TitleCompanyProjection> findAllTitleCompanyProjections();
     Optional<ExternalJob> findByExternalJobId(String externalJobId);
 
     // Used by the import cycle to find an already-seen posting so its content can be refreshed

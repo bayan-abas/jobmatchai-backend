@@ -276,7 +276,11 @@ public final class MatchScoreCalculator {
         return null;
     }
 
-    private static int clamp(int value) {
+    // Public - JobMatchService reuses this exact clamp for languageMatchPercent (the AI's raw
+    // narrative-detail JSON field, parsed straight from computeJobMatchDetail's response with no
+    // fixed-vocabulary/component-weighted derivation like every other *MatchPercent here), so every
+    // percentage this app ever persists or displays goes through the same 0-100 bound.
+    public static int clamp(int value) {
         return Math.max(0, Math.min(100, value));
     }
 }

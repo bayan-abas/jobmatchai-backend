@@ -169,6 +169,66 @@ public class ExternalJobController {
         }
     }
 
+    // Manual, one-time (re-runnable) cleanup for external jobs that were already duplicated in
+    // production before importFromProviders' title+company dedup was extended to cover full
+    // history - see ExternalJobService#removeDuplicateExternalJobs for the exact matching/removal
+    // logic. No AI calls, pure DB cleanup, so this is fast and cheap to call.
+    @PostMapping("/remove-duplicates")
+    public ResponseEntity<Map<String, Object>> removeDuplicates(
+            @RequestHeader(value = "X-Internal-Api-Key", required = false) String providedKey) {
+        Map<String, Object> response = new HashMap<>();
+
+        if (!isAuthorizedForInternalOps(providedKey)) {
+            response.put("success", false);
+            response.put("message", "Not authorized to trigger duplicate removal.");
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(response);
+        }
+
+        try {
+            ExternalJobService.DuplicateCleanupResult result = externalJobService.removeDuplicateExternalJobs();
+
+            response.put("success", true);
+            response.put("duplicateGroupsFound", result.duplicateGroupsFound());
+            response.put("rowsRemoved", result.rowsRemoved());
+
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            log.error("External job duplicate removal failed", e);
+            response.put("success", false);
+            response.put("message", "Duplicate removal failed. Please try again.");
+            return ResponseEntity.internalServerError().body(response);
+        }
+    }
+
+    // Manual, one-time (re-runnable) cleanup for external_jobs.skills rows already persisted with
+    // unsanitized tokens (see ExternalJobService#sanitizeSkillsList) - written before that filter
+    // existed. No AI calls, pure string processing, so this is fast and cheap to call.
+    @PostMapping("/resanitize-skills")
+    public ResponseEntity<Map<String, Object>> resanitizeSkills(
+            @RequestHeader(value = "X-Internal-Api-Key", required = false) String providedKey) {
+        Map<String, Object> response = new HashMap<>();
+
+        if (!isAuthorizedForInternalOps(providedKey)) {
+            response.put("success", false);
+            response.put("message", "Not authorized to trigger a skills resanitization.");
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(response);
+        }
+
+        try {
+            int changed = externalJobService.resanitizeExistingSkills();
+
+            response.put("success", true);
+            response.put("jobsChanged", changed);
+
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            log.error("External job skills resanitization failed", e);
+            response.put("success", false);
+            response.put("message", "Resanitization failed. Please try again.");
+            return ResponseEntity.internalServerError().body(response);
+        }
+    }
+
     @PostMapping("/match-scores")
     public ResponseEntity<?> getMatchScores(@RequestBody ExternalMatchScoreRequest request, Authentication authentication) {
         try {

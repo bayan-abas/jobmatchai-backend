@@ -87,7 +87,8 @@ public class SecurityConfig {
                         // "permitAll + its own independent secret check" pattern already used for
                         // the Stripe webhook above.
                         .requestMatchers(HttpMethod.POST, "/api/external-jobs/import",
-                                "/api/external-jobs/backfill-content").permitAll()
+                                "/api/external-jobs/backfill-content", "/api/external-jobs/remove-duplicates",
+                                "/api/external-jobs/resanitize-skills").permitAll()
                         // The deployment platform's health checker (Render, or any load balancer)
                         // calls this with no credentials at all - without this exception it fell
                         // under .anyRequest().authenticated() below and returned 401, which reads

@@ -8,6 +8,8 @@ import com.jobmatchai.backend.repository.ExternalJobRepository;
 import com.jobmatchai.backend.repository.JobMatchNarrativeRepository;
 import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.repository.MatchScoreJobRepository;
+import com.jobmatchai.backend.repository.RecentlyViewedJobRepository;
+import com.jobmatchai.backend.repository.SavedJobRepository;
 import com.jobmatchai.backend.service.provider.ExternalJobData;
 import com.jobmatchai.backend.service.provider.ExternalJobProvider;
 import com.jobmatchai.backend.util.HashUtil;
@@ -29,11 +31,14 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -70,6 +75,12 @@ public class ExternalJobService {
 
     @Autowired
     private MatchScoreJobRepository matchScoreJobRepository;
+
+    @Autowired
+    private SavedJobRepository savedJobRepository;
+
+    @Autowired
+    private RecentlyViewedJobRepository recentlyViewedJobRepository;
 
     /**
      * Spring auto-collects every ExternalJobProvider bean here, so all active sources (Jooble,
@@ -267,15 +278,25 @@ public class ExternalJobService {
         Map<String, ExternalJob> existingByApplyUrl = new HashMap<>();
         loadExistingJobs(fetched, existingByExternalId, existingByApplyUrl);
 
-        // Cross-provider dedup signal, scoped to this single import batch only: two different
-        // providers can aggregate the exact same real-world posting under two different external
-        // ids/apply urls (e.g. Jobicy's own id vs. JSearch re-aggregating the same LinkedIn/Indeed
-        // posting), which the id/url lookup above can never catch since neither value matches.
-        // Deliberately conservative - only an exact, case-insensitive, trimmed title+company match
-        // within the same cycle counts as a duplicate, never fuzzy matching, to avoid merging two
-        // genuinely different postings that simply share a common title (e.g. "Software Engineer"
-        // at two unrelated companies would have different companyName and NOT match).
+        // Cross-provider dedup signal: two different providers can aggregate the exact same
+        // real-world posting under two different external ids/apply urls (e.g. Jobicy's own id
+        // vs. JSearch re-aggregating the same LinkedIn/Indeed posting), which the id/url lookup
+        // above can never catch since neither value matches. Deliberately conservative - only an
+        // exact, case-insensitive, trimmed title+company match counts as a duplicate, never fuzzy
+        // matching, to avoid merging two genuinely different postings that simply share a common
+        // title (e.g. "Software Engineer" at two unrelated companies would have different
+        // companyName and NOT match).
+        //
+        // Seeded from EVERY already-stored external job, not just this batch - a production
+        // incident showed a batch-only check lets a real duplicate through the moment a provider
+        // reassigns a new external id/apply url to a posting that was already imported in an
+        // earlier cycle (id/url no longer match anything, so it looks "new" even though its
+        // title+company is already sitting in the table). Cheap: one lightweight id/title/company
+        // projection query, not the full row, regardless of how large external_jobs grows.
         Set<String> seenTitleCompanyKeys = new HashSet<>();
+        for (ExternalJobRepository.TitleCompanyProjection row : externalJobRepository.findAllTitleCompanyProjections()) {
+            addTitleCompanyKey(seenTitleCompanyKeys, row.getTitle(), row.getCompanyName());
+        }
 
         for (ExternalJobData data : fetched) {
             ExternalJob existing = existingByExternalId.get(data.externalId());
@@ -731,6 +752,36 @@ public class ExternalJobService {
         }
     }
 
+    // Single choke point for building the transient Job wrapper JobMatchService fingerprints and
+    // scores against - used by getMatchScoresForExternalJobs, streamMatchScoresForExternalJobs,
+    // AND getMatchDetailForExternalJob. Previously only getMatchDetailForExternalJob called
+    // ensureRequirementsAndSkills before building its Job, while the list/streaming paths built
+    // straight from whatever requirements/skills happened to already be on the row - for any job
+    // that hadn't been proactively prepared yet (or whose import-time prep had failed), that meant
+    // the list showed a score computed from blank requirements/skills while opening the same job's
+    // details computed (and cached) a DIFFERENT score from populated ones, since fingerprintJob's
+    // hash includes both fields. Routing every caller through this one method guarantees they
+    // always fingerprint/score the exact same content, so the list and details score can never
+    // diverge again, and a job already fully prepared (the normal case after import) never
+    // re-triggers anything here - ensureRequirementsAndSkills is a no-op once both fields are set.
+    private Job buildTransientJobForMatching(ExternalJob externalJob) {
+        ensureRequirementsAndSkills(externalJob);
+
+        Job job = new Job(
+                externalJob.getTitle(),
+                externalJob.getCompanyName(),
+                null,
+                externalJob.getLocation(),
+                externalJob.getType(),
+                externalJob.getSalary(),
+                externalJob.getDescription(),
+                externalJob.getRequirements(),
+                externalJob.getSkills()
+        );
+        job.setId(EXTERNAL_ID_OFFSET + externalJob.getId());
+        return job;
+    }
+
     // Extracts and sets requirements/skills in memory only (no save) - shared by the lazy
     // per-request backfill above and the batch import-time preparation below, which need the
     // exact same extraction logic but save on different schedules (immediately vs. batched with
@@ -781,7 +832,8 @@ public class ExternalJobService {
         }
 
         String requirements = String.valueOf(parsed.getOrDefault("requirements", "")).trim();
-        String skills = String.valueOf(parsed.getOrDefault("skills", "")).trim();
+        String skills = nullToEmpty(sanitizeSkillsList(
+                String.valueOf(parsed.getOrDefault("skills", "")).trim()));
         if (requirements.isBlank() && skills.isBlank()) {
             // Generation failed, returned nothing usable, or the posting genuinely names no
             // concrete requirements/skills - don't write empty strings as a "cached" result,
@@ -793,6 +845,37 @@ public class ExternalJobService {
         job.setRequirements(requirements.isBlank() ? null : requirements);
         job.setSkills(skills.isBlank() ? null : skills);
         return true;
+    }
+
+    // Non-skill tokens the AI occasionally hands back as if they were their own skill entries -
+    // punctuation-only fragments like ")"/".." already get caught by the "must contain a letter"
+    // filter below, but these have letters and need an explicit denylist instead.
+    private static final Set<String> DISALLOWED_SKILL_TOKENS =
+            Set.of("n/a", "na", "none", "unknown", "n\\a");
+
+    // Single choke point for cleaning up ExternalJob#skills before it's ever persisted - every
+    // consumer (ExternalJobCard.tsx, JobDetailsPage.tsx, the match-scoring prompt itself, etc.)
+    // splits this same comma/semicolon/pipe-separated string, so sanitizing once here means none
+    // of them need their own defensive filtering. Confirmed in production: the AI's raw output
+    // occasionally includes stray punctuation-only fragments (")", "0..", "..") as separate
+    // "skills", most likely nested parentheticals from the source description bleeding through
+    // the model's comma-separated list. A token survives only if it contains at least one letter
+    // (any language/script, so Arabic/Hebrew skill names aren't accidentally dropped) and isn't on
+    // the explicit denylist above - everything else (pure punctuation/digits/whitespace, or a
+    // "the posting names none" placeholder) is dropped rather than ever being stored as a skill.
+    private String sanitizeSkillsList(String rawSkills) {
+        if (rawSkills == null || rawSkills.isBlank()) {
+            return null;
+        }
+
+        List<String> cleaned = Arrays.stream(rawSkills.split("[,;|]"))
+                .map(String::trim)
+                .filter(token -> !token.isEmpty())
+                .filter(token -> token.chars().anyMatch(Character::isLetter))
+                .filter(token -> !DISALLOWED_SKILL_TOKENS.contains(token.toLowerCase(Locale.ROOT)))
+                .toList();
+
+        return cleaned.isEmpty() ? null : String.join(", ", cleaned);
     }
 
     @SuppressWarnings("unchecked")
@@ -839,20 +922,7 @@ public class ExternalJobService {
                     null, null, null, null, null, null, List.of(), List.of());
         }
 
-        ensureRequirementsAndSkills(externalJob);
-
-        Job transientJob = new Job(
-                externalJob.getTitle(),
-                externalJob.getCompanyName(),
-                null,
-                externalJob.getLocation(),
-                externalJob.getType(),
-                externalJob.getSalary(),
-                externalJob.getDescription(),
-                externalJob.getRequirements(),
-                externalJob.getSkills()
-        );
-        transientJob.setId(EXTERNAL_ID_OFFSET + externalJob.getId());
+        Job transientJob = buildTransientJobForMatching(externalJob);
 
         JobMatchService.MatchDetailResult result = jobMatchService.getMatchDetail(email, transientJob, language);
 
@@ -904,19 +974,7 @@ public class ExternalJobService {
 
         List<Job> transientJobs = new ArrayList<>();
         for (ExternalJob externalJob : externalJobs) {
-            Job job = new Job(
-                    externalJob.getTitle(),
-                    externalJob.getCompanyName(),
-                    null,
-                    externalJob.getLocation(),
-                    externalJob.getType(),
-                    externalJob.getSalary(),
-                    externalJob.getDescription(),
-                    externalJob.getRequirements(),
-                    externalJob.getSkills()
-            );
-            job.setId(EXTERNAL_ID_OFFSET + externalJob.getId());
-            transientJobs.add(job);
+            transientJobs.add(buildTransientJobForMatching(externalJob));
         }
 
         JobMatchService.MatchScoresResult result =
@@ -956,19 +1014,8 @@ public class ExternalJobService {
         Map<Long, float[]> jobEmbeddings = new HashMap<>();
 
         for (ExternalJob externalJob : externalJobs) {
-            Job job = new Job(
-                    externalJob.getTitle(),
-                    externalJob.getCompanyName(),
-                    null,
-                    externalJob.getLocation(),
-                    externalJob.getType(),
-                    externalJob.getSalary(),
-                    externalJob.getDescription(),
-                    externalJob.getRequirements(),
-                    externalJob.getSkills()
-            );
-            long offsetId = EXTERNAL_ID_OFFSET + externalJob.getId();
-            job.setId(offsetId);
+            Job job = buildTransientJobForMatching(externalJob);
+            long offsetId = job.getId();
             transientJobs.add(job);
 
             float[] vector = embeddingService.fromJson(externalJob.getContentEmbedding());
@@ -1137,5 +1184,85 @@ public class ExternalJobService {
                 || job.getAboutSummaryEn() == null
                 || job.getAboutSummaryAr() == null
                 || job.getAboutSummaryHe() == null;
+    }
+
+    public record DuplicateCleanupResult(int duplicateGroupsFound, int rowsRemoved) {}
+
+    // Manually-triggered (see POST /api/external-jobs/remove-duplicates) one-time cleanup for
+    // external jobs that were already duplicated in production BEFORE importFromProviders' title+
+    // company dedup check was extended to cover every already-stored job, not just the current
+    // fetch batch (see that method's own comment) - a provider reassigning a new external id to an
+    // already-imported posting slipped past the old batch-scoped check and landed as a second,
+    // true duplicate row. Groups every existing external job by normalized title+company, keeps
+    // the row with the LOWEST id in each group (the original, first-ever-imported copy - id order
+    // is reliable here, unlike importedAt, which every reappearing job's OWN row also gets bumped
+    // on, duplicate or not), and removes the rest along with their dependent match-score/queue/
+    // saved/recently-viewed rows so nothing is left pointing at a deleted id. Safe to re-run - a
+    // second call simply finds no groups with more than one row left.
+    public DuplicateCleanupResult removeDuplicateExternalJobs() {
+        List<ExternalJob> all = externalJobRepository.findAll();
+
+        Map<String, List<ExternalJob>> groups = new LinkedHashMap<>();
+        for (ExternalJob job : all) {
+            String key = titleCompanyKey(job.getTitle(), job.getCompanyName());
+            if (key == null) {
+                continue;
+            }
+            groups.computeIfAbsent(key, k -> new ArrayList<>()).add(job);
+        }
+
+        List<Long> idsToRemove = new ArrayList<>();
+        int duplicateGroups = 0;
+        for (List<ExternalJob> group : groups.values()) {
+            if (group.size() <= 1) {
+                continue;
+            }
+            duplicateGroups++;
+            group.stream()
+                    .sorted(Comparator.comparing(ExternalJob::getId))
+                    .skip(1)
+                    .forEach(job -> idsToRemove.add(job.getId()));
+        }
+
+        if (idsToRemove.isEmpty()) {
+            return new DuplicateCleanupResult(0, 0);
+        }
+
+        List<Long> offsetIds = idsToRemove.stream().map(id -> EXTERNAL_ID_OFFSET + id).toList();
+        jobMatchScoreRepository.deleteByJobIdIn(offsetIds);
+        jobMatchNarrativeRepository.deleteByJobIdIn(offsetIds);
+        matchScoreJobRepository.deleteByJobIdInAndJobType(idsToRemove, "external");
+        recentlyViewedJobRepository.deleteByJobIdInAndJobType(idsToRemove, "external");
+        savedJobRepository.deleteByJobIdInAndJobType(idsToRemove, "external");
+        externalJobRepository.deleteAllByIdInBatch(idsToRemove);
+
+        log.info("Removed {} duplicate external job(s) across {} title+company group(s).",
+                idsToRemove.size(), duplicateGroups);
+
+        return new DuplicateCleanupResult(duplicateGroups, idsToRemove.size());
+    }
+
+    // Manually-triggered (see POST /api/external-jobs/resanitize-skills) one-time cleanup for
+    // external_jobs.skills rows already persisted with unsanitized tokens (see
+    // sanitizeSkillsList's own doc comment) - written before that filter existed. Pure string
+    // processing, no AI calls, so this is fast and safe to run any number of times: a value
+    // that's already clean re-sanitizes to itself and is left alone.
+    public int resanitizeExistingSkills() {
+        List<ExternalJob> all = externalJobRepository.findAll();
+        List<ExternalJob> changed = new ArrayList<>();
+
+        for (ExternalJob job : all) {
+            String cleaned = sanitizeSkillsList(job.getSkills());
+            if (!Objects.equals(cleaned, job.getSkills())) {
+                job.setSkills(cleaned);
+                changed.add(job);
+            }
+        }
+
+        if (!changed.isEmpty()) {
+            externalJobRepository.saveAll(changed);
+        }
+
+        return changed.size();
     }
 }
