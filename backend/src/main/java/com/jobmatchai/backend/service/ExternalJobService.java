@@ -26,6 +26,7 @@ import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -1199,6 +1200,15 @@ public class ExternalJobService {
     // on, duplicate or not), and removes the rest along with their dependent match-score/queue/
     // saved/recently-viewed rows so nothing is left pointing at a deleted id. Safe to re-run - a
     // second call simply finds no groups with more than one row left.
+    //
+    // @Transactional here (unlike pruneExpiredJobs' equivalent sequence of deletes, which relies
+    // on a comment claiming each call is "individually atomic" - untrue for a derived delete-by
+    // query with no @Modifying/@Transactional of its own, see JobMatchScoreRepository#
+    // deleteByJobIdIn: it requires an ACTIVE transaction from the caller to call entityManager.
+    // remove(), and throws TransactionRequiredException without one) - confirmed via production
+    // error the first time this ran. Matches UserDeletionService#deleteUserAccount's identical
+    // multi-repository-delete pattern, which already works precisely because it's @Transactional.
+    @Transactional
     public DuplicateCleanupResult removeDuplicateExternalJobs() {
         List<ExternalJob> all = externalJobRepository.findAll();
 
