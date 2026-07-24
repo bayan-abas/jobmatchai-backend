@@ -260,7 +260,16 @@ public class JobMatchService {
     // synonym -> fundamental inference -> only then missing) - the rules themselves didn't change,
     // just how explicitly/early the prompt states them, so this bump forces a full recompute to
     // give the sharper wording a chance to actually change the AI's output.
-    private static final String MATCH_SCHEMA_VERSION = "v22-synonym-and-inference-checking-order";
+    // v23: v22's prompt-only fix wasn't enough - confirmed via production testing (fingerprint on
+    // the persisted row matched v22's exactly, proving a genuine fresh v22 recompute still put
+    // "Electronic Health Records" in missingMandatorySkills for a CV listing "Electronic Medical
+    // Records (EMR)") that the AI doesn't reliably apply its own SYNONYM RULE even when told to.
+    // applyParsedMatchToScore now reconciles every "missing" skill against the candidate's actual
+    // text deterministically (see reconcileAgainstCandidateText, reusing SkillClaimMatcher's
+    // existing word-overlap heuristic) - a code-side safety net that doesn't depend on the AI
+    // getting it right, on top of (not instead of) the v22 prompt wording. Every previously-cached
+    // score was computed without this reconciliation, so this bump forces a full recompute.
+    private static final String MATCH_SCHEMA_VERSION = "v23-deterministic-skill-synonym-reconciliation";
 
     // General/entry-level/vocational roles - ones that don't require specialized prior training,
     // a degree, or domain-specific tools to perform (see VocationalRoleClassifier for the actual
@@ -1264,16 +1273,27 @@ public class JobMatchService {
         // any other matched skill. See ParsedMatch's own comment for why they're kept in separate
         // AI-response arrays despite being merged again here - the separation is for validation,
         // not for scoring.
-        List<String> matchedRequired = concat(parsed.matchedMandatorySkills(), parsed.matchedMandatorySkillsInferred());
-        List<String> matchedPreferred = concat(parsed.matchedPreferredSkills(), parsed.matchedPreferredSkillsInferred());
+        // Deterministic safety net, not just a prompt instruction: a real production case (see
+        // MATCH_SCHEMA_VERSION's v22 comment) showed the AI doesn't reliably apply its own
+        // SYNONYM RULE for near-miss phrasings - a CV listing "Electronic Medical Records (EMR)"
+        // still came back with "Electronic Health Records" in missingMandatorySkills, even under
+        // the reinforced v22 prompt. Rather than trust prompt compliance alone, every "missing"
+        // skill is re-checked here against the candidate's actual text using the same word-overlap
+        // heuristic already trusted elsewhere in this class (SkillClaimMatcher, shared with the
+        // narrative-consistency filters) - anything substantially evidenced is promoted to matched
+        // regardless of what the AI itself concluded. This runs BEFORE skillsScore is computed, so
+        // a reconciled skill also correctly improves the score, not just the displayed list.
+        String candidateBlob = candidateSkillsBlob(analysis);
+        List<String> matchedRequired = new ArrayList<>(concat(parsed.matchedMandatorySkills(), parsed.matchedMandatorySkillsInferred()));
+        List<String> matchedPreferred = new ArrayList<>(concat(parsed.matchedPreferredSkills(), parsed.matchedPreferredSkillsInferred()));
+        List<String> missingRequired = reconcileAgainstCandidateText(parsed.missingMandatorySkills(), candidateBlob, matchedRequired);
+        List<String> missingPreferred = reconcileAgainstCandidateText(parsed.missingPreferredSkills(), candidateBlob, matchedPreferred);
         List<String> allMatched = concat(matchedRequired, matchedPreferred);
-        List<String> allMissing = concat(parsed.missingMandatorySkills(), parsed.missingPreferredSkills());
+        List<String> allMissing = concat(missingRequired, missingPreferred);
 
         Integer skillsScore = MatchScoreCalculator.computeSkillsScore(
-                parsed.matchedMandatorySkills().size() + parsed.matchedMandatorySkillsInferred().size(),
-                parsed.missingMandatorySkills().size(),
-                parsed.matchedPreferredSkills().size() + parsed.matchedPreferredSkillsInferred().size(),
-                parsed.missingPreferredSkills().size());
+                matchedRequired.size(), missingRequired.size(),
+                matchedPreferred.size(), missingPreferred.size());
 
         // Backend override: never score education for a general/vocational role even if the AI
         // mistakenly stated a requirement for one - see isGeneralVocationalRole.
@@ -1325,14 +1345,34 @@ public class JobMatchService {
         score.setMissingSkills(String.join("|", allMissing));
         score.setMatchedRequiredSkills(String.join("|", matchedRequired));
         score.setMatchedPreferredSkills(String.join("|", matchedPreferred));
-        score.setMissingRequiredSkills(String.join("|", parsed.missingMandatorySkills()));
-        score.setMissingPreferredSkills(String.join("|", parsed.missingPreferredSkills()));
+        score.setMissingRequiredSkills(String.join("|", missingRequired));
+        score.setMissingPreferredSkills(String.join("|", missingPreferred));
         score.setFieldRelevancePercent(weighted.componentPercents().get(ComponentKey.FIELD_RELEVANCE));
         score.setSkillsMatchPercent(weighted.componentPercents().get(ComponentKey.REQUIRED_SKILLS));
         score.setExperienceMatchPercent(weighted.componentPercents().get(ComponentKey.EXPERIENCE));
         score.setEducationMatchPercent(weighted.componentPercents().get(ComponentKey.EDUCATION));
         score.setCertificationMatchPercent(weighted.componentPercents().get(ComponentKey.CERTIFICATION));
         score.setLocationMatchPercent(weighted.componentPercents().get(ComponentKey.LOCATION));
+    }
+
+    // See applyParsedMatchToScore's call site comment. Returns the skills that are STILL genuinely
+    // missing (no substantial overlap with the candidate's own text); anything reclassified as
+    // evidenced is appended to `promoteInto` (the corresponding matched-skills list) instead.
+    // Deliberately reuses SkillClaimMatcher.mentionsSkill's existing majority-word-overlap
+    // threshold rather than a looser single-word check - lenient enough to catch a real paraphrase
+    // (e.g. "Electronic Health Records" against CV text naming "Electronic Medical Records (EMR)",
+    // 2 of 3 significant words overlap), but not so loose that an incidental shared word promotes a
+    // genuinely different, unrelated skill.
+    private List<String> reconcileAgainstCandidateText(List<String> missingSkills, String candidateBlob, List<String> promoteInto) {
+        List<String> stillMissing = new ArrayList<>();
+        for (String skill : missingSkills) {
+            if (SkillClaimMatcher.mentionsSkill(candidateBlob, skill)) {
+                promoteInto.add(skill);
+            } else {
+                stillMissing.add(skill);
+            }
+        }
+        return stillMissing;
     }
 
     // Holds the language-resolved copy of JobMatchScore's narrative fields - matchReason plus the
