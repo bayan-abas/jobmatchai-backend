@@ -269,7 +269,16 @@ public class JobMatchService {
     // existing word-overlap heuristic) - a code-side safety net that doesn't depend on the AI
     // getting it right, on top of (not instead of) the v22 prompt wording. Every previously-cached
     // score was computed without this reconciliation, so this bump forces a full recompute.
-    private static final String MATCH_SCHEMA_VERSION = "v23-deterministic-skill-synonym-reconciliation";
+    // v24: a test job posting with a title/description/skills of random keyboard-mashed text
+    // ("dsgd", "dfbdfbfd", "bgf" as a "skill") still returned a confident 21% match - the existing
+    // deterministic pre-AI gate (isInsufficientJobData) is LENGTH-based, not meaningfulness-based,
+    // so gibberish long enough to clear its character/skill-count thresholds sailed straight
+    // through to the AI, which then scored it as if it were real. Added a new STEP 0 to the
+    // prompt (postingLacksRealContent) asking the AI to recognize nonsensical/placeholder content
+    // BEFORE attempting any evaluation of it, routed through the exact same "insufficient data"
+    // verdict as the deterministic gate (see applyParsedMatchToScore). Every previously-cached
+    // score was computed without this check, so this bump forces a full recompute.
+    private static final String MATCH_SCHEMA_VERSION = "v24-gibberish-posting-detection";
 
     // General/entry-level/vocational roles - ones that don't require specialized prior training,
     // a degree, or domain-specific tools to perform (see VocationalRoleClassifier for the actual
@@ -580,7 +589,7 @@ public class JobMatchService {
                         + "keywords with your field, the core job itself calls for different training and experience.";
 
         ParsedMatch synthetic = new ParsedMatch(
-                jobId, job.getTitle(), jobContentFingerprint, "unrelated", reason,
+                jobId, job.getTitle(), jobContentFingerprint, false, "unrelated", reason,
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), null, null, null, null, null);
 
         applyParsedMatchToScore(score, synthetic, job, analysis, email, jobId,
@@ -618,7 +627,7 @@ public class JobMatchService {
             String cvFingerprint, String jobFingerprint, String jobContentFingerprint) {
 
         ParsedMatch synthetic = new ParsedMatch(
-                jobId, job.getTitle(), jobContentFingerprint, "unrelated",
+                jobId, job.getTitle(), jobContentFingerprint, false, "unrelated",
                 "Based on your profile, this role appears to be in a different field.",
                 List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), null, null, null, null, null);
 
@@ -1235,6 +1244,17 @@ public class JobMatchService {
     void applyParsedMatchToScore(
             JobMatchScore score, ParsedMatch parsed, Job job, CVAnalysis analysis, String email, long jobId,
             String cvFingerprint, String jobFingerprint, String jobContentFingerprint) {
+
+        // The AI judged this posting's own text to be nonsensical/placeholder/test data (see
+        // ParsedMatch#postingLacksRealContent's own comment for the production case that motivated
+        // this) - route through the exact same "insufficient data" verdict the deterministic
+        // pre-AI gate uses, instead of trusting a percentage computed against gibberish. Checked
+        // FIRST, before anything else below, since none of the normal scoring logic is meaningful
+        // here regardless of what fieldRelationCloseness/skills the AI also returned.
+        if (parsed.postingLacksRealContent()) {
+            applyInsufficientDataVerdict(score, email, jobId, cvFingerprint, jobFingerprint, jobContentFingerprint);
+            return;
+        }
 
         // A real AI verdict was reached (however it comes out below) - never the deterministic
         // "posting too thin to score" gate (see applyInsufficientDataVerdict), so this is always
@@ -2072,6 +2092,16 @@ public class JobMatchService {
             long jobId,
             String jobTitle,
             String jobFingerprint,
+            // True only when the AI judged this posting's own text (title/description/
+            // requirements/skills) to be nonsensical/placeholder/test data rather than a real job
+            // - see computeJobMatches' STEP 0. applyParsedMatchToScore routes this straight to the
+            // same "insufficient data" verdict the deterministic pre-AI gate uses (see
+            // isInsufficientJobData/applyInsufficientDataVerdict), instead of a normal score -
+            // found via a real production case: a test posting with a title/description/skills of
+            // random keyboard-mashed text ("dsgd", "dfbdfbfd", "bgf") was long enough in raw
+            // character count to clear that deterministic gate's thresholds, and the AI still
+            // returned a confident 21% match against complete gibberish.
+            boolean postingLacksRealContent,
             String fieldRelationCloseness,
             String matchReason,
             List<String> matchedMandatorySkills,
@@ -2145,6 +2175,7 @@ public class JobMatchService {
                 match.path("jobId").asLong(),
                 match.path("jobTitle").asText(""),
                 match.path("jobFingerprint").asText(""),
+                match.path("postingLacksRealContent").asBoolean(false),
                 closeness,
                 match.path("matchReason").asText(""),
                 fieldRelated ? toStringList(match.path("matchedMandatorySkills")) : List.of(),

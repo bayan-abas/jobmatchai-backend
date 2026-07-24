@@ -497,6 +497,8 @@ JOB POSTINGS TO SCORE (score each one independently, based only on its own requi
 
 IMPORTANT - YOUR ROLE HERE: you are the ANALYST, not the CALCULATOR. You never invent a raw 0-100 fit number for anything below. For every judgment, you pick ONE label from a small fixed list - the backend then turns that label into a number using a fixed formula. This is what keeps the score for an unchanged candidate+job pair from drifting between requests: the same label always produces the same number, deterministically, outside of you.
 
+STEP 0 - postingLacksRealContent (check this FIRST, before anything else, for EACH job independently): true only if this job's title/description/requirements/skills consist of nonsensical, placeholder, or test data rather than describing an actual role - e.g. random keyboard-mashed character strings ("dsgd", "dfbdfbfd", "asdfgh"), a single meaningless word repeated, obvious filler text ("test job", "lorem ipsum"), or a "skills" list made of strings that are not real skill/tool/credential names at all (e.g. "bgf", "xyz123"). This is NOT about a posting being short, sparse, or informally worded - a short but coherent, real posting (e.g. title "Electrician", description "Need a licensed electrician for residential wiring work", no other fields) is real content, not gibberish, and must get postingLacksRealContent=false with a normal full evaluation. Reserve true ONLY for postings where a human reader could not tell what real role, if any, is actually being described - a confident-sounding score computed against meaningless input is worse than admitting no evaluation is possible. If true for a job: skip every other step for that job entirely - set its fieldRelationCloseness to "unrelated", matchReason to "This job posting doesn't contain enough real information to evaluate.", leave every skill array empty, and every required* field null, exactly like a genuine "unrelated" verdict.
+
 STEP 1 - fieldRelationCloseness (professional-FIELD relevance only, never "is this a perfect match"):
 This asks ONLY how closely related the candidate's documented professional field/background is to this job's profession. It is NOT asking whether the candidate is a great match, has every required skill, has enough experience, or holds the exact license this specific role prefers - those questions belong entirely to steps 2/3, which can and should come out low for a weak-but-related fit. A low score elsewhere is the correct outcome for a related-but-weak fit; "unrelated" here is reserved for genuinely different professions.
 
@@ -536,7 +538,8 @@ STEP 3 - classify these job requirements ONLY if the posting actually states or 
 Return exactly this JSON structure:
 {
   "matches": [
-    { "jobId": 0, "jobTitle": "", "jobFingerprint": "", "fieldRelationCloseness": "unrelated", "matchReason": "",
+    { "jobId": 0, "jobTitle": "", "jobFingerprint": "", "postingLacksRealContent": false,
+      "fieldRelationCloseness": "unrelated", "matchReason": "",
       "matchedMandatorySkills": [], "matchedMandatorySkillsInferred": [], "missingMandatorySkills": [],
       "matchedPreferredSkills": [], "matchedPreferredSkillsInferred": [], "missingPreferredSkills": [],
       "requiredExperienceLevel": null, "requiredExperienceType": null, "candidateHasRequiredExperienceType": null,
@@ -547,6 +550,7 @@ Return exactly this JSON structure:
 Rules:
 - jobTitle: copy the EXACT "Title:" value given for that jobId above, unchanged.
 - jobFingerprint: copy the EXACT "Fingerprint:" value given for that jobId above, unchanged. Both jobTitle and jobFingerprint are cross-checks, not scoring inputs - they are what lets the caller catch a verdict that got attached to the wrong job internally, so get them exactly right, character for character.
+- postingLacksRealContent: true only for genuinely nonsensical/placeholder/test-data content per STEP 0 above - almost always false. A real posting, even a short or informally-worded one, is never true just for being brief.
 - fieldRelationCloseness: exactly one of "same_role", "same_specialization", "same_broad_field", "unrelated" - never any other value.
 - matchReason: ONE concise sentence (max ~25 words), SPECIFIC to this exact job and candidate (name the actual job title/profession involved - never reuse a generic stock phrase across different jobs), written directly to the candidate ("you"). If candidateHasRequiredExperienceType is false, prefer using this sentence to name that specific gap (e.g. "you have strong general medical experience, but this role specifically needs Clinical Research experience") rather than a generic "lacks experience" statement.
 - requiredExperienceLevel/requiredEducationLevel/requiredCertificationLevel: use null (not a placeholder string) when the posting gives no signal for that requirement.
