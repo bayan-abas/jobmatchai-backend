@@ -125,6 +125,17 @@ public class CVController {
         return ResponseEntity.badRequest().body(Map.of("success", false, "message", message));
     }
 
+    // Diagnostic-only: a short, single-line snippet of the extracted CV text for the log line
+    // right before validation, per the ask to be able to see what extraction actually produced
+    // (or didn't) without dumping an entire candidate's CV into the logs.
+    private static String previewOf(String text) {
+        if (text == null || text.isBlank()) {
+            return "";
+        }
+        String singleLine = text.replaceAll("\\s+", " ").trim();
+        return singleLine.length() > 150 ? singleLine.substring(0, 150) + "..." : singleLine;
+    }
+
     @PostMapping("/upload")
     public ResponseEntity<?> uploadCV(
             @RequestParam("file") MultipartFile file,
@@ -212,21 +223,37 @@ public class CVController {
             try {
                 file.transferTo(tempFile);
 
+                // Three genuinely distinct failure modes below, each surfaced with its own
+                // message instead of one generic "unreadable" catch-all - a file that opens fine
+                // for the user but has no real text layer (scanned/image-only) looks nothing like
+                // an actually corrupted/unparseable file, and both look nothing like a document
+                // that DID extract real text but isn't a CV. Conflating them previously meant a
+                // valid, non-corrupted PDF that simply had no extractable text (or - before the
+                // CVTextExtractorService fix above - got contaminated with binary byte-soup that
+                // passed the blank check and confused the AI classifier) was reported to the user
+                // as if the file itself were broken.
                 String extractedText;
                 try {
                     extractedText = cvTextExtractorService.extractText(tempFile);
                 } catch (Exception extractException) {
+                    log.warn("CV upload rejected - file could not be parsed as a valid {} document: user={} file={}",
+                            extension.toUpperCase(), resolvedEmail, originalFileName, extractException);
                     return badRequest(pickByLanguage(language,
-                            "The uploaded file does not contain readable CV text.",
-                            "الملف الذي تم رفعه لا يحتوي على نص سيرة ذاتية قابل للقراءة.",
-                            "הקובץ שהועלה אינו מכיל טקסט קורות חיים קריא."));
+                            "The uploaded file could not be processed - it may be corrupted, password-protected, or in an unsupported format.",
+                            "تعذّرت معالجة الملف الذي تم رفعه - قد يكون تالفًا أو محميًا بكلمة مرور أو بصيغة غير مدعومة.",
+                            "לא ניתן היה לעבד את הקובץ שהועלה - ייתכן שהוא פגום, מוגן בסיסמה, או בפורמט לא נתמך."));
                 }
+
+                log.info("CV upload text extraction: user={} file={} extractedLength={} preview=\"{}\"",
+                        resolvedEmail, originalFileName,
+                        extractedText == null ? 0 : extractedText.length(),
+                        previewOf(extractedText));
 
                 if (extractedText == null || extractedText.isBlank()) {
                     return badRequest(pickByLanguage(language,
-                            "The uploaded file does not contain readable CV text.",
-                            "الملف الذي تم رفعه لا يحتوي على نص سيرة ذاتية قابل للقراءة.",
-                            "הקובץ שהועלה אינו מכיל טקסט קורות חיים קריא."));
+                            "No readable text was found in this file - it looks like a scanned or image-only document with no real text layer. Please upload a text-based PDF or DOCX, not a photo or scanned copy.",
+                            "لم يتم العثور على نص قابل للقراءة في هذا الملف - يبدو أنه مستند ممسوح ضوئيًا أو يعتمد على صور فقط بدون طبقة نص حقيقية. يرجى رفع ملف PDF أو DOCX نصي، وليس صورة أو نسخة ممسوحة ضوئيًا.",
+                            "לא נמצא טקסט קריא בקובץ זה - נראה שמדובר במסמך סרוק או מבוסס תמונה בלבד, ללא שכבת טקסט אמיתית. אנא העלה קובץ PDF או DOCX המבוסס על טקסט, ולא צילום או סריקה."));
                 }
 
                 String validationResult = openAICVAnalysisService.validateCV(extractedText, language);
@@ -241,9 +268,9 @@ public class CVController {
 
                 if (!isCV || confidence < 75) {
                     return badRequest(pickByLanguage(language,
-                            "Invalid CV file: ",
-                            "ملف السيرة الذاتية غير صالح: ",
-                            "קובץ קורות החיים אינו תקין: ") + reason);
+                            "We were able to read this document, but it doesn't look like a CV/resume: ",
+                            "تمكّنا من قراءة هذا المستند، لكنه لا يبدو سيرة ذاتية: ",
+                            "הצלחנו לקרוא את המסמך הזה, אך הוא אינו נראה כקורות חיים: ") + reason);
                 }
 
                 fileStorageService.store(tempFile, fileName);

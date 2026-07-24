@@ -1,6 +1,8 @@
 package com.jobmatchai.backend.service;
 
 import org.apache.tika.Tika;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.util.HtmlUtils;
 
@@ -12,6 +14,8 @@ import java.util.regex.Pattern;
 
 @Service
 public class CVTextExtractorService {
+
+    private static final Logger log = LoggerFactory.getLogger(CVTextExtractorService.class);
 
     private final Tika tika = new Tika();
 
@@ -37,12 +41,51 @@ public class CVTextExtractorService {
     public String extractText(File file) {
         try {
             String tikaText = cleanExtractedText(tika.parseToString(file));
-            String embeddedText = extractEmbeddedWordHtml(file);
 
-            return isBetterExtraction(embeddedText, tikaText) ? embeddedText : tikaText;
+            // The raw-bytes-as-UTF-16LE rescue below only makes sense for Word-family binary
+            // formats, where Word can store paragraph text as UTF-16LE runs recoverable even when
+            // the container itself parses badly - it was never meaningful for PDF, whose binary
+            // structure decoded as UTF-16LE is essentially never blank (mostly replacement
+            // characters and stray symbols), yet isBetterExtraction() below unconditionally
+            // prefers ANY non-blank candidate over a blank current result. Applying it to every
+            // file type meant a PDF that genuinely has no extractable text (scanned/image-only, or
+            // fonts with no Unicode mapping) had its correctly-blank result silently replaced with
+            // meaningless byte-soup, which then passed CVController's isBlank() check and got sent
+            // to the AI CV-classifier as if it were real content - masking the true "no readable
+            // text" condition behind a confusing "not a CV" rejection instead.
+            String tikaTextForLogging = tikaText;
+            String extractedText = tikaText;
+            if (isWordDocument(file)) {
+                String embeddedText = extractEmbeddedWordHtml(file);
+                if (isBetterExtraction(embeddedText, tikaText)) {
+                    extractedText = embeddedText;
+                }
+            }
+
+            log.info("CV text extraction: file={} tikaLength={} finalLength={} preview=\"{}\"",
+                    file.getName(),
+                    tikaTextForLogging == null ? 0 : tikaTextForLogging.length(),
+                    extractedText == null ? 0 : extractedText.length(),
+                    previewOf(extractedText));
+
+            return extractedText;
         } catch (Exception e) {
-            throw new RuntimeException("Failed to extract text from CV file: " + e.getMessage());
+            log.warn("CV text extraction failed for file={}: {}", file.getName(), e.getMessage());
+            throw new RuntimeException("Failed to extract text from CV file: " + e.getMessage(), e);
         }
+    }
+
+    private boolean isWordDocument(File file) {
+        String name = file.getName().toLowerCase();
+        return name.endsWith(".docx") || name.endsWith(".doc");
+    }
+
+    private static String previewOf(String text) {
+        if (text == null || text.isBlank()) {
+            return "";
+        }
+        String singleLine = WHITESPACE_PATTERN.matcher(text.replace('\n', ' ')).replaceAll(" ").trim();
+        return singleLine.length() > 150 ? singleLine.substring(0, 150) + "..." : singleLine;
     }
 
     private String extractEmbeddedWordHtml(File file) {
