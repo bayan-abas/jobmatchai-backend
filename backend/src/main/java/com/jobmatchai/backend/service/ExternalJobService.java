@@ -38,6 +38,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
@@ -155,6 +156,14 @@ public class ExternalJobService {
     }
 
     public record ImportResult(int imported, int skipped, int total) {}
+
+    // One entry per content-prep operation ("requirements/skills" or "about-summary[en/ar/he]")
+    // that exhausted every retry attempt for a given job - surfaced back through
+    // backfillMissingContent's API response so a genuinely stuck job is reported with its exact
+    // id/title/field/reason instead of requiring a Render log lookup to diagnose.
+    public record ContentPrepFailure(Long jobId, String jobTitle, String field, String reason) {}
+
+    public record BackfillResult(int candidatesFound, int fullyCompleted, List<ContentPrepFailure> failures) {}
 
     private List<String> categoryKeywords() {
         List<String> keywords = Arrays.stream(categoryKeywordsCsv.split(","))
@@ -571,9 +580,18 @@ public class ExternalJobService {
     // or the requirements/skills extraction, from completing for this job. Idempotent per
     // language - a language already populated (e.g. from a previous import attempt) is skipped
     // rather than regenerated.
-    private void populateAboutSummaryAllLanguages(ExternalJob job) {
+    private void populateAboutSummaryAllLanguages(ExternalJob job, List<ContentPrepFailure> failures) {
         String description = nullToEmpty(job.getDescription());
         if (description.isBlank()) {
+            // Genuinely unprocessable, not a transient failure - there's no description to
+            // summarize, ever, for this job. Recorded so backfillMissingContent's caller sees an
+            // explicit reason instead of this job silently staying "missing" forever.
+            for (String language : SUPPORTED_LANGUAGES) {
+                if (getAboutSummaryField(job, language) == null) {
+                    failures.add(new ContentPrepFailure(job.getId(), job.getTitle(),
+                            "about-summary[" + language + "]", "job has no description to summarize"));
+                }
+            }
             return;
         }
 
@@ -582,7 +600,7 @@ public class ExternalJobService {
                 continue;
             }
 
-            String rawSummary = callWithRetry(job, "about-summary[" + language + "]", () ->
+            String rawSummary = callWithRetry(job, "about-summary[" + language + "]", failures, () ->
                     openAICVAnalysisService.summarizeJobDescription(
                             job.getTitle(), job.getCompanyName(), description, language));
             if (rawSummary == null) {
@@ -618,6 +636,10 @@ public class ExternalJobService {
     // fully isolated (each task only ever mutates its own ExternalJob instance), so one job's
     // task failing outright can never affect any other job's task.
     private void prepareJobContent(List<ExternalJob> jobs) {
+        prepareJobContent(jobs, new CopyOnWriteArrayList<>());
+    }
+
+    private void prepareJobContent(List<ExternalJob> jobs, List<ContentPrepFailure> failures) {
         if (jobs.isEmpty()) {
             return;
         }
@@ -631,8 +653,8 @@ public class ExternalJobService {
                         return;
                     }
                     try {
-                        populateRequirementsAndSkills(job);
-                        populateAboutSummaryAllLanguages(job);
+                        populateRequirementsAndSkills(job, failures);
+                        populateAboutSummaryAllLanguages(job, failures);
                     } finally {
                         contentPrepConcurrencyLimiter.release();
                     }
@@ -651,7 +673,7 @@ public class ExternalJobService {
     // instead of silently disappearing. Returns null (never throws) after exhausting all
     // attempts - callers already treat a null/failed extraction as "leave this field blank, the
     // existing lazy on-demand path will retry it later."
-    private String callWithRetry(ExternalJob job, String operation, Callable<String> call) {
+    private String callWithRetry(ExternalJob job, String operation, List<ContentPrepFailure> failures, Callable<String> call) {
         Exception lastError = null;
         for (int attempt = 1; attempt <= Math.max(1, contentPrepMaxAttempts); attempt++) {
             try {
@@ -671,6 +693,8 @@ public class ExternalJobService {
 
         log.warn("content-prep '{}' permanently failed for external job id={} title='{}' after {} attempt(s)",
                 operation, job.getId(), job.getTitle(), contentPrepMaxAttempts, lastError);
+        failures.add(new ContentPrepFailure(job.getId(), job.getTitle(), operation,
+                lastError == null ? "unknown" : lastError.getClass().getSimpleName() + ": " + lastError.getMessage()));
         return null;
     }
 
@@ -687,7 +711,7 @@ public class ExternalJobService {
     // proactive import-time extraction below (see prepareJobContent) - e.g. a job imported before
     // this existed, or whose import-time extraction failed.
     private void ensureRequirementsAndSkills(ExternalJob job) {
-        if (populateRequirementsAndSkills(job)) {
+        if (populateRequirementsAndSkills(job, new CopyOnWriteArrayList<>())) {
             externalJobRepository.save(job);
         }
     }
@@ -706,13 +730,16 @@ public class ExternalJobService {
     // rather than an obviously bulleted skills list (confirmed via production data: internal jobs,
     // which always have a company-typed skills/requirements field, essentially never come back
     // with empty skill arrays; external jobs frequently did).
-    private boolean populateRequirementsAndSkills(ExternalJob job) {
+    private boolean populateRequirementsAndSkills(ExternalJob job, List<ContentPrepFailure> failures) {
         if (!nullToEmpty(job.getRequirements()).isBlank() || !nullToEmpty(job.getSkills()).isBlank()) {
             return false;
         }
 
         String description = nullToEmpty(job.getDescription());
         if (description.isBlank()) {
+            // Genuinely unprocessable, not a transient failure - there's nothing to extract from.
+            failures.add(new ContentPrepFailure(job.getId(), job.getTitle(),
+                    "requirements/skills", "job has no description to extract from"));
             return false;
         }
 
@@ -725,7 +752,7 @@ public class ExternalJobService {
         // anything - can never prevent the real match computation, or the rest of an import
         // batch, from proceeding; the next view (or the next import cycle's changedJobs pass)
         // simply retries this (still-blank) extraction from scratch.
-        String raw = callWithRetry(job, "requirements/skills", () ->
+        String raw = callWithRetry(job, "requirements/skills", failures, () ->
                 openAICVAnalysisService.extractRequirementsAndSkills(job.getTitle(), job.getCompanyName(), description));
         if (raw == null) {
             return false;
@@ -1059,5 +1086,41 @@ public class ExternalJobService {
         }
         attachEmbeddings(missing);
         externalJobRepository.saveAll(missing);
+    }
+
+    // Manually-triggered (see POST /api/external-jobs/backfill-content), NOT a startup listener
+    // like backfillMissingEmbeddingsOnStartup above - catches up every existing external job
+    // still missing requirements/skills or any language's about-summary, e.g. because it was
+    // imported before prepareJobContent existed, or its import-time prep hit OpenAI rate limits
+    // (the exact incident that motivated hardening prepareJobContent with concurrency/retry -
+    // see callWithRetry). Deliberately re-runnable any number of times: every field this touches
+    // is checked and skipped if already populated (see populateRequirementsAndSkills/
+    // populateAboutSummaryAllLanguages), so it only ever fills in what's still missing, never
+    // regenerates already-populated data.
+    public BackfillResult backfillMissingContent() {
+        List<ExternalJob> candidates = externalJobRepository.findAll().stream()
+                .filter(this::isMissingAnyContentField)
+                .toList();
+
+        if (candidates.isEmpty()) {
+            return new BackfillResult(0, 0, List.of());
+        }
+
+        List<ContentPrepFailure> failures = new CopyOnWriteArrayList<>();
+        prepareJobContent(candidates, failures);
+        externalJobRepository.saveAll(candidates);
+
+        int fullyCompleted = (int) candidates.stream().filter(j -> !isMissingAnyContentField(j)).count();
+
+        return new BackfillResult(candidates.size(), fullyCompleted, failures);
+    }
+
+    private boolean isMissingAnyContentField(ExternalJob job) {
+        boolean missingRequirementsAndSkills =
+                nullToEmpty(job.getRequirements()).isBlank() && nullToEmpty(job.getSkills()).isBlank();
+        return missingRequirementsAndSkills
+                || job.getAboutSummaryEn() == null
+                || job.getAboutSummaryAr() == null
+                || job.getAboutSummaryHe() == null;
     }
 }

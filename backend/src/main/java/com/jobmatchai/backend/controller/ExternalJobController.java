@@ -135,6 +135,40 @@ public class ExternalJobController {
         }
     }
 
+    // Manual catch-up for existing external jobs missing requirements/skills or any language's
+    // about-summary (e.g. imported before ExternalJobService#prepareJobContent existed, or whose
+    // import-time prep hit OpenAI rate limits) - see ExternalJobService#backfillMissingContent
+    // for why this is safe to call any number of times (every field is skipped if already
+    // populated). Gated the same way as /import since it also fans out to OpenAI for however many
+    // jobs are still missing content.
+    @PostMapping("/backfill-content")
+    public ResponseEntity<Map<String, Object>> backfillContent(
+            @RequestHeader(value = "X-Internal-Api-Key", required = false) String providedKey) {
+        Map<String, Object> response = new HashMap<>();
+
+        if (!isAuthorizedForInternalOps(providedKey)) {
+            response.put("success", false);
+            response.put("message", "Not authorized to trigger a content backfill.");
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(response);
+        }
+
+        try {
+            ExternalJobService.BackfillResult result = externalJobService.backfillMissingContent();
+
+            response.put("success", true);
+            response.put("candidatesFound", result.candidatesFound());
+            response.put("fullyCompleted", result.fullyCompleted());
+            response.put("failures", result.failures());
+
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            log.error("External job content backfill failed", e);
+            response.put("success", false);
+            response.put("message", "Backfill failed. Please try again.");
+            return ResponseEntity.internalServerError().body(response);
+        }
+    }
+
     @PostMapping("/match-scores")
     public ResponseEntity<?> getMatchScores(@RequestBody ExternalMatchScoreRequest request, Authentication authentication) {
         try {
