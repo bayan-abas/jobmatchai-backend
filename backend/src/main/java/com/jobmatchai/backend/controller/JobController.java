@@ -14,6 +14,7 @@ import com.jobmatchai.backend.repository.MatchScoreJobRepository;
 import com.jobmatchai.backend.service.JobMatchService;
 import com.jobmatchai.backend.util.MatchLabelUtil;
 
+import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -292,7 +293,7 @@ public class JobController {
     // request; it comes exclusively from the authenticated caller.
     @PostMapping("/add")
     @PreAuthorize("hasRole('COMPANY')")
-    public Map<String, Object> addJob(@RequestBody JobCreateRequest request, Authentication authentication) {
+    public Map<String, Object> addJob(@Valid @RequestBody JobCreateRequest request, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
 
         try {

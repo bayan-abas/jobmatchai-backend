@@ -54,7 +54,18 @@ public class ExternalJob {
     // summary is stale and must be regenerated.
     private String aboutSummaryContentHash;
 
+    // Blank for every job as imported today (no provider currently supplies a separate
+    // structured requirements/skills field - see JobicyJobProvider#resolveDescription) - lazily
+    // backfilled once per job by ExternalJobService#ensureRequirementsAndSkills the first time a
+    // candidate opens that job's details page, extracted from the raw description via AI and
+    // persisted here permanently so every later match computation (any candidate, any code path)
+    // reads real structured text instead of "N/A". TEXT (not the JPA default VARCHAR(255)) since
+    // that default silently caps out far below what a real requirements paragraph needs -
+    // description already had to make the same change for the same reason.
+    @Column(columnDefinition = "TEXT")
     private String requirements;
+
+    @Column(columnDefinition = "TEXT")
     private String skills;
 
     // One of frontend/src/utils/jobInference.ts's INDUSTRY_KEYS, resolved by the provider from

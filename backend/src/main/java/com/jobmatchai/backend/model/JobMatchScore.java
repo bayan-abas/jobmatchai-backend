@@ -183,8 +183,14 @@ public class JobMatchScore {
         this.jobId = jobId;
     }
 
+    // Defensively re-clamped on every read (not just re-trusting whatever MatchScoreCalculator
+    // wrote at save time) - this is the single choke point every consumer of this entity reads
+    // through (JobController, ApplicationController, ExternalJobController, AI chat context,
+    // notifications), so it's the one place that can guarantee no caller ever sees an
+    // out-of-range percent, regardless of how a bad value got into this column (a future write
+    // path that forgets to clamp, or a row written by a since-changed scoring version).
     public Integer getMatchPercent() {
-        return matchPercent;
+        return matchPercent == null ? null : Math.max(0, Math.min(100, matchPercent));
     }
 
     public void setMatchPercent(Integer matchPercent) {

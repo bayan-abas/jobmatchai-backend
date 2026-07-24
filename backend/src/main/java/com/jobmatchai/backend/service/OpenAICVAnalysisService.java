@@ -773,6 +773,62 @@ Field instructions:
         }
     }
 
+    // Backfills the structured "Required skills"/"Requirements" text that internal job postings
+    // always have (typed directly by the company via PostJob's own form fields) but no external
+    // job provider currently supplies - see ExternalJobService#ensureRequirementsAndSkills. Run
+    // ONCE per external job, ever (the caller only invokes this when both fields are still blank,
+    // and persists the result permanently), never per-candidate or per-language - unlike
+    // summarizeJobDescription's aboutSummary, this output IS a scoring input from then on (it
+    // becomes this job's Job.requirements/Job.skills, read by buildJobsBlock exactly like an
+    // internal job's own company-typed text), so it must stay language-neutral and grounded
+    // strictly in the posting's own words, never invented, to avoid biasing or destabilizing the
+    // match score.
+    public String extractRequirementsAndSkills(String title, String companyName, String description) {
+        try {
+            String prompt = """
+Return ONLY a raw valid JSON object. No markdown. No explanations outside the JSON.
+
+You are extracting the structured requirements and required/preferred skills from ONE job posting's full description, so they can be stored as this posting's own "Requirements" and "Required skills" fields - exactly as if the company had typed them into those fields directly when creating the posting. You are NOT evaluating a candidate and NOT judging the job.
+
+JOB POSTING:
+Title: """ + nullToNA(title) + """
+
+Company: """ + nullToNA(companyName) + """
+
+Full description:
+""" + nullToNA(description) + """
+
+
+CRITICAL RULE: use ONLY information that actually appears in the description above, in its own original language. Never invent, assume, or translate anything not stated or clearly implied by the text. If the posting states no concrete requirements or skills at all, return empty strings - that is the correct, honest answer, not a failure.
+
+Return exactly this JSON structure:
+{
+  "requirements": "",
+  "skills": ""
+}
+
+Field instructions:
+- requirements: the posting's stated requirements/qualifications/experience-level expectations, as a short plain-text paragraph or semicolon-separated list (a few sentences at most) - the kind of text a company would type into a "Requirements" field, not a copy of the whole description.
+- skills: a comma-separated list of the concrete skills, tools, technologies, or qualifications the posting names as required or preferred (e.g. "Python, AWS, 5+ years experience, Bachelor's degree") - the kind of short list a company would type into a "Required skills" field. Empty string if the posting names no concrete skills.
+""";
+
+            Map<String, Object> body = Map.of(
+                    "model", model,
+                    "input", prompt,
+                    "store", false,
+                    "temperature", 0,
+                    "text", Map.of("format", Map.of("type", "json_object"))
+            );
+
+            Map<String, Object> response = callOpenAI(body);
+            String result = extractTextFromOpenAIResponse(response);
+
+            return (result == null || result.isBlank()) ? "{}" : result;
+        } catch (Exception e) {
+            return "{}";
+        }
+    }
+
     public String computeCandidateSummary(CVAnalysis analysis, Job job, String language) {
         try {
             String languageInstruction = switch (language == null ? "en" : language) {

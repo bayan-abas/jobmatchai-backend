@@ -473,6 +473,52 @@ public class ExternalJobService {
         return parsed;
     }
 
+    // Lazily backfills ExternalJob#requirements/#skills the first time this specific job's match
+    // detail is requested (see getMatchDetailForExternalJob) - every provider today leaves these
+    // blank (see JobicyJobProvider#resolveDescription), so the match-scoring prompt was showing
+    // the AI "Required skills: N/A" / "Requirements: N/A" even for postings whose full description
+    // clearly states real requirements, which measurably made the AI less likely to return a
+    // matched/missing-skills breakdown at all for jobs whose description reads as narrative prose
+    // rather than an obviously bulleted skills list (confirmed via production data: internal jobs,
+    // which always have a company-typed skills/requirements field, essentially never come back
+    // with empty skill arrays; external jobs frequently did). Unlike aboutSummary, this result IS a
+    // scoring input from now on and is never regenerated once set - there's no equivalent of
+    // aboutSummary's language/content-hash staleness check needed, since requirements/skills (like
+    // an internal job's own company-typed text) are read as opaque matching input, not displayed
+    // prose, and a re-import updating the description would already bump this job's row via a
+    // fresh externalJobId in practice rather than silently editing description in place.
+    private void ensureRequirementsAndSkills(ExternalJob job) {
+        if (!nullToEmpty(job.getRequirements()).isBlank() || !nullToEmpty(job.getSkills()).isBlank()) {
+            return;
+        }
+
+        String description = nullToEmpty(job.getDescription());
+        if (description.isBlank()) {
+            return;
+        }
+
+        String raw = openAICVAnalysisService.extractRequirementsAndSkills(
+                job.getTitle(), job.getCompanyName(), description);
+        Map<String, Object> parsed = parseJsonToMap(raw);
+        if (parsed == null) {
+            return;
+        }
+
+        String requirements = String.valueOf(parsed.getOrDefault("requirements", "")).trim();
+        String skills = String.valueOf(parsed.getOrDefault("skills", "")).trim();
+        if (requirements.isBlank() && skills.isBlank()) {
+            // Generation failed, returned nothing usable, or the posting genuinely names no
+            // concrete requirements/skills - don't write empty strings as a "cached" result, so
+            // the next view retries instead of a transient failure permanently looking identical
+            // to "this posting truly has none".
+            return;
+        }
+
+        job.setRequirements(requirements.isBlank() ? null : requirements);
+        job.setSkills(skills.isBlank() ? null : skills);
+        externalJobRepository.save(job);
+    }
+
     @SuppressWarnings("unchecked")
     private Map<String, Object> parseJsonToMap(String json) {
         if (json == null || json.isBlank()) {
@@ -516,6 +562,8 @@ public class ExternalJobService {
                     null, null, null, null, null, null, null, null, List.of(), List.of(),
                     null, null, null, null, null, null, List.of(), List.of());
         }
+
+        ensureRequirementsAndSkills(externalJob);
 
         Job transientJob = new Job(
                 externalJob.getTitle(),

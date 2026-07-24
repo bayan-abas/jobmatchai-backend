@@ -90,18 +90,37 @@ public class MatchScoreQueueWorker {
     private int staleInProgressMinutes;
 
     private Semaphore aiConcurrencyLimiter;
+    // Bounds how many processOne() calls actually RUN (not just how many are dispatched) at
+    // once - found via production incident: claimBatch() marks a whole batch IN_PROGRESS and
+    // dispatchExecutor (virtual-thread-per-task, uncapped) starts a task for every row
+    // immediately, but aiConcurrencyLimiter only ever gated the OpenAI call INSIDE
+    // computeChunkWithRetry - every row's surrounding DB work (the CVAnalysis lookup, the
+    // "already fresh" JobMatchScore check, the final save) ran fully unbounded outside that gate.
+    // With poll-interval-ms=1000 continuing to claim new batches every second regardless of how
+    // many previous rows were still mid-processing, concurrent DB connection demand from this
+    // worker alone scaled with backlog size, not with worker-concurrency - exhausting the Hikari
+    // pool (observed: "Connection is not available... waiting=30" against a pool of just a few
+    // connections) and making every affected row fail with CannotCreateTransactionException /
+    // DataAccessResourceFailureException, retry, fail again, and eventually land FAILED - which
+    // is what made already-cached-forever candidates see their match scores "recompute" on
+    // every visit: those jobs were never actually finishing, not being recalculated from a
+    // working cache. Acquiring this BEFORE any DB work starts (not just before the AI call) is
+    // what actually caps concurrent connection usage to workerConcurrency, matching what the
+    // comment on dispatchExecutor below always assumed was already true.
+    private Semaphore rowConcurrencyLimiter;
     private Bucket rateLimitBucket;
     private ExecutorService dispatchExecutor;
 
     @PostConstruct
     void init() {
         aiConcurrencyLimiter = new Semaphore(Math.max(1, workerConcurrency));
+        rowConcurrencyLimiter = new Semaphore(Math.max(1, workerConcurrency));
         rateLimitBucket = Bucket.builder()
                 .addLimit(limit -> limit.capacity(Math.max(1, openAiRateLimitPerSecond))
                         .refillGreedy(Math.max(1, openAiRateLimitPerSecond), java.time.Duration.ofSeconds(1)))
                 .build();
-        // Cheap to dispatch generously on virtual threads - the real throttle is
-        // aiConcurrencyLimiter/rateLimitBucket inside computeChunkWithRetry, not this pool's size.
+        // Cheap to dispatch generously on virtual threads - a claimed-but-not-yet-processed row
+        // just blocks on rowConcurrencyLimiter in memory (no DB connection held) until its turn.
         dispatchExecutor = Executors.newVirtualThreadPerTaskExecutor();
     }
 
@@ -121,7 +140,19 @@ public class MatchScoreQueueWorker {
 
         log.info("match-score-queue claimed batch size={}", batch.size());
         for (MatchScoreJob row : batch) {
-            dispatchExecutor.execute(() -> processOne(row));
+            dispatchExecutor.execute(() -> {
+                try {
+                    rowConcurrencyLimiter.acquire();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                try {
+                    processOne(row);
+                } finally {
+                    rowConcurrencyLimiter.release();
+                }
+            });
         }
     }
 

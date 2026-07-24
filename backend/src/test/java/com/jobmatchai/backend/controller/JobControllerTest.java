@@ -74,7 +74,8 @@ class JobControllerTest {
 
         JobCreateRequest request = new JobCreateRequest(
                 "Backend Engineer", "Acme Corp", "Remote", "Full-time",
-                "$100k-$120k", "Build things", "5 years Java", "Java,Spring");
+                "$100k-$120k", "Build things", "5 years Java", "Java,Spring",
+                null, null, null, null);
 
         Map<String, Object> response = jobController.addJob(request, authentication);
 
