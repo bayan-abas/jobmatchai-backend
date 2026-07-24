@@ -278,7 +278,18 @@ public class JobMatchService {
     // BEFORE attempting any evaluation of it, routed through the exact same "insufficient data"
     // verdict as the deterministic gate (see applyParsedMatchToScore). Every previously-cached
     // score was computed without this check, so this bump forces a full recompute.
-    private static final String MATCH_SCHEMA_VERSION = "v24-gibberish-posting-detection";
+    // v25: v24's postingLacksRealContent wasn't strict enough - a real test case (job title
+    // "dsgd", description "dfbdfbfd", but a skills field containing "React, TypeScript, bgf")
+    // still scored 21% with a fabricated "senior software development role" match reason - the AI
+    // was inferring a plausible role from a couple of individually-recognizable skill words even
+    // though the title/description themselves were nonsense. Rewrote STEP 0 to anchor the
+    // judgment on the TITLE and DESCRIPTION specifically (does the posting itself state a real
+    // role in real words), explicit that a few real-looking terms scattered in
+    // Requirements/Skills next to a nonsense title/description do not redeem it, and explicit that
+    // guessing/inferring a plausible role from fragments is itself the signal to flag it. Every
+    // previously-cached score was computed against the looser v24 wording, so this bump forces a
+    // full recompute.
+    private static final String MATCH_SCHEMA_VERSION = "v25-stricter-gibberish-detection";
 
     // General/entry-level/vocational roles - ones that don't require specialized prior training,
     // a degree, or domain-specific tools to perform (see VocationalRoleClassifier for the actual
