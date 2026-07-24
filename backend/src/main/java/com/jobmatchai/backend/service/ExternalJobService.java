@@ -12,6 +12,10 @@ import com.jobmatchai.backend.service.provider.ExternalJobData;
 import com.jobmatchai.backend.service.provider.ExternalJobProvider;
 import com.jobmatchai.backend.util.HashUtil;
 
+import io.github.bucket4j.Bucket;
+
+import jakarta.annotation.PostConstruct;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -21,6 +25,7 @@ import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -31,6 +36,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 
 @Service
 public class ExternalJobService {
@@ -109,6 +119,40 @@ public class ExternalJobService {
     // broader-outage case).
     @Value("${externaljobs.retention.days:3}")
     private int retentionDays;
+
+    // How many jobs' content-prep (requirements/skills + about-summary) runs at once during
+    // import - found via production incident: firing ~200 sequential OpenAI calls (50 jobs x up
+    // to 4 calls each) back-to-back with zero throttling burned through OpenAI's rate limit
+    // partway through, silently leaving most of the batch unprepared (only ~14/50 jobs got
+    // requirements/skills). A small bounded concurrency, paired with the rate limiter below,
+    // keeps the batch fast without bursting past what the API actually allows.
+    @Value("${externaljobs.import.content-prep-concurrency:4}")
+    private int contentPrepConcurrency;
+
+    // Independent of the concurrency cap above - a hard calls-per-second ceiling shared across
+    // every concurrent job, so a wider concurrency setting can never spike faster than this.
+    // Mirrors MatchScoreQueueWorker's identical rate-limit-vs-concurrency split.
+    @Value("${externaljobs.import.content-prep-rate-limit-per-second:3}")
+    private int contentPrepRateLimitPerSecond;
+
+    @Value("${externaljobs.import.content-prep-max-attempts:3}")
+    private int contentPrepMaxAttempts;
+
+    private Semaphore contentPrepConcurrencyLimiter;
+    private Bucket contentPrepRateLimitBucket;
+    private ExecutorService contentPrepExecutor;
+
+    @PostConstruct
+    void initContentPrep() {
+        contentPrepConcurrencyLimiter = new Semaphore(Math.max(1, contentPrepConcurrency));
+        contentPrepRateLimitBucket = Bucket.builder()
+                .addLimit(limit -> limit.capacity(Math.max(1, contentPrepRateLimitPerSecond))
+                        .refillGreedy(Math.max(1, contentPrepRateLimitPerSecond), Duration.ofSeconds(1)))
+                .build();
+        // Cheap to dispatch generously on virtual threads - a job waiting for its turn just blocks
+        // on contentPrepConcurrencyLimiter in memory, holding no DB connection or OS thread.
+        contentPrepExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    }
 
     public record ImportResult(int imported, int skipped, int total) {}
 
@@ -475,8 +519,20 @@ public class ExternalJobService {
             }
         }
 
-        String rawSummary = openAICVAnalysisService.summarizeJobDescription(
-                job.getTitle(), job.getCompanyName(), description, effectiveLanguage);
+        String rawSummary;
+        try {
+            // summarizeJobDescription throws on an OpenAI/network failure (see its own doc
+            // comment) rather than swallowing to "{}" - callers on the import-time path retry via
+            // callWithRetry, but this on-demand path just needs to fail open: the next view
+            // retries instead of getting stuck on a blank summary forever.
+            rawSummary = openAICVAnalysisService.summarizeJobDescription(
+                    job.getTitle(), job.getCompanyName(), description, effectiveLanguage);
+        } catch (Exception e) {
+            log.warn("On-demand about-summary generation failed for external job id={} language={}",
+                    externalJobId, effectiveLanguage, e);
+            return Map.of();
+        }
+
         Map<String, Object> parsed = parseJsonToMap(rawSummary);
 
         if (parsed == null || parsed.isEmpty()) {
@@ -511,8 +567,10 @@ public class ExternalJobService {
     // (no save) - used by prepareJobContent at import time so a candidate opening this job for
     // the first time, in any language, already has a ready summary instead of waiting on
     // getOrGenerateAboutSummary's on-demand path above. Each language is independent and
-    // best-effort: one language's AI failure must never block the other two, or the
-    // requirements/skills extraction, from completing for this job.
+    // best-effort (via callWithRetry): one language's AI failure must never block the other two,
+    // or the requirements/skills extraction, from completing for this job. Idempotent per
+    // language - a language already populated (e.g. from a previous import attempt) is skipped
+    // rather than regenerated.
     private void populateAboutSummaryAllLanguages(ExternalJob job) {
         String description = nullToEmpty(job.getDescription());
         if (description.isBlank()) {
@@ -523,18 +581,21 @@ public class ExternalJobService {
             if (getAboutSummaryField(job, language) != null) {
                 continue;
             }
-            try {
-                String rawSummary = openAICVAnalysisService.summarizeJobDescription(
-                        job.getTitle(), job.getCompanyName(), description, language);
-                Map<String, Object> parsed = parseJsonToMap(rawSummary);
-                if (parsed == null || parsed.isEmpty()) {
-                    continue;
-                }
-                setAboutSummaryField(job, language, rawSummary);
-            } catch (Exception e) {
-                log.warn("Failed to generate '{}' about-summary for external job id={} - will fall back to "
-                        + "on-demand generation on first view", language, job.getId(), e);
+
+            String rawSummary = callWithRetry(job, "about-summary[" + language + "]", () ->
+                    openAICVAnalysisService.summarizeJobDescription(
+                            job.getTitle(), job.getCompanyName(), description, language));
+            if (rawSummary == null) {
+                continue;
             }
+
+            Map<String, Object> parsed = parseJsonToMap(rawSummary);
+            if (parsed == null || parsed.isEmpty()) {
+                log.warn("content-prep about-summary[{}] returned no usable content for external job id={} title='{}'",
+                        language, job.getId(), job.getTitle());
+                continue;
+            }
+            setAboutSummaryField(job, language, rawSummary);
         }
     }
 
@@ -549,10 +610,75 @@ public class ExternalJobService {
     // candidate's CV, and there's no fixed, enumerable set of candidates to precompute it for at
     // import time - it still gets computed (and cached) the first time any candidate actually
     // requests it, same as before, just now against already-complete job data from the start.
+    //
+    // Runs one task per job on a bounded pool (contentPrepConcurrencyLimiter), not one big
+    // sequential loop - found via production incident: firing ~200 sequential OpenAI calls with
+    // zero concurrency control (and no retry) for a 50-job batch burned through OpenAI's rate
+    // limit partway through and silently left most of the batch unprepared. Per-job work is still
+    // fully isolated (each task only ever mutates its own ExternalJob instance), so one job's
+    // task failing outright can never affect any other job's task.
     private void prepareJobContent(List<ExternalJob> jobs) {
-        for (ExternalJob job : jobs) {
-            populateRequirementsAndSkills(job);
-            populateAboutSummaryAllLanguages(job);
+        if (jobs.isEmpty()) {
+            return;
+        }
+
+        List<CompletableFuture<Void>> tasks = jobs.stream()
+                .map(job -> CompletableFuture.runAsync(() -> {
+                    try {
+                        contentPrepConcurrencyLimiter.acquire();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    try {
+                        populateRequirementsAndSkills(job);
+                        populateAboutSummaryAllLanguages(job);
+                    } finally {
+                        contentPrepConcurrencyLimiter.release();
+                    }
+                }, contentPrepExecutor))
+                .toList();
+
+        tasks.forEach(CompletableFuture::join);
+    }
+
+    // Shared retry wrapper for every content-prep AI call (requirements/skills extraction, and
+    // each language's about-summary) - retries on ANY failure (OpenAI rate limit, transient
+    // network error, etc.) up to contentPrepMaxAttempts times with exponential backoff (1s, 2s,
+    // 4s, ...), rate-limited via contentPrepRateLimitBucket so concurrent jobs' calls stay under
+    // OpenAI's actual per-second allowance instead of bursting. Every attempt (and the final
+    // giving-up) is logged with the specific job id/title/operation, so a failure is traceable
+    // instead of silently disappearing. Returns null (never throws) after exhausting all
+    // attempts - callers already treat a null/failed extraction as "leave this field blank, the
+    // existing lazy on-demand path will retry it later."
+    private String callWithRetry(ExternalJob job, String operation, Callable<String> call) {
+        Exception lastError = null;
+        for (int attempt = 1; attempt <= Math.max(1, contentPrepMaxAttempts); attempt++) {
+            try {
+                contentPrepRateLimitBucket.asBlocking().consume(1);
+                return call.call();
+            } catch (Exception e) {
+                lastError = e;
+                if (attempt >= contentPrepMaxAttempts) {
+                    break;
+                }
+                long backoffMs = 1000L << (attempt - 1);
+                log.warn("content-prep '{}' attempt {}/{} failed for external job id={} title='{}' - retrying in {}ms: {}",
+                        operation, attempt, contentPrepMaxAttempts, job.getId(), job.getTitle(), backoffMs, e.toString());
+                sleepQuietly(backoffMs);
+            }
+        }
+
+        log.warn("content-prep '{}' permanently failed for external job id={} title='{}' after {} attempt(s)",
+                operation, job.getId(), job.getTitle(), contentPrepMaxAttempts, lastError);
+        return null;
+    }
+
+    private void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -590,41 +716,41 @@ public class ExternalJobService {
             return false;
         }
 
-        // Best-effort only. A production incident (see the "value too long for type character
-        // varying(255)" case that motivated this try/catch - the columns were still their old
-        // JPA-default width when this first shipped) proved that an uncaught failure HERE was
-        // taking the entire match-detail request down with it, denying the candidate their match
-        // score/skills breakdown entirely over something that has nothing to do with computing
-        // it. Any failure here - AI error, JSON parse failure, a future DB constraint, anything -
-        // must never prevent the real match computation, or the rest of an import batch, from
-        // proceeding; the next view (or the next import cycle's changedJobs pass) simply retries
-        // this (still-blank) extraction from scratch.
-        try {
-            String raw = openAICVAnalysisService.extractRequirementsAndSkills(
-                    job.getTitle(), job.getCompanyName(), description);
-            Map<String, Object> parsed = parseJsonToMap(raw);
-            if (parsed == null) {
-                return false;
-            }
-
-            String requirements = String.valueOf(parsed.getOrDefault("requirements", "")).trim();
-            String skills = String.valueOf(parsed.getOrDefault("skills", "")).trim();
-            if (requirements.isBlank() && skills.isBlank()) {
-                // Generation failed, returned nothing usable, or the posting genuinely names no
-                // concrete requirements/skills - don't write empty strings as a "cached" result,
-                // so the next attempt retries instead of a transient failure permanently looking
-                // identical to "this posting truly has none".
-                return false;
-            }
-
-            job.setRequirements(requirements.isBlank() ? null : requirements);
-            job.setSkills(skills.isBlank() ? null : skills);
-            return true;
-        } catch (Exception e) {
-            log.warn("Failed to extract requirements/skills for external job id={} - match scoring will proceed without them",
-                    job.getId(), e);
+        // Best-effort only, via callWithRetry (handles its own retry/backoff and logging). A
+        // production incident (the "value too long for type character varying(255)" case) proved
+        // an uncaught failure HERE was taking the entire match-detail request down with it,
+        // denying the candidate their match score/skills breakdown entirely over something that
+        // has nothing to do with computing it - callWithRetry never throws, so any failure -
+        // AI error (after exhausting retries), JSON parse failure, a future DB constraint,
+        // anything - can never prevent the real match computation, or the rest of an import
+        // batch, from proceeding; the next view (or the next import cycle's changedJobs pass)
+        // simply retries this (still-blank) extraction from scratch.
+        String raw = callWithRetry(job, "requirements/skills", () ->
+                openAICVAnalysisService.extractRequirementsAndSkills(job.getTitle(), job.getCompanyName(), description));
+        if (raw == null) {
             return false;
         }
+
+        Map<String, Object> parsed = parseJsonToMap(raw);
+        if (parsed == null) {
+            log.warn("content-prep requirements/skills returned unparseable JSON for external job id={} title='{}'",
+                    job.getId(), job.getTitle());
+            return false;
+        }
+
+        String requirements = String.valueOf(parsed.getOrDefault("requirements", "")).trim();
+        String skills = String.valueOf(parsed.getOrDefault("skills", "")).trim();
+        if (requirements.isBlank() && skills.isBlank()) {
+            // Generation failed, returned nothing usable, or the posting genuinely names no
+            // concrete requirements/skills - don't write empty strings as a "cached" result,
+            // so the next attempt retries instead of a transient failure permanently looking
+            // identical to "this posting truly has none".
+            return false;
+        }
+
+        job.setRequirements(requirements.isBlank() ? null : requirements);
+        job.setSkills(skills.isBlank() ? null : skills);
+        return true;
     }
 
     @SuppressWarnings("unchecked")

@@ -705,8 +705,11 @@ Rules:
     // posting doesn't mention it - this is presenting the posting, not embellishing it. Cached by
     // the caller (see ExternalJobService#getOrGenerateAboutSummary) so this only runs once per
     // job per language, not on every view.
+    // Throws (doesn't swallow to "{}") on any OpenAI/network failure - unlike this file's other
+    // AI-call methods, the caller (ExternalJobService#callWithRetry) needs to tell a genuine
+    // failure apart from a legitimately empty result to retry only the former.
     public String summarizeJobDescription(String title, String companyName, String description, String language) {
-        try {
+        {
             String languageInstruction = switch (language == null ? "en" : language) {
                 case "ar" -> "Write every text value entirely in Arabic.";
                 case "he" -> "Write every text value entirely in Hebrew.";
@@ -767,9 +770,6 @@ Field instructions:
             }
 
             return result;
-
-        } catch (Exception e) {
-            return "{}";
         }
     }
 
@@ -783,8 +783,11 @@ Field instructions:
     // internal job's own company-typed text), so it must stay language-neutral and grounded
     // strictly in the posting's own words, never invented, to avoid biasing or destabilizing the
     // match score.
+    // Throws (doesn't swallow to "{}") on any OpenAI/network failure - unlike this file's other
+    // AI-call methods, the caller (ExternalJobService#callWithRetry) needs to tell a genuine
+    // failure apart from a legitimately empty result to retry only the former.
     public String extractRequirementsAndSkills(String title, String companyName, String description) {
-        try {
+        {
             String prompt = """
 Return ONLY a raw valid JSON object. No markdown. No explanations outside the JSON.
 
@@ -824,8 +827,6 @@ Field instructions:
             String result = extractTextFromOpenAIResponse(response);
 
             return (result == null || result.isBlank()) ? "{}" : result;
-        } catch (Exception e) {
-            return "{}";
         }
     }
 
