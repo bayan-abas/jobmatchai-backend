@@ -754,6 +754,9 @@ public class JobMatchService {
         boolean vocational = VocationalRoleClassifier.isGeneralVocationalRole(job.getTitle());
         match.put("generalVocationalRole", vocational);
         match.put("excludedFromListing", !vocational && Boolean.FALSE.equals(score.getFieldRelated()));
+        // See JobMatchScore#stale's own doc comment - true only when this row is a last-known-good
+        // fallback being served in place of a failed recompute, never for a genuinely fresh verdict.
+        match.put("stale", score.isStale());
         return match;
     }
 
@@ -782,6 +785,7 @@ public class JobMatchService {
         // transient failure and subsequent retry.
         match.put("generalVocationalRole", VocationalRoleClassifier.isGeneralVocationalRole(job.getTitle()));
         match.put("excludedFromListing", false);
+        match.put("stale", false);
         return match;
     }
 
@@ -941,6 +945,12 @@ public class JobMatchService {
         for (Job job : jobsSentToAi) {
             long jobId = job.getId();
             String jobFingerprint = jobFingerprints.get(jobId);
+            // Captured BEFORE dispatch, while cachedByJobId still holds whatever was loaded from
+            // the DB at the top of this method - for a job landing in jobsSentToAi, that entry is
+            // never mutated until the AI call actually resolves, so this is reliably the STALE
+            // (pre-recompute) row, not a race with the fresh one. Used as the "last known good"
+            // fallback below - see that comment for why.
+            JobMatchScore previousScore = cachedByJobId.get(jobId);
 
             matchScoreQueueService.enqueueIfNeeded(email, job, jobType, language, cvFingerprint, jobFingerprint);
             CompletableFuture<JobMatchScore> future = matchScoreQueueService.awaitResult(
@@ -959,9 +969,27 @@ public class JobMatchService {
                             email, jobId, similarity, fieldRelated);
                 }
 
-                Map<String, Object> payload = (score != null)
-                        ? scoreToPayload(score, job, resolveMatchReason(email, score, language, null))
-                        : errorPayload(jobId, job);
+                Map<String, Object> payload;
+                if (score != null) {
+                    payload = scoreToPayload(score, job, resolveMatchReason(email, score, language, null));
+                } else if (previousScore != null && previousScore.getFieldRelated() != null) {
+                    // The recompute failed (timed out, or the queue gave up after its own
+                    // retries), but a real score from BEFORE this recompute still exists - per
+                    // product requirement, a transient recompute failure must never blank out an
+                    // already-known match percentage. Serve the stale-but-real result instead of
+                    // the bare error sentinel, flagged "stale" so the frontend can keep silently
+                    // retrying in the background rather than treating this as final. The queue
+                    // itself has already scheduled its own retry-with-backoff for this row (see
+                    // MatchScoreQueueWorker), so the next attempt happens automatically regardless
+                    // of whether the candidate is still even looking at this page.
+                    previousScore.setStale(true);
+                    payload = scoreToPayload(previousScore, job,
+                            resolveMatchReason(email, previousScore, language, null));
+                    log.info("match-scores-streaming candidate={} jobId={} recompute failed - serving stale "
+                            + "cached score instead of an error", email, jobId);
+                } else {
+                    payload = errorPayload(jobId, job);
+                }
                 onJobResult.accept(jobId, payload);
 
                 if (remaining.decrementAndGet() == 0) {
@@ -1123,18 +1151,33 @@ public class JobMatchService {
                         cachedByJobId.put(job.getId(), score);
                     } else {
                         // The AI call failed even after computeChunkWithRetry's validation-guided
-                        // retry - surface that honestly instead of caching a guessed verdict. This
-                        // is deliberately never saved to the repository, so the very next request
-                        // retries the real computation instead of getting stuck on a cached failure.
-                        JobMatchScore errorScore = new JobMatchScore();
-                        errorScore.setCandidateEmail(email);
-                        errorScore.setJobId(job.getId());
-                        errorScore.setFieldRelated(null);
-                        errorScore.setMatchPercent(null);
-                        errorScore.setMatchReason("We couldn't calculate a match for this job right now. Please try again.");
-                        errorScore.setMatchedSkills("");
-                        errorScore.setMissingSkills("");
-                        cachedByJobId.put(job.getId(), errorScore);
+                        // retry. cachedByJobId still holds whatever was loaded from the DB at the
+                        // top of this method for this job (never overwritten - we're here exactly
+                        // because that didn't happen) - if that's a real, previously-computed
+                        // verdict, serve it as a stale-but-real fallback instead of blanking the
+                        // score out, per the product requirement that a transient recompute
+                        // failure must never hide an already-known match percentage from the
+                        // candidate. The queue/worker has already scheduled its own retry for this
+                        // row regardless of whether this fallback is ever even shown.
+                        JobMatchScore previous = cachedByJobId.get(job.getId());
+                        if (previous != null && previous.getFieldRelated() != null) {
+                            previous.setStale(true);
+                            // cachedByJobId already maps this id to `previous` - nothing to put.
+                        } else {
+                            // No prior real verdict to fall back to (first-ever view of this job) -
+                            // this sentinel is deliberately never saved to the repository, so the
+                            // very next request retries the real computation from scratch instead
+                            // of getting stuck on a cached failure.
+                            JobMatchScore errorScore = new JobMatchScore();
+                            errorScore.setCandidateEmail(email);
+                            errorScore.setJobId(job.getId());
+                            errorScore.setFieldRelated(null);
+                            errorScore.setMatchPercent(null);
+                            errorScore.setMatchReason("We couldn't calculate a match for this job right now. Please try again.");
+                            errorScore.setMatchedSkills("");
+                            errorScore.setMissingSkills("");
+                            cachedByJobId.put(job.getId(), errorScore);
+                        }
                     }
                 }
             }

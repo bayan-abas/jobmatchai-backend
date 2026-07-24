@@ -440,4 +440,22 @@ public class JobMatchScore {
     public void setInsufficientData(Boolean insufficientData) {
         this.insufficientData = insufficientData;
     }
+
+    // In-memory only, never persisted - set by JobMatchService's ensureCoreScores/
+    // computeMatchScoresStreaming when a recompute attempt fails and this row's fields are the
+    // last KNOWN-GOOD result being served as a fallback instead of a bare error, per the product
+    // requirement that a transient failure must never blank out an already-known match percentage.
+    // Every persisted row is otherwise indistinguishable from a genuinely fresh one - this flag
+    // exists purely to tell the payload/frontend layer "keep quietly retrying in the background,
+    // this number is real but may be a little behind."
+    @Transient
+    private boolean stale = false;
+
+    public boolean isStale() {
+        return stale;
+    }
+
+    public void setStale(boolean stale) {
+        this.stale = stale;
+    }
 }
