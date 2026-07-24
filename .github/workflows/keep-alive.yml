@@ -1,0 +1,27 @@
+name: Keep backend awake
+
+# Render's free tier spins the web service down after ~15 minutes with no incoming HTTP traffic,
+# and the next real user request then has to wait for a cold start (30-60+ seconds, sometimes
+# failing outright while the instance is still coming up) - this is what caused the "Could not
+# load jobs from backend" / "Couldn't compute - refresh to retry" errors after deployment. A
+# periodic ping counts as real traffic, so pinging well inside that 15-minute window keeps the
+# service continuously warm and makes a cold start a non-issue in practice, without requiring a
+# paid always-on plan. GitHub's own scheduler isn't always exactly on time under load - every 10
+# minutes leaves enough margin under the 15-minute idle limit to absorb that.
+#
+# Not needed at all if the Render service is already on a paid, always-on instance type instead
+# of the free tier - harmless either way (just an extra periodic health check), but only load-
+# bearing on the free tier.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /actuator/health
+        run: |
+          curl --fail --silent --show-error --max-time 30 \
+            "https://jobmatchai-backend-aqso.onrender.com/actuator/health"
