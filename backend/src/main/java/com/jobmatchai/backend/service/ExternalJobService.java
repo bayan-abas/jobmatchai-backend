@@ -23,6 +23,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -82,6 +83,18 @@ public class ExternalJobService {
 
     @Autowired
     private RecentlyViewedJobRepository recentlyViewedJobRepository;
+
+    // Self-injected reference to this same bean's Spring-managed proxy - needed so
+    // scheduledImport() can call pruneExpiredJobs() THROUGH the proxy instead of via plain
+    // self-invocation (calling another method on "this" from within the same class bypasses
+    // Spring's proxy-based AOP entirely, so a @Transactional on pruneExpiredJobs would silently
+    // do nothing if called as a normal self-invocation - confirmed via production error the first
+    // time a bare, unwrapped derived-delete call like this ran without an active transaction; see
+    // pruneExpiredJobs' own comment). @Lazy avoids the circular-dependency-at-construction-time
+    // issue a bean depending on its own proxy would otherwise have.
+    @Lazy
+    @Autowired
+    private ExternalJobService self;
 
     /**
      * Spring auto-collects every ExternalJobProvider bean here, so all active sources (Jooble,
@@ -1056,7 +1069,9 @@ public class ExternalJobService {
         }
 
         try {
-            pruneExpiredJobs(result);
+            // Through the proxy (self), not a plain self-invocation - see the `self` field's own
+            // comment for why pruneExpiredJobs' @Transactional would otherwise be silently ignored.
+            self.pruneExpiredJobs(result);
         } catch (Exception e) {
             log.error("Scheduled external job retention pruning failed (country={})", defaultCountry, e);
         }
@@ -1079,7 +1094,16 @@ public class ExternalJobService {
     //      hopefully-healthy cycle instead.
     private static final int MIN_FETCHED_TO_TRUST_PRUNING = 1;
 
-    private void pruneExpiredJobs(ImportResult result) {
+    // public + @Transactional, and called through the self-injected proxy (see the `self` field's
+    // comment) rather than as a plain self-invocation from scheduledImport() - a private method
+    // called via "this" from within the same class never goes through Spring's proxy, so
+    // @Transactional on a private/self-invoked method is silently ignored rather than actually
+    // establishing a transaction. Confirmed via production error: the identical derived-delete
+    // pattern in removeDuplicateExternalJobs threw TransactionRequiredException the first time it
+    // ran without one; this method's deletes were the same latent bug, just never yet triggered
+    // since retention pruning had rarely found anything to actually prune this early in production.
+    @Transactional
+    public void pruneExpiredJobs(ImportResult result) {
         if (retentionDays <= 0) {
             return;
         }
@@ -1108,14 +1132,11 @@ public class ExternalJobService {
         jobMatchNarrativeRepository.deleteByJobIdIn(offsetIds);
         matchScoreJobRepository.deleteByJobIdInAndJobType(idsToPrune, "external");
 
-        // Not wrapped in one @Transactional spanning all three deletes: pruneExpiredJobs is a
-        // private method invoked via self-call from the @Scheduled scheduledImport() - Spring's
-        // proxy-based AOP can't intercept that invocation, so a @Transactional annotation here
-        // would silently do nothing rather than actually group these into one transaction. Each
-        // delete above is still individually atomic (Spring Data wraps every repository method in
-        // its own transaction), and this whole cycle is idempotent and re-run every 6 hours, so a
-        // crash in the exact window between these calls only ever means the next cycle finishes
-        // what this one started - never a stuck, unrecoverable state.
+        // All four deletes now share this method's own @Transactional (see the method-level
+        // comment) - either the whole cleanup for this cutoff commits, or none of it does. Still
+        // safe to interrupt (e.g. a crash/redeploy mid-cycle): this whole cycle is idempotent and
+        // re-run every 6 hours, so an uncommitted attempt simply gets retried from scratch next
+        // time, never leaving a stuck, partially-cleaned state.
         externalJobRepository.deleteAllByIdInBatch(idsToPrune);
 
         int deleted = idsToPrune.size();
