@@ -769,7 +769,6 @@ class JobMatchServiceTest {
                         nullable(String.class), nullable(Boolean.class)))
                 .thenReturn("""
                         {
-                          "languageMatchPercent": 90,
                           "whyGoodMatch": ["You have over 8 years of experience as a General Practitioner, which exceeds the job's requirement of 2-5 years."],
                           "whyNotPerfectMatch": [
                             "There is no explicit mention of experience working in Tel Aviv or familiarity with local healthcare regulations.",
@@ -893,7 +892,6 @@ class JobMatchServiceTest {
                         nullable(String.class), nullable(Boolean.class)))
                 .thenReturn("""
                         {
-                          "languageMatchPercent": 90,
                           "whyGoodMatch": [
                             "Your documented Patient diagnosis experience is a strong fit for this role.",
                             "Your Clinical Research background makes you an excellent candidate."
@@ -935,7 +933,6 @@ class JobMatchServiceTest {
                         nullable(String.class), nullable(Boolean.class)))
                 .thenReturn("""
                         {
-                          "languageMatchPercent": 90,
                           "whyGoodMatch": ["Your background aligns well with this role."],
                           "whyNotPerfectMatch": [
                             "There is no evidence you lack Patient care experience - your profile fully covers this role's requirements."

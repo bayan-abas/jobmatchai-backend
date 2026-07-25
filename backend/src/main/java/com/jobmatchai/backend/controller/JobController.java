@@ -516,10 +516,10 @@ public class JobController {
             response.put("recommendation", result.recommendation());
             response.put("shouldApply", result.shouldApply());
             response.put("fieldRelated", result.fieldRelated());
+            response.put("generalVocationalRole", result.generalVocationalRole());
             response.put("skillsMatchPercent", result.skillsMatchPercent());
             response.put("experienceMatchPercent", result.experienceMatchPercent());
             response.put("educationMatchPercent", result.educationMatchPercent());
-            response.put("languageMatchPercent", result.languageMatchPercent());
             response.put("fieldRelevancePercent", result.fieldRelevancePercent());
             response.put("certificationMatchPercent", result.certificationMatchPercent());
             response.put("locationMatchPercent", result.locationMatchPercent());

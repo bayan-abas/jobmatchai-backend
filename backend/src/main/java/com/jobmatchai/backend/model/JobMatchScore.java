@@ -80,9 +80,6 @@ public class JobMatchScore {
     @Column(name = "education_match_percent")
     private Integer educationMatchPercent;
 
-    @Column(name = "language_match_percent")
-    private Integer languageMatchPercent;
-
     @Column(name = "field_relevance_percent")
     private Integer fieldRelevancePercent;
 
@@ -272,14 +269,6 @@ public class JobMatchScore {
 
     public void setEducationMatchPercent(Integer educationMatchPercent) {
         this.educationMatchPercent = educationMatchPercent;
-    }
-
-    public Integer getLanguageMatchPercent() {
-        return languageMatchPercent;
-    }
-
-    public void setLanguageMatchPercent(Integer languageMatchPercent) {
-        this.languageMatchPercent = languageMatchPercent;
     }
 
     public String getMatchedRequiredSkills() {

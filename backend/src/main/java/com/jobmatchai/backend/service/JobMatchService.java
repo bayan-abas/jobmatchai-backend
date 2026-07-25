@@ -385,7 +385,6 @@ public class JobMatchService {
             Integer skillsMatchPercent,
             Integer experienceMatchPercent,
             Integer educationMatchPercent,
-            Integer languageMatchPercent,
             Integer fieldRelevancePercent,
             Integer certificationMatchPercent,
             Integer locationMatchPercent,
@@ -402,7 +401,8 @@ public class JobMatchService {
             java.time.LocalDateTime lastAnalyzedAt,
 
             List<String> matchedRequiredSkills,
-            List<String> matchedPreferredSkills
+            List<String> matchedPreferredSkills,
+            Boolean generalVocationalRole
     ) {}
 
     // נקודת הכניסה הראשית לקבלת רשימת ציוני התאמה למשתמש עבור רשימת משרות (המסלול הלא-streaming)
@@ -1126,12 +1126,13 @@ public class JobMatchService {
 
     // נקודת הכניסה לעמוד הפירוט של משרה בודדת - מוודא ציון ליבה, ואז שולף/מייצר עם AI את ההסברים המפורטים (why good/not perfect, המלצה)
     public MatchDetailResult getMatchDetail(String email, Job job, String language) {
+        boolean vocational = VocationalRoleClassifier.isGeneralVocationalRole(job.getTitle());
         CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(email).orElse(null);
 
         if (analysis == null) {
             return new MatchDetailResult(false, job.getId(), null, null, List.of(), List.of(), List.of(), List.of(), List.of(),
-                    null, null, null, null, null, null, null, null, null, null, List.of(), List.of(),
-                    null, null, null, null, null, null, List.of(), List.of());
+                    null, null, null, null, null, null, null, null, null, List.of(), List.of(),
+                    null, null, null, null, null, null, List.of(), List.of(), vocational);
         }
 
         JobMatchScore core = ensureCoreScores(email, List.of(job), language, analysis).get(job.getId());
@@ -1153,8 +1154,8 @@ public class JobMatchService {
                     reason != null && !reason.isBlank() ? reason
                             : "We couldn't compute your match for this job right now. Please try again shortly.",
                     List.of(), List.of(), List.of(), List.of(), List.of(),
-                    null, null, null, null, null, null, null, null, null, null, List.of(), List.of(),
-                    null, null, null, null, null, core != null ? core.getUpdatedAt() : null, List.of(), List.of());
+                    null, null, null, null, null, null, null, null, null, List.of(), List.of(),
+                    null, null, null, null, null, core != null ? core.getUpdatedAt() : null, List.of(), List.of(), vocational);
         }
 
         boolean fieldRelated = core.getFieldRelated();
@@ -1179,8 +1180,8 @@ public class JobMatchService {
             return new MatchDetailResult(true, job.getId(), null, unrelatedReason,
                     List.of(), List.of(), List.of(), List.of(), List.of(),
                     "A meaningful evaluation isn't possible for this job given the field mismatch.",
-                    false, false, null, null, null, null, null, null, null, List.of(), List.of(),
-                    null, null, null, null, null, core.getUpdatedAt(), List.of(), List.of());
+                    false, false, null, null, null, null, null, null, List.of(), List.of(),
+                    null, null, null, null, null, core.getUpdatedAt(), List.of(), List.of(), vocational);
         }
 
         boolean detailStale = core.getRecommendation() == null || core.getRecommendation().isBlank()
@@ -1193,10 +1194,6 @@ public class JobMatchService {
             JsonNode json = readDetailObject(result);
 
             if (json != null) {
-                core.setLanguageMatchPercent(json.has("languageMatchPercent")
-                        ? MatchScoreCalculator.clamp(json.path("languageMatchPercent").asInt())
-                        : null);
-
                 List<String> whyGoodMatch = validateDetailClaims(
                         toStringList(json.path("whyGoodMatch")), job, matchedSkills, missingSkills, true);
                 List<String> whyNotPerfectMatch = validateDetailClaims(
@@ -1246,7 +1243,6 @@ public class JobMatchService {
                 core.getSkillsMatchPercent(),
                 core.getExperienceMatchPercent(),
                 core.getEducationMatchPercent(),
-                core.getLanguageMatchPercent(),
                 core.getFieldRelevancePercent(),
                 core.getCertificationMatchPercent(),
                 core.getLocationMatchPercent(),
@@ -1259,7 +1255,8 @@ public class JobMatchService {
                 core.getRequiredCertificationLevel(),
                 core.getUpdatedAt(),
                 matchedRequiredSkills,
-                matchedPreferredSkills
+                matchedPreferredSkills,
+                vocational
         );
     }
 

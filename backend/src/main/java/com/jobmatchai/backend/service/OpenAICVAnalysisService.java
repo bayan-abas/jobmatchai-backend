@@ -615,7 +615,6 @@ STRICT EVIDENCE RULES (mandatory - every bullet you write is checked against the
 
 Return exactly this JSON structure:
 {
-  "languageMatchPercent": 0,
   "whyGoodMatch": ["", ""],
   "whyNotPerfectMatch": ["", ""],
   "improvementSuggestions": ["", ""],
@@ -624,7 +623,6 @@ Return exactly this JSON structure:
 }
 
 Rules:
-- languageMatchPercent: integer 0-100, how well the candidate's language/communication skills match what this job needs (if no language requirement is evident, score based on general communication evidence in the profile, defaulting to a reasonable score rather than 0).
 - recommendation: 2-3 sentences giving a clear, personal apply-or-not recommendation with reasoning, written directly to the candidate ("you"), consistent with the given """ + matchPercent + """
 % score. Follow the same STRICT EVIDENCE RULES above - never mention overqualification/seniority as a concern without an explicit stated maximum, and never treat location as a work-experience requirement.
 - whyGoodMatch: 2-4 short bullet points, each written directly to the candidate ("you"), citing concrete evidence from the candidate profile.

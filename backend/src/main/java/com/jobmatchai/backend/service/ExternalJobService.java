@@ -690,8 +690,8 @@ public class ExternalJobService {
         if (externalJob == null) {
             return new JobMatchService.MatchDetailResult(
                     false, externalJobId, null, null, List.of(), List.of(), List.of(), List.of(), List.of(), null, null,
-                    null, null, null, null, null, null, null, null, List.of(), List.of(),
-                    null, null, null, null, null, null, List.of(), List.of());
+                    null, null, null, null, null, null, null, List.of(), List.of(),
+                    null, null, null, null, null, null, List.of(), List.of(), null);
         }
 
         Job transientJob = buildTransientJobForMatching(externalJob);
@@ -714,7 +714,6 @@ public class ExternalJobService {
                 result.skillsMatchPercent(),
                 result.experienceMatchPercent(),
                 result.educationMatchPercent(),
-                result.languageMatchPercent(),
                 result.fieldRelevancePercent(),
                 result.certificationMatchPercent(),
                 result.locationMatchPercent(),
@@ -727,7 +726,8 @@ public class ExternalJobService {
                 result.requiredCertificationLevel(),
                 result.lastAnalyzedAt(),
                 result.matchedRequiredSkills(),
-                result.matchedPreferredSkills()
+                result.matchedPreferredSkills(),
+                result.generalVocationalRole()
         );
     }
 
