@@ -35,14 +35,6 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-// Covers the CV-upload security hardening in CVController#uploadCV: only PDF/DOCX (verified by
-// actual content, not just extension), a size cap, and a fully server-generated storage filename
-// - see CvFileValidator and CVTextExtractorService#detectContentType. cvTextExtractorService is
-// mocked here (its real-Tika detection behavior is covered separately by
-// CVTextExtractorServiceTest) so these tests focus purely on the controller's own
-// validation/orchestration branching, matching this repo's existing controller-test convention
-// (plain JUnit5 + Mockito + ReflectionTestUtils, no MockMvc/@SpringBootTest - see
-// JobControllerTest/PaymentControllerTest).
 @ExtendWith(MockitoExtension.class)
 class CVControllerTest {
 
@@ -83,10 +75,6 @@ class CVControllerTest {
         ReflectionTestUtils.setField(cvController, "applicationRepository", applicationRepository);
         ReflectionTestUtils.setField(cvController, "jobRepository", jobRepository);
 
-        // Real LocalFileStorageService pointed at the @TempDir, not a mock - these tests assert
-        // against actual files on disk (see fileCountInUploadDir/Files.exists below), and this
-        // preserves that. Absolute path - Path.resolve (used inside LocalFileStorageService)
-        // returns an absolute uploadDir as-is regardless of the test JVM's working directory.
         LocalFileStorageService localFileStorageService = new LocalFileStorageService();
         ReflectionTestUtils.setField(localFileStorageService, "uploadDir", uploadDir.toString());
         ReflectionTestUtils.setField(cvController, "fileStorageService", localFileStorageService);
@@ -116,8 +104,6 @@ class CVControllerTest {
         }
     }
 
-    // ---- valid uploads ----
-
     @Test
     void uploadCV_validPdf_savesFileWithServerGeneratedNameAndReturnsExpectedShape() throws Exception {
         User user = candidateUser("candidate@example.com");
@@ -139,7 +125,7 @@ class CVControllerTest {
 
         String storedFileName = (String) body.get("fileName");
         assertThat(storedFileName).isNotNull().endsWith(".pdf");
-        // Server-generated, not derived from the uploaded name - the whole point of the hardening.
+
         assertThat(storedFileName).isNotEqualTo("my-resume.pdf").doesNotContain("my-resume");
         assertThat(Files.exists(uploadDir.resolve(storedFileName))).isTrue();
 
@@ -173,8 +159,6 @@ class CVControllerTest {
         assertThat(Files.exists(uploadDir.resolve(storedFileName))).isTrue();
     }
 
-    // ---- invalid file type ----
-
     @Test
     void uploadCV_invalidFileType_rejectedBeforeTouchingContentOrDisk() throws Exception {
         User user = candidateUser("candidate3@example.com");
@@ -189,13 +173,10 @@ class CVControllerTest {
         assertThat(bodyOf(response).get("success")).isEqualTo(false);
         assertThat(bodyOf(response).get("message")).isEqualTo("Only PDF and DOCX files are allowed.");
 
-        // Rejected on extension alone - no need to even inspect content, and nothing written.
         verify(cvTextExtractorService, never()).detectContentType(any());
         verify(userRepository, never()).save(any());
         assertThat(fileCountInUploadDir()).isZero();
     }
-
-    // ---- oversized file ----
 
     @Test
     void uploadCV_oversizedFile_rejectedBeforeContentCheckOrDisk() throws Exception {
@@ -216,8 +197,6 @@ class CVControllerTest {
         assertThat(fileCountInUploadDir()).isZero();
     }
 
-    // ---- fake extension (executable renamed to .pdf) ----
-
     @Test
     void uploadCV_executableRenamedAsPdf_rejectedAndNeverWrittenToDisk() throws Exception {
         User user = candidateUser("candidate5@example.com");
@@ -227,9 +206,6 @@ class CVControllerTest {
         MockMultipartFile file = new MockMultipartFile(
                 "file", "totally-a-resume.pdf", "application/pdf", exeBytes);
 
-        // Simulates what CVTextExtractorServiceTest proves real Tika actually returns for this
-        // byte content - here we're testing the controller's reaction to a mismatch, not Tika
-        // itself again.
         when(cvTextExtractorService.detectContentType(any())).thenReturn("application/x-msdownload");
 
         ResponseEntity<?> response = cvController.uploadCV(file, "en", authentication);
@@ -242,8 +218,6 @@ class CVControllerTest {
         verify(userRepository, never()).save(any());
         assertThat(fileCountInUploadDir()).isZero();
     }
-
-    // ---- existing behavior preserved ----
 
     @Test
     void uploadCV_notActuallyACv_stillDeletesFileAndReturnsBadRequest() throws Exception {
@@ -262,8 +236,7 @@ class CVControllerTest {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         verify(userRepository, never()).save(any());
-        // The passing-content-check file gets written, then must be cleaned up once the AI
-        // classifier rejects it - unchanged from before this hardening.
+
         assertThat(fileCountInUploadDir()).isZero();
     }
 

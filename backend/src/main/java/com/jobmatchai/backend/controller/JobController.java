@@ -62,12 +62,9 @@ public class JobController {
     @Autowired
     private JobMatchService jobMatchService;
 
-    // One virtual thread per open SSE connection, mirroring ExternalJobController's identical
-    // streaming endpoint.
     private final ExecutorService streamingExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
-    // Hard backstop if a client goes away mid-stream without cleanly aborting - see
-    // ExternalJobController.SSE_TIMEOUT_MS for the full rationale.
+    // 3 דקות - חייב להספיק גם למקרה שיש הרבה משרות שכולן צריכות קריאת AI טרייה
     private static final long SSE_TIMEOUT_MS = 180_000L;
 
     public record MatchScoreRequest(String email, List<Long> jobIds, String language) {}
@@ -92,12 +89,6 @@ public class JobController {
 
     public record JobStatusUpdateRequest(String status) {}
 
-    // matchPercent/matchLabel are sourced from JobMatchScore (see getApplicationsForJob) - the
-    // exact same number the candidate's own "Job Matches" page shows for this pair. null means
-    // one of: the candidate never triggered their own match computation for this job before
-    // applying (rare - normal flow sees the score before applying), a transient "AI call failed,
-    // please retry" state, or the job posting itself was too thin to score - all three render the
-    // same "not scored yet" state client-side, mirroring how a missing AI Summary used to.
     public record JobApplicantView(
             Long id,
             Long jobId,
@@ -108,11 +99,7 @@ public class JobController {
             String appliedDate,
             Integer matchPercent,
             String matchLabel,
-            // Whether a CandidateAiSummary already exists for this pair - see
-            // ApplicationController.ApplicantView's identical field for the full rationale (in
-            // short: matchPercent above no longer implies this, now that it's JobMatchScore-
-            // sourced, so the frontend needs this explicit signal to know whether requesting the
-            // AI Summary is a guaranteed cache hit).
+
             boolean hasAiSummary
     ) {}
 
@@ -138,23 +125,18 @@ public class JobController {
         return "Jobs API is working";
     }
 
-    // Candidate/public listing - a CLOSED job must never appear here (see the ACTIVE/CLOSED
-    // lifecycle rationale on JobStatus). A candidate who already applied before a job closed
-    // still sees it via GET /api/applications/candidate/{email} (which is enriched with the
-    // job's current status separately, not sourced from this endpoint).
+    // מחזיר את כל המשרות הפעילות להצגה בעמוד חיפוש המשרות
     @GetMapping("/all")
     public List<Job> getAllJobs() {
         return jobRepository.findByStatus(JobStatus.ACTIVE);
     }
 
+    // מחזיר לחברה המחוברת את כל המשרות שפרסמה כולל מספר המועמדים לכל משרה
     @GetMapping("/company/{companyEmail}")
     public List<JobWithApplicantsView> getJobsByCompanyEmail(Authentication authentication) {
         List<Job> jobs = jobRepository.findByCompanyEmail(authentication.getName());
         List<Long> jobIds = jobs.stream().map(Job::getId).toList();
 
-        // One query for every job's applicants instead of one count query per job - against
-        // a remote database each round trip is expensive, so this matters even for a
-        // handful of postings.
         Map<Long, Long> applicantCounts = new HashMap<>();
         for (Application application : applicationRepository.findByJobIdIn(jobIds)) {
             applicantCounts.merge(application.getJobId(), 1L, Long::sum);
@@ -179,6 +161,7 @@ public class JobController {
                 .toList();
     }
 
+    // מחזיר לחברה את רשימת המועמדים שהגישו בקשה למשרה, כולל ציון התאמה והאם קיים תקציר AI
     @GetMapping("/{jobId}/applications")
     @PreAuthorize("hasRole('COMPANY')")
     public ResponseEntity<?> getApplicationsForJob(@PathVariable Long jobId, Authentication authentication) {
@@ -188,26 +171,10 @@ public class JobController {
             return ResponseEntity.status(404).body("Job not found");
         }
 
-        // JobMatchScore (the same deterministic, backend-weighted score shown on the candidate's
-        // own "Job Matches" page) is now the single source of truth for the percentage/label
-        // shown here too - see MatchScoreCalculator. This used to read CandidateAiSummary
-        // instead (a free-form AI-invented number from a completely different prompt, with no
-        // weighting/guardrails behind it); that field still exists and still drives the AI
-        // Summary's own narrative/recommendation (see getCandidateAiSummary below), but is no
-        // longer surfaced as "the match percentage" anywhere on the company side, so a recruiter
-        // and a candidate looking at the same pair always see the same number.
         List<Application> applications = applicationRepository.findByJobId(jobId);
 
-        // One batched query for every applicant's score instead of one per applicant - against
-        // a remote database each round trip is expensive. Deliberately a plain cache read (no
-        // on-demand JobMatchService computation here) - this is a passive list view, not an
-        // explicit per-candidate action, and matches this endpoint's existing behavior of only
-        // ever showing what's already been computed. In the overwhelming common case the score
-        // already exists by the time a candidate applies (they saw it on the job's own card
-        // first) - see JobApplicantView's own comment for what a still-missing row means.
         Map<String, JobMatchScore> scoresByEmail = new HashMap<>();
-        // Existence-only lookup (never read for its score) - purely to populate hasAiSummary,
-        // see JobApplicantView's comment on that field.
+
         Map<String, CandidateAiSummary> summariesByEmail = new HashMap<>();
         if (!applications.isEmpty()) {
             List<String> candidateEmails = applications.stream().map(Application::getCandidateEmail).distinct().toList();
@@ -243,6 +210,7 @@ public class JobController {
         return ResponseEntity.ok(applicants);
     }
 
+    // מחזיר לחברה פרטי משרה מלאים כולל ממוצע ציון ההתאמה של כלל המועמדים שהגישו
     @GetMapping("/{id}/company-details")
     @PreAuthorize("hasRole('COMPANY')")
     public ResponseEntity<?> getJobDetailsForCompany(@PathVariable Long id, Authentication authentication) {
@@ -254,10 +222,6 @@ public class JobController {
 
         List<Application> applications = applicationRepository.findByJobId(id);
 
-        // Same source as getApplicationsForJob above (JobMatchScore, not CandidateAiSummary) and
-        // the same averaging the company job postings list uses (getJobsByCompanyEmail's
-        // client-side average in CompanyJobPostings.tsx, fed by the identical source via
-        // ApplicationController#getApplicationsByCompany) - one consistent number everywhere.
         Integer averageMatchScore = null;
         if (!applications.isEmpty()) {
             List<String> candidateEmails = applications.stream().map(Application::getCandidateEmail).distinct().toList();
@@ -292,11 +256,7 @@ public class JobController {
         return ResponseEntity.ok(view);
     }
 
-    // Binds a dedicated DTO (never the Job entity itself) so a client can only ever supply the
-    // fields listed here - there is no "id" field to smuggle in, so jobRepository.save() below
-    // always inserts a brand-new row (Job.id stays null) and can never merge into - and thereby
-    // take ownership of - an existing job by id. companyEmail is likewise never taken from the
-    // request; it comes exclusively from the authenticated caller.
+    // יוצר משרה חדשה עבור החברה המחוברת ושומר אותה במסד הנתונים
     @PostMapping("/add")
     @PreAuthorize("hasRole('COMPANY')")
     public Map<String, Object> addJob(@Valid @RequestBody JobCreateRequest request, Authentication authentication) {
@@ -346,6 +306,7 @@ public class JobController {
                 });
     }
 
+    // מעדכן את פרטי המשרה הקיימת, רק אם המבקש הוא החברה שפרסמה אותה
     @PutMapping("/{id}")
     @PreAuthorize("hasRole('COMPANY')")
     public Map<String, Object> updateJob(@PathVariable long id, @RequestBody Job updatedJob, Authentication authentication) {
@@ -393,12 +354,7 @@ public class JobController {
         }
     }
 
-    // Dedicated status-only endpoint (deliberately separate from the full-replace updateJob
-    // above) so the company job-postings card's Close/Reopen action never has to resend the
-    // entire job payload just to flip one field. Same ownership check as every other
-    // company-scoped job endpoint. Never touches applications or any match-score/queue data -
-    // closing a job is reversible (see reopen) and must never cascade into deleting anything,
-    // unlike deleteJob below.
+    // סוגר או פותח מחדש משרה לקבלת מועמדויות (ACTIVE/CLOSED)
     @PatchMapping("/{id}/status")
     @PreAuthorize("hasRole('COMPANY')")
     public ResponseEntity<Map<String, Object>> updateJobStatus(
@@ -432,10 +388,7 @@ public class JobController {
         return ResponseEntity.ok(response);
     }
 
-    // Transactional so the job row and its match-score/queue cleanup either all commit or all
-    // roll back - a failure partway through must never leave JobMatchScore/MatchScoreJob rows
-    // pointing at a jobId the Job table no longer has, which the worker could never resolve and
-    // would sit there as a permanent orphan.
+    // מוחק משרה יחד עם כל ציוני ההתאמה וההסברים שנוצרו עבורה
     @Transactional
     @DeleteMapping("/{id}")
     @PreAuthorize("hasRole('COMPANY')")
@@ -451,9 +404,6 @@ public class JobController {
                 return response;
             }
 
-            // Every persisted/queued match-score artifact for this job must go with it - a
-            // deleted job can never be recomputed for, so leaving these behind would just be
-            // permanent orphans (the worker's own jobId lookups would all resolve to nothing).
             jobMatchScoreRepository.deleteByJobIdIn(List.of(id));
             jobMatchNarrativeRepository.deleteByJobIdIn(List.of(id));
             matchScoreJobRepository.deleteByJobIdInAndJobType(List.of(id), "internal");
@@ -465,11 +415,7 @@ public class JobController {
 
         } catch (Exception e) {
             log.error("Failed to delete job id={} for company={}", id, authentication.getName(), e);
-            // Without this, a failure partway through (e.g. the job-row delete itself throwing)
-            // would still COMMIT whatever match-score/queue rows were already deleted before it -
-            // @Transactional only auto-rolls-back on an exception that propagates OUT of the
-            // method, and this catch block deliberately doesn't rethrow (it returns a normal
-            // {success:false} response instead), so the rollback has to be requested explicitly.
+
             TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
             response.put("success", false);
             response.put("message", "Failed to delete job. Please try again.");
@@ -477,6 +423,7 @@ public class JobController {
         }
     }
 
+    // מחשב ומחזיר ציוני התאמה בין המועמד המחובר לרשימת משרות שנשלחה
     @PostMapping("/match-scores")
     public ResponseEntity<?> getMatchScores(@RequestBody MatchScoreRequest request, Authentication authentication) {
         try {
@@ -498,9 +445,7 @@ public class JobController {
         }
     }
 
-    // Progressive counterpart of /match-scores - see ExternalJobController.streamMatchScores for
-    // the full rationale (manual SSE-frame parsing on the frontend, POST instead of GET so the
-    // job-id list travels in the body). This is the internal-jobs half of that same contract.
+    // מחזיר סטרים (SSE) של ציוני התאמה למשרות שמתעדכן בזמן אמת ככל שכל משרה מחושבת
     @PostMapping(path = "/match-scores/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter streamMatchScores(@RequestBody MatchScoreRequest request, Authentication authentication) {
         SseEmitter emitter = new SseEmitter(SSE_TIMEOUT_MS);
@@ -532,9 +477,7 @@ public class JobController {
     }
 
     private void sendEvent(SseEmitter emitter, Object lock, String name, Object data) {
-        // SseEmitter.send is documented as not safe for concurrent calls from multiple threads -
-        // every job's own async completion callback sends independently, so this lock is load-
-        // bearing, not defensive-for-show.
+
         synchronized (lock) {
             try {
                 emitter.send(SseEmitter.event().name(name).data(data, MediaType.APPLICATION_JSON));
@@ -544,6 +487,7 @@ public class JobController {
         }
     }
 
+    // מחזיר ניתוח התאמה מפורט למשרה בודדת - כישורים חסרים, המלצות ופירוט לפי קטגוריות
     @PostMapping("/match-detail")
     public ResponseEntity<?> getMatchDetail(@RequestBody MatchDetailRequest request, Authentication authentication) {
         try {

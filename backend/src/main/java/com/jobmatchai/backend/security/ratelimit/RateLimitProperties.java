@@ -5,8 +5,6 @@ import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 
-// Every knob here maps to a ratelimit.auth.* property (see application.properties) so limits can
-// be tuned per environment without a code change or redeploy of new thresholds.
 @Component
 public class RateLimitProperties {
 
@@ -23,7 +21,6 @@ public class RateLimitProperties {
     @Value("${ratelimit.auth.send-verification-code.window-seconds:600}")
     private long sendVerificationCodeWindowSeconds;
 
-    // Covers /api/auth/register, the endpoint that actually consumes the verification code.
     @Value("${ratelimit.auth.verify-code.capacity:5}")
     private long verifyCodeCapacity;
     @Value("${ratelimit.auth.verify-code.window-seconds:600}")

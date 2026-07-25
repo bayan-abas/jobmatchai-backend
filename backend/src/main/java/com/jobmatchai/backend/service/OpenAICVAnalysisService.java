@@ -35,14 +35,6 @@ public class OpenAICVAnalysisService {
     @Value("${openai.model}")
     private String model;
 
-    // computeJobMatches is called far more often, and at far higher volume per user action
-    // (one call per 10-job chunk, several chunks per page load), than the other single-shot
-    // calls in this class (analyzeCV, computeJobMatchDetail, computeCandidateSummary) - it's
-    // a bounded classification/scoring task (score N jobs against one profile, structured
-    // JSON out) rather than open-ended reasoning, so it doesn't need the flagship model. Using
-    // a smaller, faster model just for this call is what actually cuts the wall-clock wait for
-    // match percentages to appear, instead of only tuning chunk size/concurrency around the
-    // same slow model. Defaults to a distinct model but falls back to the main model if unset.
     @Value("${openai.match-model:${openai.model}}")
     private String matchModel;
 
@@ -55,6 +47,7 @@ public class OpenAICVAnalysisService {
     @Autowired
     private MatchMetrics matchMetrics;
 
+    // שולח את קורות החיים ל-GPT ומבקש ניתוח מובנה ב-JSON לפי הפרופסיה האמיתית של המועמד, ואז מחשב ציון סופי ומנקה כפילויות בין כישורים חסרים לקיימים
     public String analyzeCV(String cvText, String language) {
         try {
             String safeCvText = cvText;
@@ -232,12 +225,6 @@ CV Text:
 
             JsonNode json = objectMapper.readTree(result);
 
-            // Build a set of existing skills (lowercase) for fast lookup - pulled from ALL three
-            // skill-bearing fields (skills, technicalSkills, softSkills), not just the combined
-            // "skills" field alone. Previously only "skills" was checked, so the AI could list a
-            // skill under technicalSkills/softSkills only and STILL have it show up as "missing"
-            // a few lines later - the same contradiction this whole filter exists to prevent, just
-            // for two fields it wasn't looking at.
             String rawSkills = json.path("skills").asText("");
             String rawTechnicalSkills = json.path("technicalSkills").asText("");
             String rawSoftSkills = json.path("softSkills").asText("");
@@ -251,7 +238,6 @@ CV Text:
                 }
             }
 
-            // Filter missingSkills: remove anything already present in skills or CV text
             String rawMissing = json.path("missingSkills").asText("");
             List<String> filteredMissing = new ArrayList<>();
             for (String s : rawMissing.split("[,;\\n]")) {
@@ -299,28 +285,20 @@ CV Text:
             finalJson.put("certificationsEvidence", json.path("certificationsEvidence").asText(""));
             finalJson.put("licensesEvidence", json.path("licensesEvidence").asText(""));
             finalJson.put("yearsOfExperience", json.path("estimatedYearsExperience").asText(""));
-            // professionalExperienceEvidence is already a fixed vocabulary (none/entry_level/
-            // mid_level/senior_level) - reused verbatim as experienceLevel, the value
-            // JobMatchService's deterministic experience-scoring formula compares against a
-            // job's required seniority, instead of trying to parse a free-text years string.
+
             finalJson.put("experienceLevel", json.path("professionalExperienceEvidence").asText("none"));
 
             return objectMapper.writeValueAsString(finalJson);
 
         } catch (HttpClientErrorException e) {
-            // Previously swallowed with no log line at all - a bad/expired API key or an OpenAI
-            // rate limit/4xx in production showed up ONLY as a generic 500 to the client, with
-            // nothing server-side to diagnose it from. Logged the same way computeJobMatches
-            // already does for its own OpenAI failures.
+
             log.error("analyzeCV failed against OpenAI: {} {}", e.getStatusCode(), e.getResponseBodyAsString());
             return emptyAnalysisJson(pickByLanguage(language,
                     "OpenAI API Error: " + e.getStatusCode(),
                     "خطأ في واجهة OpenAI: " + e.getStatusCode(),
                     "שגיאת API של OpenAI: " + e.getStatusCode()));
         } catch (Exception e) {
-            // Same gap as above, for every other failure this method can hit - a missing/blank
-            // OPENAI_API_KEY (see requireConfiguredApiKey), a connection timeout, or a JSON parse
-            // failure all used to return a 500 to the client with zero trace of why.
+
             log.error("analyzeCV failed", e);
             return emptyAnalysisJson(pickByLanguage(language,
                     "Error analyzing CV: " + e.getMessage(),
@@ -329,6 +307,7 @@ CV Text:
         }
     }
 
+    // בודק מול ה-AI אם הקובץ שהועלה הוא באמת קורות חיים ולא מסמך אחר (מטלה, חוזה, תיאור משרה וכו')
     public String validateCV(String cvText, String language) {
         try {
             String safeCvText = cvText;
@@ -450,14 +429,7 @@ Document text:
         };
     }
 
-    // jobFingerprints/retryFeedback exist to support JobMatchService's per-job validation loop:
-    // jobFingerprints is the caller-computed (jobId + title + company + normalized title +
-    // content hash) fingerprint for each job, which the AI must echo back unchanged - this is
-    // what lets the caller detect a verdict that got attached to the wrong job internally, even
-    // within a single-job request (a garbled/omitted echo is itself a red flag). retryFeedback
-    // is null on the first attempt; on a validation-triggered retry it carries the caller's
-    // itemized complaints about the previous response, so the model corrects the SAME problems
-    // instead of the caller just hoping a second blind attempt happens to come out right.
+    // משווה את המועמד למספר משרות במקביל ומבקש מה-AI לתייג כל התאמה בקטגוריות קבועות (במקום לתת ציון גולמי), כדי שהציון הסופי יחושב דטרמיניסטית בצד השרת
     public String computeJobMatches(
             CVAnalysis analysis, List<Job> jobs, Map<Long, String> jobFingerprints,
             String language, String retryFeedback) {
@@ -466,9 +438,6 @@ Document text:
                 return "{\"matches\":[]}";
             }
 
-            // Deliberately small: batching many jobs into one prompt is what previously let the
-            // model attach one job's verdict to a different job's jobId. JobMatchService now
-            // defaults to one job per call; this cap is a hard backstop, not the primary control.
             List<Job> cappedJobs = jobs.size() > 5 ? jobs.subList(0, 5) : jobs;
 
             String languageInstruction = switch (language == null ? "en" : language) {
@@ -576,22 +545,13 @@ Rules:
             return result;
 
         } catch (Exception e) {
-            // Swallowed on purpose (caller falls back to "no score yet" for this batch and
-            // retries on the next request), but log it - otherwise a transient OpenAI failure
-            // (rate limit, timeout, truncated JSON) silently drops every job in this batch
-            // with zero trace of why.
+
             log.error("computeJobMatches failed against OpenAI", e);
             return "{\"matches\":[]}";
         }
     }
 
-    // matchPercent/matchedSkills/missingSkills/fieldRelevance/experience/education/certification/
-    // location scores are all GIVEN, not computed here - they come from JobMatchService's core,
-    // backend-weighted computation (see MatchScoreCalculator), which is the single source of
-    // truth shown on the job card. This method only fills in the narrative explanation (plus
-    // languageMatchPercent, which is informational and not part of the weighted score) anchored
-    // to that already-decided number, instead of a second, independently-judged score for the
-    // same job.
+    // מבקש מה-AI הסבר אישי ומפורט להתאמה למשרה ספציפית, כשאחוז ההתאמה כבר קבוע מראש וה-AI רק צריך להסביר אותו בעקביות
     public String computeJobMatchDetail(
             CVAnalysis analysis, Job job, String language,
             int matchPercent, List<String> matchedSkills, List<String> missingSkills,
@@ -606,11 +566,6 @@ Rules:
             String matchedSkillsText = matchedSkills.isEmpty() ? "none" : String.join(", ", matchedSkills);
             String missingSkillsText = missingSkills.isEmpty() ? "none" : String.join(", ", missingSkills);
 
-            // Only present when this job named a specific experience sub-domain beyond general
-            // seniority (see computeJobMatches' requiredExperienceType) - gives this call the same
-            // amount-vs-type distinction the core score was already computed with, instead of it
-            // having to guess from matchPercent alone whether a low experience component means
-            // "not enough years" or "right amount, wrong specialty."
             String experienceTypeBlock = (requiredExperienceType == null || requiredExperienceType.isBlank())
                     ? ""
                     : "\nThis role specifically requires experience in: " + requiredExperienceType + ". "
@@ -622,9 +577,6 @@ Rules:
                             + "experience the candidate profile above DOES show.")
                     + "\n";
 
-            // Built with plain concatenation (not a text block) since it interpolates
-            // matchPercent mid-sentence in several places - a text block's closing/reopening
-            // """ must be followed by a line break, so it can't sit mid-line like this.
             String givenScoreBlock =
                     "This candidate's overall match for this job has ALREADY been determined: " + matchPercent + "% match.\n"
                     + "Already-matched skills: " + matchedSkillsText + "\n"
@@ -703,16 +655,7 @@ Rules:
         }
     }
 
-    // Purely a readability transform of the posting's OWN text for the "About this job" display
-    // - never a scoring input (match scoring always reads the full raw description directly, see
-    // buildJobsBlock/buildSingleJobBlock) and never a substitute for it. Grounded strictly in the
-    // given description; every field must come back empty/"" rather than invented when the
-    // posting doesn't mention it - this is presenting the posting, not embellishing it. Cached by
-    // the caller (see ExternalJobService#getOrGenerateAboutSummary) so this only runs once per
-    // job per language, not on every view.
-    // Throws (doesn't swallow to "{}") on any OpenAI/network failure - unlike this file's other
-    // AI-call methods, the caller (ExternalJobService#callWithRetry) needs to tell a genuine
-    // failure apart from a legitimately empty result to retry only the former.
+    // מבקש מה-AI לארגן מחדש תיאור משרה חופשי למבנה קריא וברור (סקירה, אחריות, דרישות, תנאים)
     public String summarizeJobDescription(String title, String companyName, String description, String language) {
         {
             String languageInstruction = switch (language == null ? "en" : language) {
@@ -734,7 +677,6 @@ Company: """ + nullToNA(companyName) + """
 
 Full description:
 """ + nullToNA(description) + """
-
 
 CRITICAL RULE: use ONLY information that actually appears in the description above. Never invent, assume, or infer anything not stated or clearly implied by the text. If the posting doesn't mention something, leave that field empty ("" for text, [] for a list) - an empty field is the correct, honest answer, not a failure.
 
@@ -778,19 +720,7 @@ Field instructions:
         }
     }
 
-    // Backfills the structured "Required skills"/"Requirements" text that internal job postings
-    // always have (typed directly by the company via PostJob's own form fields) but no external
-    // job provider currently supplies - see ExternalJobService#ensureRequirementsAndSkills. Run
-    // ONCE per external job, ever (the caller only invokes this when both fields are still blank,
-    // and persists the result permanently), never per-candidate or per-language - unlike
-    // summarizeJobDescription's aboutSummary, this output IS a scoring input from then on (it
-    // becomes this job's Job.requirements/Job.skills, read by buildJobsBlock exactly like an
-    // internal job's own company-typed text), so it must stay language-neutral and grounded
-    // strictly in the posting's own words, never invented, to avoid biasing or destabilizing the
-    // match score.
-    // Throws (doesn't swallow to "{}") on any OpenAI/network failure - unlike this file's other
-    // AI-call methods, the caller (ExternalJobService#callWithRetry) needs to tell a genuine
-    // failure apart from a legitimately empty result to retry only the former.
+    // מחלץ מתוך תיאור המשרה החופשי רשימת דרישות וכישורים מובנית, כדי לשמור אותה בשדות הנפרדים של המשרה
     public String extractRequirementsAndSkills(String title, String companyName, String description) {
         {
             String prompt = """
@@ -805,7 +735,6 @@ Company: """ + nullToNA(companyName) + """
 
 Full description:
 """ + nullToNA(description) + """
-
 
 CRITICAL RULE: use ONLY information that actually appears in the description above, in its own original language. Never invent, assume, or translate anything not stated or clearly implied by the text. If the posting states no concrete requirements or skills at all, return empty strings - that is the correct, honest answer, not a failure.
 
@@ -835,6 +764,7 @@ Field instructions:
         }
     }
 
+    // בונה עבור מגייס תדריך מועמד מול משרה ספציפית - כולל ציון התאמה, חוזקות וחולשות ביחס לדרישות המשרה
     public String computeCandidateSummary(CVAnalysis analysis, Job job, String language) {
         try {
             String languageInstruction = switch (language == null ? "en" : language) {
@@ -904,15 +834,7 @@ Field instructions:
         }
     }
 
-    // Translation-only calls used when a candidate+job's score/analysis is already fully computed
-    // and unchanged, but the requesting caller's UI language differs from whatever language the
-    // narrative text currently on file is in (see JobMatchService#getMatchDetail/scoreToPayload
-    // and CandidateSummaryService#getCandidateSummary). Deliberately take ONLY text fields, never
-    // any score/number - unlike computeJobMatches/computeJobMatchDetail/computeCandidateSummary,
-    // which decide a score alongside their narrative, these two methods CANNOT alter any score,
-    // by construction, because no score is ever passed in or asked for. This is what lets a
-    // language switch be served without ever risking a different match percentage/component on a
-    // fresh AI call for the same candidate+job.
+    // מתרגם טקסט שכבר נוצר לשפה אחרת בלי לשנות תוכן, משמעות או מבנה JSON
     private String translateJsonFields(Map<String, Object> fields, String targetLanguage) {
         try {
             String languageName = switch (targetLanguage == null ? "en" : targetLanguage) {
@@ -973,6 +895,7 @@ INPUT JSON (translate every string value in here into """ + languageName + """
         }
     }
 
+    // אורז את שדות ההסבר של התאמת המשרה למפה אחת ושולח אותם לתרגום
     public String translateJobMatchNarrative(
             String matchReason, List<String> whyGoodMatch, List<String> whyNotPerfectMatch,
             List<String> improvementSuggestions, String recommendation, String targetLanguage) {
@@ -985,6 +908,7 @@ INPUT JSON (translate every string value in here into """ + languageName + """
         return translateJsonFields(fields, targetLanguage);
     }
 
+    // אורז את שדות תקציר המועמד למפה אחת ושולח אותם לתרגום
     public String translateCandidateSummaryNarrative(
             String professionalBackground, String strengths, String weaknesses,
             String overallSuitability, String targetLanguage) {
@@ -996,9 +920,9 @@ INPUT JSON (translate every string value in here into """ + languageName + """
         return translateJsonFields(fields, targetLanguage);
     }
 
+    // מפרמט את פרטי המשרה הבודדת לטקסט קריא שנשתל בתוך הפרומפט ל-AI
     private String buildSingleJobBlock(Job job) {
-        // No truncation - this explanation call must be grounded in the same complete
-        // posting the match score itself was computed from (see buildJobsBlock).
+
         String description = job.getDescription();
 
         return """
@@ -1018,6 +942,7 @@ Description: %s
         );
     }
 
+    // מבקש מה-AI הסבר ידידותי על כישור חסר - למה הוא חשוב, איפה משתמשים בו ואיך להתחיל ללמוד אותו
     public String explainSkill(String skillName, String jobTitle, String language) {
         try {
             String languageInstruction = switch (language == null ? "en" : language) {
@@ -1070,10 +995,7 @@ Rules:
         }
     }
 
-    // Every field here is a PERSISTED, structured value from the CV-analysis step - never
-    // something the job matcher has to infer solely from free-text prose. This is what lets the
-    // regulated-profession fieldRelated guardrail actually check "does this candidate have a
-    // relevant license" instead of hoping the summary paragraph happened to mention one.
+    // מפרמט את פרופיל המועמד המלא לטקסט אחד שמשמש כהקשר קבוע בכל פרומפט שקשור להתאמת משרות
     private String buildCandidateProfileBlock(CVAnalysis analysis) {
         return """
 Candidate field (broad label - the candidate's real background may span more than this one field; read the fields below for the full picture): %s
@@ -1112,17 +1034,12 @@ Overall CV score: %s
         );
     }
 
+    // מפרמט רשימת משרות לטקסט אחד עם fingerprint ייחודי לכל משרה, כדי שה-AI לא יערבב בין תשובות של משרות שונות
     private String buildJobsBlock(List<Job> jobs, Map<Long, String> jobFingerprints) {
         StringBuilder sb = new StringBuilder();
 
         for (Job job : jobs) {
-            // No truncation here anymore - match scoring must see the COMPLETE posting.
-            // External jobs have no separate skills/requirements field from any provider (see
-            // JobicyJobProvider#resolveDescription), so the description is the only source of
-            // real requirement signal; truncating it was found via live testing to cut off
-            // requirements sections that start well past character 2000. The one remaining
-            // safety ceiling lives at ingestion time (ExternalJob#description is TEXT, capped
-            // only defensively at 20,000 chars in JobicyJobProvider).
+
             String description = job.getDescription();
 
             String fingerprint = jobFingerprints == null ? null : jobFingerprints.get(job.getId());
@@ -1150,6 +1067,7 @@ Overall CV score: %s
         return value == null ? "N/A" : String.valueOf(value);
     }
 
+    // ממיר את שדה ה-confidence שחוזר מה-AI למספר שלם, גם כשהוא מגיע כמחרוזת עם סימן %
     private int parseConfidence(JsonNode confidenceNode) {
         if (confidenceNode == null || confidenceNode.isMissingNode() || confidenceNode.isNull()) {
             return 0;
@@ -1168,6 +1086,7 @@ Overall CV score: %s
         }
     }
 
+    // מחשב את הציון הסופי של קורות החיים: משלב את הציון שה-AI נתן עם ציון מבוסס-ראיות, ומוודא רצפה הגיונית לפי רמת הניסיון
     private int calculateRealisticScore(JsonNode json) {
         int aiScore = clampScore(json.path("overallProfileScore").asInt(-1));
         int evidenceScore = calculateEvidenceScore(json);
@@ -1176,13 +1095,13 @@ Overall CV score: %s
             return evidenceScore;
         }
 
+        // לא סומכים על ה-AI לבד - ממזגים עם ניקוד מבוסס-ראיות כדי שהציון לא יקפוץ בין הרצות
         int score = Math.round((aiScore * 0.65f) + (evidenceScore * 0.35f));
 
         String experience = json.path("professionalExperienceEvidence").asText("").toLowerCase().trim();
         int experienceDepth = Math.max(0, Math.min(5, json.path("experienceDepthScore").asInt(0)));
         String careerStage = json.path("careerStage").asText("").toLowerCase().trim();
 
-        // Guardrails prevent rich professional CVs from being mis-scored like empty student CVs.
         if (experience.equals("senior_level") || careerStage.equals("senior") || careerStage.equals("managerial")) {
             score = Math.max(score, experienceDepth >= 3 ? 70 : 62);
         } else if (experience.equals("mid_level") || careerStage.equals("experienced")) {
@@ -1194,6 +1113,7 @@ Overall CV score: %s
         return Math.min(score, 100);
     }
 
+    // מחשב ציון קורות חיים לפי עדויות קונקרטיות (ניסיון, השכלה, תעודות, מנהיגות, הישגים) בלי להסתמך רק על השיפוט הסובייקטיבי של ה-AI
     private int calculateEvidenceScore(JsonNode json) {
         int score = 0;
 
@@ -1283,6 +1203,7 @@ Overall CV score: %s
         return count;
     }
 
+    // ממיר את הציון המספרי לתיאור מילולי של רמת המועמד, בשפה המתאימה
     private String getScoreLevel(int score, String language) {
         if (score <= 20) {
             return pickByLanguage(language, "Very weak CV", "سيرة ذاتية ضعيفة جدًا", "קורות חיים חלשים מאוד");
@@ -1299,6 +1220,7 @@ Overall CV score: %s
         }
     }
 
+    // בונה הסבר טקסטואלי אנושי לציון (באנגלית) כשה-AI לא סיפק scoreRationale משלו, מותאם לתחום ולרמת הניסיון של המועמד
     private String buildEvaluationReason(JsonNode json, int score, String language) {
         if (!"en".equals(language == null ? "en" : language)) {
             return buildEvaluationReasonLocalized(json, language);
@@ -1312,14 +1234,12 @@ Overall CV score: %s
 
         StringBuilder reason = new StringBuilder();
 
-        // Education
         if (education.equals("relevant_degree")) {
             reason.append("Your relevant degree gives you a strong academic foundation for your field. ");
         } else if (education.equals("general")) {
             reason.append("Your educational background shows a commitment to learning. ");
         }
 
-        // Experience — field-agnostic language
         switch (experience) {
             case "senior_level" -> reason.append("Your senior-level professional experience is a significant advantage that sets you apart from many candidates in your field. ");
             case "mid_level" -> reason.append("Your solid professional experience shows you can contribute effectively in a real work environment — that matters to employers. ");
@@ -1335,7 +1255,6 @@ Overall CV score: %s
             }
         }
 
-        // Portfolio/work evidence — field-aware language
         String workLabel = switch (candidateField) {
             case "construction" -> "projects and sites";
             case "healthcare" -> "cases and clinical work";
@@ -1370,7 +1289,6 @@ Overall CV score: %s
             }
         }
 
-        // Achievements
         if (achievements.equals("measurable")) {
             reason.append("Including measurable achievements sets your CV apart and makes your contributions concrete and credible.");
         } else if (achievements.equals("general")) {
@@ -1382,6 +1300,7 @@ Overall CV score: %s
         return reason.toString().trim();
     }
 
+    // אותו הסבר לציון כמו buildEvaluationReason, רק בעברית/ערבית במקום באנגלית
     private String buildEvaluationReasonLocalized(JsonNode json, String language) {
         String experience = json.path("professionalExperienceEvidence").asText("none").toLowerCase().trim();
         String portfolio = json.path("portfolioEvidence").asText("none").toLowerCase().trim();
@@ -1447,6 +1366,7 @@ Overall CV score: %s
         return reason.toString().trim();
     }
 
+    // שולח את הבקשה בפועל ל-API של OpenAI ומודד/מתעד את זמן התגובה והצלחה/כישלון לצורך מטריקות
     private Map<String, Object> callOpenAI(Map<String, Object> body) {
         String configuredApiKey = requireConfiguredApiKey();
         String requestedModel = String.valueOf(body.get("model"));
@@ -1482,6 +1402,7 @@ Overall CV score: %s
         return apiKey.trim();
     }
 
+    // שולף את הטקסט של התשובה מתוך המבנה המקונן שמחזיר ה-API של OpenAI (output -> content -> text)
     private String extractTextFromOpenAIResponse(Map<String, Object> response) {
         if (response != null && response.containsKey("output")) {
             Object outputObj = response.get("output");
@@ -1499,6 +1420,7 @@ Overall CV score: %s
                             Object text = contentMap.get("text");
 
                             if (text != null && !text.toString().trim().isEmpty()) {
+                                // לפעמים ה-AI עוטף את ה-JSON ב-```json למרות שביקשנו json_object - מסירים ליתר ביטחון
                                 return text.toString()
                                         .trim()
                                         .replace("```json", "")

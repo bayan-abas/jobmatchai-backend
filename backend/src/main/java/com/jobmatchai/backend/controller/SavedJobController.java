@@ -29,11 +29,13 @@ public class SavedJobController {
         return "Saved Jobs API is working";
     }
 
+    // מחזיר את כל המשרות שהמועמד שמר למועדפים, מהחדשה לישנה
     @GetMapping("/candidate/{email}")
     public List<SavedJob> getSavedJobsByCandidate(Authentication authentication) {
         return savedJobRepository.findByCandidateEmailOrderBySavedAtDesc(authentication.getName());
     }
 
+    // מוסיף משרה לרשימת המועדפים של המועמד המחובר, ומונע שמירה כפולה של אותה משרה
     @PostMapping("/save")
     @PreAuthorize("hasRole('CANDIDATE')")
     public Map<String, Object> saveJob(@RequestBody SavedJob savedJob, Authentication authentication) {
@@ -73,6 +75,7 @@ public class SavedJobController {
         }
     }
 
+    // מסיר משרה מרשימת המועדפים של המועמד המחובר
     @Transactional
     @DeleteMapping("/candidate/{email}/{jobType}/{jobId}")
     public Map<String, Object> unsaveJob(@PathVariable String jobType, @PathVariable Long jobId, Authentication authentication) {

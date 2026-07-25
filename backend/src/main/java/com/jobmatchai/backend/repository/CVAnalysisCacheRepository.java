@@ -7,6 +7,7 @@ import java.util.Optional;
 
 public interface CVAnalysisCacheRepository extends JpaRepository<CVAnalysisCache, Long> {
 
+    // בודק אם כבר יש ניתוח שמור לאותו טקסט קורות חיים, שפה וגרסת פרומפט - כדי לא לקרוא שוב ל-AI בחינם
     Optional<CVAnalysisCache> findByCvTextHashAndLanguageAndPromptVersion(
             String cvTextHash, String language, String promptVersion);
 }

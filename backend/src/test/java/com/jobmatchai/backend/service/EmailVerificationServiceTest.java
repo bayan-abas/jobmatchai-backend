@@ -21,11 +21,6 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-// Covers the security-audit fix: EmailVerificationService used to log the raw verification code
-// (and the email it belongs to) whenever mail isn't configured, regardless of environment - see
-// the mail-not-configured branch of requestCode(). That must now depend on app.environment: the
-// raw code is only ever logged in dev; every other environment gets a generic warning with no
-// code or email in it.
 @ExtendWith(MockitoExtension.class)
 class EmailVerificationServiceTest {
 
@@ -42,7 +37,7 @@ class EmailVerificationServiceTest {
 
         emailVerificationService = new EmailVerificationService();
         ReflectionTestUtils.setField(emailVerificationService, "emailVerificationCodeRepository", emailVerificationCodeRepository);
-        // Mail not configured - the scenario the audit finding is about.
+
         ReflectionTestUtils.setField(emailVerificationService, "mailSender", null);
         ReflectionTestUtils.setField(emailVerificationService, "mailHost", "");
         ReflectionTestUtils.setField(emailVerificationService, "mailUsername", "");
@@ -84,8 +79,7 @@ class EmailVerificationServiceTest {
         String returnedCode = emailVerificationService.requestCode("candidate@example.com");
 
         assertThat(returnedCode).isNull();
-        // A fixed generic literal with no interpolation - the only way this passes is if no
-        // code/email ever made it into any log call for this request.
+
         assertThat(formattedLogMessages())
                 .containsExactly("Verification email could not be sent because mail is not configured.");
     }

@@ -15,6 +15,7 @@ public class NotificationService {
     @Autowired
     private NotificationRepository notificationRepository;
 
+    // יוצר התראה חדשה למשתמש ושומר אותה כלא נקראה
     public Notification createNotification(String recipientEmail, String title, String message, String type) {
         Notification notification = new Notification(
                 recipientEmail,
@@ -27,6 +28,21 @@ public class NotificationService {
         return notificationRepository.save(notification);
     }
 
+    // כמו createNotification, אבל עם referenceId כדי שהלקוח יוכל לנווט ישר לרשומה הרלוונטית (למשל בקשת עבודה) בלחיצה על ההתראה
+    public Notification createNotification(String recipientEmail, String title, String message, String type, Long referenceId) {
+        Notification notification = new Notification(
+                recipientEmail,
+                title,
+                message,
+                type,
+                LocalDateTime.now(),
+                false
+        );
+        notification.setReferenceId(referenceId);
+        return notificationRepository.save(notification);
+    }
+
+    // יוצר התראה רק אם עוד לא נשלחה התראה מאותו סוג עם אותו referenceId - מונע שליחת אותה התראה כמה פעמים
     public void createNotificationOnce(String recipientEmail, String title, String message, String type, Long referenceId) {
         if (notificationRepository.existsByRecipientEmailAndTypeAndReferenceId(recipientEmail, type, referenceId)) {
             return;
@@ -52,6 +68,7 @@ public class NotificationService {
         return notificationRepository.countByRecipientEmailAndReadFalse(recipientEmail);
     }
 
+    // מסמן התראה כנקראה, רק אם היא באמת שייכת למשתמש שביקש - מונע קריאה/עדכון של התראות של מישהו אחר
     public Notification markAsRead(Long notificationId, String requesterEmail) {
         return notificationRepository.findById(notificationId)
                 .filter(notification -> notification.getRecipientEmail().equals(requesterEmail))
@@ -67,6 +84,7 @@ public class NotificationService {
         return notificationRepository.markAllAsReadByRecipientEmail(recipientEmail);
     }
 
+    // מוחק התראה רק אם היא שייכת למשתמש שביקש למחוק אותה
     public boolean deleteNotification(Long notificationId, String requesterEmail) {
         return notificationRepository.findById(notificationId)
                 .filter(notification -> notification.getRecipientEmail().equals(requesterEmail))

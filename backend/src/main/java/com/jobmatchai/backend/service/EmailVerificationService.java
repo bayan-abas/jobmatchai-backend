@@ -39,14 +39,9 @@ public class EmailVerificationService {
 
     private final SecureRandom secureRandom = new SecureRandom();
 
-    // No account exists yet at this point (this runs BEFORE registration, unlike password
-    // reset which always targets an existing user) - so unlike PasswordResetService#requestReset,
-    // this never checks whether a user already exists for the email. That check still happens
-    // where it always has, in UserRegistrationService#register, via EmailAlreadyExistsException.
+    // מייצר קוד אימות בן 6 ספרות, שומר אותו ל-10 דקות ושולח אותו למייל (או מחזיר אותו ישירות בסביבת dev)
     public String requestCode(String email) {
-        // Only the latest requested code is ever valid - stops a candidate who re-clicks "send
-        // code" from ending up with several simultaneously-valid codes floating around, only
-        // one of which is the one actually just emailed to them.
+        // מבטלים קודים קודמים כדי שלא יהיו כמה קודים תקפים בו-זמנית למשתמש שלחץ "שלח קוד" כמה פעמים
         emailVerificationCodeRepository.findAllByEmailAndUsedFalse(email)
                 .forEach(existing -> {
                     existing.setUsed(true);
@@ -68,15 +63,11 @@ public class EmailVerificationService {
         } else if ("dev".equals(appEnvironment)) {
             log.info("Verification code for {}: {}", email, code);
         } else {
-            // Never log the raw code (or the email tied to it) outside dev - this branch means
-            // mail isn't configured at all, so unlike the catch block above there's no delivery
-            // failure detail worth trading that off for.
+
             log.warn("Verification email could not be sent because mail is not configured.");
         }
 
-        // Only ever hand the raw code back in the API response in dev mode - a prod deploy
-        // with mail misconfigured must never leak it to the client, same rule as
-        // PasswordResetService#requestReset.
+        // מחזיר את הקוד בתגובה רק בסביבת dev, כדי שאפשר יהיה לבדוק בלי לחכות למייל אמיתי
         return "dev".equals(appEnvironment) ? code : null;
     }
 
@@ -88,9 +79,7 @@ public class EmailVerificationService {
         helper.setSubject("Your JobMatchAI verification code");
         if (mailUsername != null && !mailUsername.isBlank()) {
             helper.setFrom(mailUsername, "JobMatchAI");
-            // A missing/absent Reply-To is a minor spam-scoring signal on some filters (it
-            // reads as more automated/no-reply-ish than a normal transactional sender) - setting
-            // it to the same verified mailbox costs nothing and can only help deliverability.
+
             helper.setReplyTo(mailUsername);
         }
 
@@ -113,6 +102,7 @@ public class EmailVerificationService {
         mailSender.send(mimeMessage);
     }
 
+    // בודק שהקוד קיים, לא נוצל, לא פג תוקף ותואם למה שהוזן - ואם כן מסמן אותו כמנוצל כדי שלא ישמש שוב
     public boolean verifyAndConsume(String email, String code) {
         EmailVerificationCode verificationCode = emailVerificationCodeRepository
                 .findFirstByEmailAndUsedFalseOrderByIdDesc(email)
@@ -130,8 +120,7 @@ public class EmailVerificationService {
         return true;
     }
 
-    // Used and expired codes have no ongoing value - without this this table would otherwise
-    // grow forever, since there's no account yet at this stage for a deletion to cascade from.
+    // ג'וב שרץ כל לילה ומנקה מה-DB קודי אימות ישנים שכבר נוצלו או פגו
     @Scheduled(cron = "0 0 3 * * *")
     @Transactional
     public void cleanupExpiredCodes() {

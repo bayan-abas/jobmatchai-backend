@@ -55,15 +55,9 @@ public class ExternalJobService {
 
     private static final Logger log = LoggerFactory.getLogger(ExternalJobService.class);
 
-    /**
-     * Offset added to an ExternalJob's real id when building a transient Job wrapper for
-     * JobMatchService, so cached rows in job_match_scores (keyed by a plain Long jobId with
-     * no foreign key) never collide with real internal Job ids.
-     */
+    // מוסיפים מיליארד ל-id של משרה חיצונית כדי שלא תתנגש עם id של משרה פנימית באותן טבלאות match-score/narrative
     private static final long EXTERNAL_ID_OFFSET = 1_000_000_000L;
 
-    // Every language getOrGenerateAboutSummary/prepareJobContent generate an about-summary for -
-    // must match LanguageContext's supported languages on the frontend.
     private static final List<String> SUPPORTED_LANGUAGES = List.of("en", "ar", "he");
 
     @Autowired
@@ -84,23 +78,10 @@ public class ExternalJobService {
     @Autowired
     private RecentlyViewedJobRepository recentlyViewedJobRepository;
 
-    // Self-injected reference to this same bean's Spring-managed proxy - needed so
-    // scheduledImport() can call pruneExpiredJobs() THROUGH the proxy instead of via plain
-    // self-invocation (calling another method on "this" from within the same class bypasses
-    // Spring's proxy-based AOP entirely, so a @Transactional on pruneExpiredJobs would silently
-    // do nothing if called as a normal self-invocation - confirmed via production error the first
-    // time a bare, unwrapped derived-delete call like this ran without an active transaction; see
-    // pruneExpiredJobs' own comment). @Lazy avoids the circular-dependency-at-construction-time
-    // issue a bean depending on its own proxy would otherwise have.
     @Lazy
     @Autowired
     private ExternalJobService self;
 
-    /**
-     * Spring auto-collects every ExternalJobProvider bean here, so all active sources (Jooble,
-     * JSearch, ...) are queried and merged on each import. Adding a new provider later just
-     * means adding a new @Component implementing ExternalJobProvider - nothing here changes.
-     */
     @Autowired
     private List<ExternalJobProvider> externalJobProviders;
 
@@ -115,12 +96,6 @@ public class ExternalJobService {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    // The full set of categories imported every cycle (see importAllCategories) - covers the
-    // general Israeli job market broadly, not just tech, plus explicit remote/work-from-home
-    // variants so remote postings surface across categories rather than only through Jobicy
-    // (which is itself a tech-leaning remote-jobs feed - see JobicyJobProvider). Deliberately a
-    // config property (not a constant) so it can be extended/tuned per deployment without a
-    // code change.
     @Value("${externaljobs.import.keywords:software developer,web developer,project manager,accountant,mechanical engineer,civil engineer,electrical engineer,graphic designer,electrician," +
             "physician,doctor,dentist,pharmacist,physical therapist,veterinarian,registered nurse,healthcare assistant,lawyer,attorney,teacher,chef," +
             "marketing manager,human resources,financial analyst,data analyst,IT support,social worker,real estate agent,plumber,HVAC technician,welder,security guard,bank teller,translator," +
@@ -132,46 +107,15 @@ public class ExternalJobService {
     @Value("${externaljobs.import.country:il}")
     private String defaultCountry;
 
-    // None of these providers expose an explicit "this posting is closed" flag - the only
-    // available signal that a listing is gone is that it stops reappearing in the scheduled
-    // re-imports (see importFromProviders' "reappearing confirms it's still live" comment below).
-    // This IS the closed-job/sync mechanism: retentionDays is how long a job is allowed to go
-    // without reappearing before it's treated as closed and pruned. Short enough (relative to the
-    // 6-hourly import cadence, ~4 cycles/day) that a genuinely closed posting disappears within a
-    // few days rather than lingering for weeks, but still several cycles wide so a job surviving
-    // pruning doesn't require reappearing in literally every single cycle - insulation against a
-    // provider's ranking briefly bumping a still-open job out of a keyword's top results, or one
-    // cycle's fetch having a transient hiccup (see MIN_FETCHED_TO_TRUST_PRUNING below for the
-    // broader-outage case).
     @Value("${externaljobs.retention.days:3}")
     private int retentionDays;
 
-    // How many jobs' content-prep (requirements/skills + about-summary) runs at once during
-    // import - low on purpose. A production incident proved a request-count-based rate limit
-    // (3/sec = 180/min) is nowhere near the real constraint: OpenAI's actual cap here is 30,000
-    // TOKENS per minute for this account/model, and each call costs ~1,500-2,200 tokens - a real
-    // budget of roughly 15-20 calls/minute, not 180. Concurrency beyond a couple of jobs doesn't
-    // make the batch finish faster once the token-per-minute bucket below is the true bottleneck
-    // (see contentPrepRateLimitBucket) - it only makes more callers collide into a 429
-    // simultaneously and waste retries. This is also a SHARED org-wide budget with
-    // MatchScoreQueueWorker's own OpenAI calls (candidate match scoring) - low concurrency here
-    // leaves headroom for that traffic too instead of content-prep dominating the whole quota.
     @Value("${externaljobs.import.content-prep-concurrency:2}")
     private int contentPrepConcurrency;
 
-    // A calls-PER-MINUTE ceiling (not per-second) - matches the actual token-per-minute constraint
-    // above rather than a request-count constraint. bucket4j's asBlocking().consume(1) blocks the
-    // calling (virtual) thread until a token refills, so this is the primary defense that keeps
-    // calls paced under the real budget in the first place, rather than relying on 429s happening
-    // and being retried after the fact. Deliberately conservative (well under the theoretical
-    // 15-20/min ceiling) to leave room for MatchScoreQueueWorker's concurrent usage of the same
-    // per-minute budget.
     @Value("${externaljobs.import.content-prep-rate-limit-per-minute:10}")
     private int contentPrepRateLimitPerMinute;
 
-    // Higher than a typical retry count, and paired with a much longer backoff (see
-    // callWithRetry) - a rate-limit failure needs to wait out a meaningful slice of the 60s token
-    // window to have a real chance of succeeding, not a handful of quick retries.
     @Value("${externaljobs.import.content-prep-max-attempts:5}")
     private int contentPrepMaxAttempts;
 
@@ -179,6 +123,7 @@ public class ExternalJobService {
     private Bucket contentPrepRateLimitBucket;
     private ExecutorService contentPrepExecutor;
 
+    // מכין מגבלת מקביליות ו-rate limit לקריאות ה-AI שמשלימות תיאור/כישורים למשרות חיצוניות
     @PostConstruct
     void initContentPrep() {
         contentPrepConcurrencyLimiter = new Semaphore(Math.max(1, contentPrepConcurrency));
@@ -186,21 +131,17 @@ public class ExternalJobService {
                 .addLimit(limit -> limit.capacity(Math.max(1, contentPrepRateLimitPerMinute))
                         .refillGreedy(Math.max(1, contentPrepRateLimitPerMinute), Duration.ofMinutes(1)))
                 .build();
-        // Cheap to dispatch generously on virtual threads - a job waiting for its turn just blocks
-        // on contentPrepConcurrencyLimiter in memory, holding no DB connection or OS thread.
+
         contentPrepExecutor = Executors.newVirtualThreadPerTaskExecutor();
     }
 
     public record ImportResult(int imported, int skipped, int total) {}
 
-    // One entry per content-prep operation ("requirements/skills" or "about-summary[en/ar/he]")
-    // that exhausted every retry attempt for a given job - surfaced back through
-    // backfillMissingContent's API response so a genuinely stuck job is reported with its exact
-    // id/title/field/reason instead of requiring a Render log lookup to diagnose.
     public record ContentPrepFailure(Long jobId, String jobTitle, String field, String reason) {}
 
     public record BackfillResult(int candidatesFound, int fullyCompleted, List<ContentPrepFailure> failures) {}
 
+    // מפרק את רשימת הקטגוריות מה-config למילות חיפוש בפועל, עם ברירת מחדל אם הרשימה ריקה
     private List<String> categoryKeywords() {
         List<String> keywords = Arrays.stream(categoryKeywordsCsv.split(","))
                 .map(String::trim)
@@ -210,14 +151,10 @@ public class ExternalJobService {
         return keywords.isEmpty() ? List.of("software developer") : keywords;
     }
 
+    // נקודת הכניסה לייבוא משרות - אם לא נתנו מילת חיפוש ספציפית מייבאים לפי כל הקטגוריות המוגדרות
     public ImportResult importJobs(String keywords, String country) {
         String searchCountry = (country == null || country.isBlank()) ? defaultCountry : country;
 
-        // No specific keyword given (the unattended scheduled/startup path) means "import
-        // everything" - every configured category, not just one. A single query only ever
-        // asking about "software developer" is exactly why the job pool used to be almost
-        // entirely tech postings: providers return their top/most-relevant results for
-        // whatever is asked, so a category that's never queried simply never appears.
         if (keywords == null || keywords.isBlank()) {
             return importAllCategories(searchCountry);
         }
@@ -225,16 +162,12 @@ public class ExternalJobService {
         return importForKeyword(keywords, searchCountry);
     }
 
+    // עובר על כל קטגוריית חיפוש ומייבא ממנה משרות, בנפרד לספקים שלא צריכים מילת חיפוש (נמשכים פעם אחת בלבד)
     private ImportResult importAllCategories(String country) {
         int imported = 0;
         int skipped = 0;
         int total = 0;
 
-        // Providers that ignore the keyword entirely (see ExternalJobProvider#usesKeywords,
-        // e.g. JobicyJobProvider's single fixed remote-jobs feed) would otherwise get hit once
-        // per category for the exact same unchanging result set - call them exactly once
-        // instead. Providers whose results genuinely depend on the keyword get one call per
-        // category, which is the whole point of importing "all categories".
         List<ExternalJobProvider> keywordIndependent =
                 externalJobProviders.stream().filter(p -> !p.usesKeywords()).toList();
         List<ExternalJobProvider> keywordDependent =
@@ -261,14 +194,11 @@ public class ExternalJobService {
         return importFromProviders(externalJobProviders, keywords, country);
     }
 
+    // הליבה של הייבוא - שולף משרות מהספקים, מזהה אילו כבר קיימות (לפי externalId/applyUrl), מעדכן שינויים ומוסיף חדשות תוך סינון כפילויות בין ספקים
     private ImportResult importFromProviders(List<ExternalJobProvider> providers, String keywords, String country) {
         List<ExternalJobData> fetched = new ArrayList<>();
         for (ExternalJobProvider provider : providers) {
-            // Defensive per-provider isolation: every current ExternalJobProvider already
-            // catches its own exceptions internally and returns an empty list on failure (see
-            // e.g. JobicyJobProvider#fetchJobs), but this guards against a future provider that
-            // doesn't - one provider's outage/bug must never abort the whole import cycle (and
-            // the other providers' results already fetched) for every other category too.
+
             try {
                 fetched.addAll(provider.fetchJobs(keywords, country, 50));
             } catch (Exception e) {
@@ -284,29 +214,10 @@ public class ExternalJobService {
         List<ExternalJob> changedJobs = new ArrayList<>();
         List<ExternalJob> touchedExisting = new ArrayList<>();
 
-        // Batch-load every existing row that could possibly match ANY job in this fetch in one
-        // (or two, via the OR-in-SQL single query) round trip, instead of one
-        // findByExternalJobIdOrApplyUrl query per fetched job - against a remote database, a
-        // 50-job-per-provider fetch used to mean 50+ individual round trips here every cycle.
         Map<String, ExternalJob> existingByExternalId = new HashMap<>();
         Map<String, ExternalJob> existingByApplyUrl = new HashMap<>();
         loadExistingJobs(fetched, existingByExternalId, existingByApplyUrl);
 
-        // Cross-provider dedup signal: two different providers can aggregate the exact same
-        // real-world posting under two different external ids/apply urls (e.g. Jobicy's own id
-        // vs. JSearch re-aggregating the same LinkedIn/Indeed posting), which the id/url lookup
-        // above can never catch since neither value matches. Deliberately conservative - only an
-        // exact, case-insensitive, trimmed title+company match counts as a duplicate, never fuzzy
-        // matching, to avoid merging two genuinely different postings that simply share a common
-        // title (e.g. "Software Engineer" at two unrelated companies would have different
-        // companyName and NOT match).
-        //
-        // Seeded from EVERY already-stored external job, not just this batch - a production
-        // incident showed a batch-only check lets a real duplicate through the moment a provider
-        // reassigns a new external id/apply url to a posting that was already imported in an
-        // earlier cycle (id/url no longer match anything, so it looks "new" even though its
-        // title+company is already sitting in the table). Cheap: one lightweight id/title/company
-        // projection query, not the full row, regardless of how large external_jobs grows.
         Set<String> seenTitleCompanyKeys = new HashSet<>();
         for (ExternalJobRepository.TitleCompanyProjection row : externalJobRepository.findAllTitleCompanyProjections()) {
             addTitleCompanyKey(seenTitleCompanyKeys, row.getTitle(), row.getCompanyName());
@@ -319,9 +230,7 @@ public class ExternalJobService {
             }
 
             if (existing != null) {
-                // Reappearing in a fresh fetch confirms the posting is still live, regardless of
-                // whether its content changed - this is what keeps a still-open job from being
-                // silently pruned by retention just because it hasn't needed a content update.
+
                 existing.setImportedAt(LocalDateTime.now());
                 touchedExisting.add(existing);
                 addTitleCompanyKey(seenTitleCompanyKeys, existing.getTitle(), existing.getCompanyName());
@@ -351,44 +260,26 @@ public class ExternalJobService {
             newJobs.add(job);
         }
 
-        // One batch embeddings call per import cycle covering every new AND changed job, instead
-        // of one API call per job - this is the entire reason job embeddings are computed at
-        // import time rather than lazily per match request: the cost is paid once per job
-        // (again only when its content actually changes), off the user-facing request path.
-        // Fails open on any embeddings-API problem (embedBatch returns an empty list) - jobs are
-        // still saved without an embedding and simply always go through the AI match path until
-        // a later startup backfill fills them in.
         List<ExternalJob> needingEmbeddings = new ArrayList<>(newJobs);
         needingEmbeddings.addAll(changedJobs);
         attachEmbeddings(needingEmbeddings);
 
-        // Content actually changing (title/description) invalidates any about-summary generated
-        // from the old description - unlike requirements/skills, which applyJobData already reset
-        // to whatever the fresh provider data gives (null, for every provider today), nothing
-        // upstream clears these, so it's done explicitly here before regenerating them below.
         for (ExternalJob job : changedJobs) {
             job.setAboutSummaryEn(null);
             job.setAboutSummaryAr(null);
             job.setAboutSummaryHe(null);
         }
-        // Same list as the embeddings above: every new AND changed job gets requirements/skills
-        // and an about-summary in every language prepared now, off the user-facing request path,
-        // instead of the first candidate to open the job paying for it (see prepareJobContent).
+
         prepareJobContent(needingEmbeddings);
 
         externalJobRepository.saveAll(newJobs);
-        // Covers both changed and unchanged existing rows in one call - every touched row needs
-        // its bumped importedAt persisted regardless of whether its content also changed.
+
         externalJobRepository.saveAll(touchedExisting);
 
         return new ImportResult(newJobs.size(), updated + unchanged + crossProviderDuplicates, fetched.size());
     }
 
-    // Fills the two lookup maps from a single batch query covering every fetched job's
-    // externalId/applyUrl, so the per-job loop in importFromProviders is pure in-memory map
-    // lookups afterward. A row can legitimately land in both maps (its externalId matches one map
-    // entry and its applyUrl matches another) - that's fine, both maps just point at the same
-    // persisted ExternalJob instance in that case.
+    // טוען בבת אחת (query אחד) את כל המשרות הקיימות שעשויות להתאים למה שנשלף, כדי לא לבצע שאילתה לכל משרה בנפרד
     private void loadExistingJobs(List<ExternalJobData> fetched,
                                    Map<String, ExternalJob> existingByExternalId,
                                    Map<String, ExternalJob> existingByApplyUrl) {
@@ -411,9 +302,6 @@ public class ExternalJobService {
             return;
         }
 
-        // JPA's derived "In...In" query still needs both collections non-empty to build a
-        // sensible WHERE clause; pass a single impossible sentinel value for whichever side has
-        // nothing to match instead of an empty IN(), which some JPA providers reject outright.
         List<String> externalIdsParam = externalIds.isEmpty() ? List.of("\0none") : externalIds;
         List<String> applyUrlsParam = applyUrls.isEmpty() ? List.of("\0none") : applyUrls;
 
@@ -432,8 +320,7 @@ public class ExternalJobService {
 
     private String titleCompanyKey(String title, String companyName) {
         if (title == null || companyName == null || title.isBlank() || companyName.isBlank()) {
-            // No confident signal without both fields present - never treat as a duplicate on
-            // partial data, to stay conservative.
+
             return null;
         }
         return title.trim().toLowerCase() + "||" + companyName.trim().toLowerCase();
@@ -462,15 +349,13 @@ public class ExternalJobService {
         job.setPublishedAt(data.publishedAt());
     }
 
-    // Only the fields that would actually change the candidate-facing content (and therefore
-    // warrant a fresh embedding) - salary/location/type churn is common on some providers'
-    // re-fetches even when the role itself is unchanged, but title/description are the real
-    // signal something meaningfully changed.
+    // בודק אם התוכן של המשרה השתנה בפועל (כותרת/תיאור) - אם כן צריך לחשב מחדש embedding וסיכומים
     private boolean contentChanged(ExternalJob existing, ExternalJobData data) {
         return !nullToEmpty(existing.getTitle()).equals(nullToEmpty(data.title()))
                 || !nullToEmpty(existing.getDescription()).equals(nullToEmpty(data.description()));
     }
 
+    // מחשב embedding בבאטש אחד לכל המשרות שצריכות אותו ומצמיד לכל משרה יחד עם ה-hash והמודל ששימש
     private void attachEmbeddings(List<ExternalJob> jobs) {
         if (jobs.isEmpty()) {
             return;
@@ -504,25 +389,14 @@ public class ExternalJobService {
         return value == null ? "" : value;
     }
 
+    // מחזיר את כל המשרות החיצוניות אחרי סינון - רק כאלה שבישראל או remote מוצגות למשתמש
     public List<ExternalJob> getAllExternalJobs() {
         List<ExternalJob> jobs = externalJobRepository.findAllByOrderByImportedAtDesc();
         jobs.forEach(this::populateTransientLocationFields);
         return jobs.stream().filter(this::isIsraelOrRemote).toList();
     }
 
-    // "country" isn't real per-job data (see populateTransientLocationFields - it's always just
-    // the single configured import country, "IL", copied onto every row regardless of the
-    // job's actual scope), so it can't be used to filter. Jobicy (currently the only working
-    // provider - see JoobleJobProvider/JSearchJobProvider doc comments) always calls its
-    // /remote-jobs endpoint with geo=israel, which Jobicy itself resolves server-side into jobs
-    // actually eligible for Israel-based remote candidates - every Jobicy-sourced job is
-    // therefore remote AND Israel-eligible BY CONSTRUCTION, regardless of what its displayed
-    // location text says (Jobicy jobs commonly show broad region tags like "EMEA" or "APAC,
-    // EMEA, LATAM, Canada, USA", which read as "a job in other countries" even though the
-    // posting is actually open to remote Israeli applicants). Trusting the provider's own
-    // contract here is far more reliable than trying to parse an open-ended region-list string.
-    // Any other/future provider falls back to checking its own location text for "israel" or
-    // "remote".
+    // בודק אם המשרה רלוונטית להצגה - Jobicy תמיד remote, אחרת בודקים שהמיקום/סוג המשרה מזכירים ישראל או remote
     private boolean isIsraelOrRemote(ExternalJob job) {
         if ("Jobicy".equalsIgnoreCase(job.getSourceName())) {
             return true;
@@ -539,21 +413,7 @@ public class ExternalJobService {
         });
     }
 
-    // Lazily generates (on first request per job+language) and caches a structured AI summary
-    // of the posting's full description for the frontend's "About this job" section - never
-    // used for match scoring, which always reads the raw description directly (see
-    // getMatchScoresForExternalJobs/getMatchDetailForExternalJob above). One cached column PER
-    // language (see ExternalJob), rather than a single slot plus a content hash - a candidate
-    // viewing in Hebrew right after another viewed in English no longer discards the other
-    // language's cached copy. prepareJobContent proactively fills all three at import time, so
-    // this on-demand path is mainly a fallback for jobs imported before that existed, or whose
-    // import-time generation failed.
-    //
-    // Returns a plain Map (not the JsonNode it's built from) - a JsonNode embedded directly in a
-    // Map<String,Object> controller response gets serialized via bean introspection (its own
-    // isArray()/isObject()/... predicate methods) instead of as JSON, since the map's value type
-    // erases to Object. Converting here, once, is what makes the response actually come back as
-    // real JSON instead of a dump of JsonNode's internal accessors.
+    // מחזיר סיכום "אודות המשרה" מהמטמון אם קיים בשפה המבוקשת, ואם לא - מייצר אותו עכשיו דרך AI ושומר לפעם הבאה
     public Map<String, Object> getOrGenerateAboutSummary(Long externalJobId, String language) {
         ExternalJob job = externalJobRepository.findById(externalJobId).orElse(null);
         if (job == null) {
@@ -576,10 +436,7 @@ public class ExternalJobService {
 
         String rawSummary;
         try {
-            // summarizeJobDescription throws on an OpenAI/network failure (see its own doc
-            // comment) rather than swallowing to "{}" - callers on the import-time path retry via
-            // callWithRetry, but this on-demand path just needs to fail open: the next view
-            // retries instead of getting stuck on a blank summary forever.
+
             rawSummary = openAICVAnalysisService.summarizeJobDescription(
                     job.getTitle(), job.getCompanyName(), description, effectiveLanguage);
         } catch (Exception e) {
@@ -591,8 +448,7 @@ public class ExternalJobService {
         Map<String, Object> parsed = parseJsonToMap(rawSummary);
 
         if (parsed == null || parsed.isEmpty()) {
-            // Generation failed (or the AI returned nothing usable) - don't cache a failure,
-            // so the next view retries instead of getting stuck on a blank summary forever.
+
             return Map.of();
         }
 
@@ -618,20 +474,11 @@ public class ExternalJobService {
         }
     }
 
-    // Proactively generates the about-summary for all three supported languages in memory only
-    // (no save) - used by prepareJobContent at import time so a candidate opening this job for
-    // the first time, in any language, already has a ready summary instead of waiting on
-    // getOrGenerateAboutSummary's on-demand path above. Each language is independent and
-    // best-effort (via callWithRetry): one language's AI failure must never block the other two,
-    // or the requirements/skills extraction, from completing for this job. Idempotent per
-    // language - a language already populated (e.g. from a previous import attempt) is skipped
-    // rather than regenerated.
+    // מייצר סיכום "אודות המשרה" בכל שפה נתמכת שעוד חסרה למשרה הזו, עם ניסיונות חוזרים ורישום כשלים
     private void populateAboutSummaryAllLanguages(ExternalJob job, List<ContentPrepFailure> failures) {
         String description = nullToEmpty(job.getDescription());
         if (description.isBlank()) {
-            // Genuinely unprocessable, not a transient failure - there's no description to
-            // summarize, ever, for this job. Recorded so backfillMissingContent's caller sees an
-            // explicit reason instead of this job silently staying "missing" forever.
+
             for (String language : SUPPORTED_LANGUAGES) {
                 if (getAboutSummaryField(job, language) == null) {
                     failures.add(new ContentPrepFailure(job.getId(), job.getTitle(),
@@ -663,28 +510,11 @@ public class ExternalJobService {
         }
     }
 
-    // Proactively prepares everything about a newly-imported or content-changed external job that
-    // doesn't depend on any specific candidate - requirements/skills extraction, and the
-    // about-summary in every language - so that when a candidate opens it for the first time,
-    // only the actual candidate-specific match score computation remains; there's no more
-    // job-side AI extraction to wait on. Mutates in memory only, exactly like attachEmbeddings
-    // above - the caller's own saveAll persists the result in the same batch.
-    //
-    // Match Score itself is deliberately NOT computed here: it's a function of a specific
-    // candidate's CV, and there's no fixed, enumerable set of candidates to precompute it for at
-    // import time - it still gets computed (and cached) the first time any candidate actually
-    // requests it, same as before, just now against already-complete job data from the start.
-    //
-    // Runs one task per job on a bounded pool (contentPrepConcurrencyLimiter), not one big
-    // sequential loop - found via production incident: firing ~200 sequential OpenAI calls with
-    // zero concurrency control (and no retry) for a 50-job batch burned through OpenAI's rate
-    // limit partway through and silently left most of the batch unprepared. Per-job work is still
-    // fully isolated (each task only ever mutates its own ExternalJob instance), so one job's
-    // task failing outright can never affect any other job's task.
     private void prepareJobContent(List<ExternalJob> jobs) {
         prepareJobContent(jobs, new CopyOnWriteArrayList<>());
     }
 
+    // משלים תוכן חסר (דרישות/כישורים + סיכומים) לכל המשרות שהתקבלו, במקביל ותחת מגבלת קצב הקריאות ל-AI
     private void prepareJobContent(List<ExternalJob> jobs, List<ContentPrepFailure> failures) {
         if (jobs.isEmpty()) {
             return;
@@ -710,19 +540,7 @@ public class ExternalJobService {
         tasks.forEach(CompletableFuture::join);
     }
 
-    // Shared retry wrapper for every content-prep AI call (requirements/skills extraction, and
-    // each language's about-summary) - retries on ANY failure (OpenAI rate limit, transient
-    // network error, etc.) up to contentPrepMaxAttempts times, rate-limited via
-    // contentPrepRateLimitBucket (a calls-per-MINUTE budget, not per-second - see its own doc
-    // comment) so calls stay paced under OpenAI's actual token-per-minute allowance in the first
-    // place, rather than relying purely on retrying after a 429. Backoff is deliberately long
-    // (15s, 30s, 60s, 60s, ...) - a production incident showed a short 1s/2s/4s backoff barely
-    // dents a per-MINUTE token budget once it's exhausted; only waiting out a real slice of that
-    // 60s window gives a retry an actual chance of succeeding. Every attempt (and the final
-    // giving-up) is logged with the specific job id/title/operation, so a failure is traceable
-    // instead of silently disappearing. Returns null (never throws) after exhausting all
-    // attempts - callers already treat a null/failed extraction as "leave this field blank, the
-    // existing lazy on-demand path (or a later backfillMissingContent run) will retry it later."
+    // מריץ קריאת AI עם ניסיונות חוזרים ו-backoff גדל, ואם כולם נכשלים רושם את הכשל ומחזיר null במקום לזרוק
     private String callWithRetry(ExternalJob job, String operation, List<ContentPrepFailure> failures, Callable<String> call) {
         Exception lastError = null;
         for (int attempt = 1; attempt <= Math.max(1, contentPrepMaxAttempts); attempt++) {
@@ -756,28 +574,14 @@ public class ExternalJobService {
         }
     }
 
-    // Lazily backfills ExternalJob#requirements/#skills the first time this specific job's match
-    // detail is requested (see getMatchDetailForExternalJob), for any job that missed the
-    // proactive import-time extraction below (see prepareJobContent) - e.g. a job imported before
-    // this existed, or whose import-time extraction failed.
+    // משלים דרישות/כישורים למשרה בודדת (אם חסר) ושומר מיד, לשימוש לפני התאמה בזמן אמת
     private void ensureRequirementsAndSkills(ExternalJob job) {
         if (populateRequirementsAndSkills(job, new CopyOnWriteArrayList<>())) {
             externalJobRepository.save(job);
         }
     }
 
-    // Single choke point for building the transient Job wrapper JobMatchService fingerprints and
-    // scores against - used by getMatchScoresForExternalJobs, streamMatchScoresForExternalJobs,
-    // AND getMatchDetailForExternalJob. Previously only getMatchDetailForExternalJob called
-    // ensureRequirementsAndSkills before building its Job, while the list/streaming paths built
-    // straight from whatever requirements/skills happened to already be on the row - for any job
-    // that hadn't been proactively prepared yet (or whose import-time prep had failed), that meant
-    // the list showed a score computed from blank requirements/skills while opening the same job's
-    // details computed (and cached) a DIFFERENT score from populated ones, since fingerprintJob's
-    // hash includes both fields. Routing every caller through this one method guarantees they
-    // always fingerprint/score the exact same content, so the list and details score can never
-    // diverge again, and a job already fully prepared (the normal case after import) never
-    // re-triggers anything here - ensureRequirementsAndSkills is a no-op once both fields are set.
+    // הופך משרה חיצונית לאובייקט Job רגיל בשביל מנוע ההתאמה, עם id מוזז (EXTERNAL_ID_OFFSET) שלא יתנגש עם משרות פנימיות
     private Job buildTransientJobForMatching(ExternalJob externalJob) {
         ensureRequirementsAndSkills(externalJob);
 
@@ -796,20 +600,7 @@ public class ExternalJobService {
         return job;
     }
 
-    // Extracts and sets requirements/skills in memory only (no save) - shared by the lazy
-    // per-request backfill above and the batch import-time preparation below, which need the
-    // exact same extraction logic but save on different schedules (immediately vs. batched with
-    // the rest of an import cycle). Returns whether anything actually changed, so callers only
-    // pay for a save when there's something new to persist.
-    //
-    // Every provider today leaves requirements/skills blank (see
-    // JobicyJobProvider#resolveDescription), so the match-scoring prompt was showing the AI
-    // "Required skills: N/A" / "Requirements: N/A" even for postings whose full description
-    // clearly states real requirements, which measurably made the AI less likely to return a
-    // matched/missing-skills breakdown at all for jobs whose description reads as narrative prose
-    // rather than an obviously bulleted skills list (confirmed via production data: internal jobs,
-    // which always have a company-typed skills/requirements field, essentially never come back
-    // with empty skill arrays; external jobs frequently did).
+    // מחלץ דרישות וכישורים מתוך תיאור המשרה באמצעות AI, כשהשדות האלה עדיין ריקים
     private boolean populateRequirementsAndSkills(ExternalJob job, List<ContentPrepFailure> failures) {
         if (!nullToEmpty(job.getRequirements()).isBlank() || !nullToEmpty(job.getSkills()).isBlank()) {
             return false;
@@ -817,21 +608,12 @@ public class ExternalJobService {
 
         String description = nullToEmpty(job.getDescription());
         if (description.isBlank()) {
-            // Genuinely unprocessable, not a transient failure - there's nothing to extract from.
+
             failures.add(new ContentPrepFailure(job.getId(), job.getTitle(),
                     "requirements/skills", "job has no description to extract from"));
             return false;
         }
 
-        // Best-effort only, via callWithRetry (handles its own retry/backoff and logging). A
-        // production incident (the "value too long for type character varying(255)" case) proved
-        // an uncaught failure HERE was taking the entire match-detail request down with it,
-        // denying the candidate their match score/skills breakdown entirely over something that
-        // has nothing to do with computing it - callWithRetry never throws, so any failure -
-        // AI error (after exhausting retries), JSON parse failure, a future DB constraint,
-        // anything - can never prevent the real match computation, or the rest of an import
-        // batch, from proceeding; the next view (or the next import cycle's changedJobs pass)
-        // simply retries this (still-blank) extraction from scratch.
         String raw = callWithRetry(job, "requirements/skills", failures, () ->
                 openAICVAnalysisService.extractRequirementsAndSkills(job.getTitle(), job.getCompanyName(), description));
         if (raw == null) {
@@ -849,10 +631,7 @@ public class ExternalJobService {
         String skills = nullToEmpty(sanitizeSkillsList(
                 String.valueOf(parsed.getOrDefault("skills", "")).trim()));
         if (requirements.isBlank() && skills.isBlank()) {
-            // Generation failed, returned nothing usable, or the posting genuinely names no
-            // concrete requirements/skills - don't write empty strings as a "cached" result,
-            // so the next attempt retries instead of a transient failure permanently looking
-            // identical to "this posting truly has none".
+
             return false;
         }
 
@@ -861,22 +640,10 @@ public class ExternalJobService {
         return true;
     }
 
-    // Non-skill tokens the AI occasionally hands back as if they were their own skill entries -
-    // punctuation-only fragments like ")"/".." already get caught by the "must contain a letter"
-    // filter below, but these have letters and need an explicit denylist instead.
     private static final Set<String> DISALLOWED_SKILL_TOKENS =
             Set.of("n/a", "na", "none", "unknown", "n\\a");
 
-    // Single choke point for cleaning up ExternalJob#skills before it's ever persisted - every
-    // consumer (ExternalJobCard.tsx, JobDetailsPage.tsx, the match-scoring prompt itself, etc.)
-    // splits this same comma/semicolon/pipe-separated string, so sanitizing once here means none
-    // of them need their own defensive filtering. Confirmed in production: the AI's raw output
-    // occasionally includes stray punctuation-only fragments (")", "0..", "..") as separate
-    // "skills", most likely nested parentheticals from the source description bleeding through
-    // the model's comma-separated list. A token survives only if it contains at least one letter
-    // (any language/script, so Arabic/Hebrew skill names aren't accidentally dropped) and isn't on
-    // the explicit denylist above - everything else (pure punctuation/digits/whitespace, or a
-    // "the posting names none" placeholder) is dropped rather than ever being stored as a skill.
+    // מנקה את רשימת הכישורים שחזרה מה-AI - מסיר טוקנים ריקים או חסרי משמעות כמו "n/a"/"none"
     private String sanitizeSkillsList(String rawSkills) {
         if (rawSkills == null || rawSkills.isBlank()) {
             return null;
@@ -904,20 +671,10 @@ public class ExternalJobService {
         }
     }
 
-    // country/city aren't stored (see ExternalJob) - filled in here from the single import
-    // config value and the location string, so every read path returns the same shape the
-    // API always has. Mutates the loaded (already-detached, no active transaction on these
-    // read-only methods) entity in memory only - never re-persisted, exactly like the
-    // country/city transient fields below.
+    // ממלא שדות מיקום שלא נשמרים ב-DB (country/city) לתצוגה בלבד, כולל הטיפול המיוחד ל-Jobicy כ-Remote
     private void populateTransientLocationFields(ExternalJob job) {
         job.setCountry(defaultCountry.toUpperCase());
 
-        // Jobicy's own "jobGeo" text (e.g. "EMEA", "EMEA, LATAM", "Cochia, Europe, Germany,
-        // Israel, Netherlands, UK") is real data, but reads as "this job is based in other
-        // countries" to a candidate scanning the list - even though isIsraelOrRemote already
-        // established every Jobicy job is remote AND Israel-eligible by construction. Showing
-        // the plain, unambiguous "Remote" label here is what makes that fact visible instead of
-        // silently correct-but-confusing.
         if ("Jobicy".equalsIgnoreCase(job.getSourceName())) {
             job.setLocation("Remote");
         }
@@ -925,6 +682,7 @@ public class ExternalJobService {
         job.setCity(job.getLocation());
     }
 
+    // מחשב פרטי התאמה מלאים למשרה חיצונית ספציפית - ממיר ל-Job זמני ומעביר למנוע ההתאמה הרגיל
     public JobMatchService.MatchDetailResult getMatchDetailForExternalJob(
             String email, Long externalJobId, String language) {
 
@@ -973,12 +731,11 @@ public class ExternalJobService {
         );
     }
 
-    // Thin delegate so ExternalJobController's streaming endpoint can emit its "no-analysis"
-    // event up front without needing JobMatchService/CVAnalysisRepository injected directly.
     public boolean hasAnalysis(String email) {
         return jobMatchService.hasAnalysis(email);
     }
 
+    // מחשב ציוני התאמה למספר משרות חיצוניות בבת אחת ומחזיר את ה-id המקוריים (בלי ה-offset) ללקוח
     public JobMatchService.MatchScoresResult getMatchScoresForExternalJobs(
             String email, List<Long> externalJobIds, String language) {
 
@@ -1011,11 +768,7 @@ public class ExternalJobService {
         return new JobMatchService.MatchScoresResult(true, remappedMatches);
     }
 
-    // Streaming counterpart of getMatchScoresForExternalJobs (see ExternalJobController's SSE
-    // endpoint) - same transient-Job-wrapper/EXTERNAL_ID_OFFSET pattern, but additionally passes
-    // each job's cached content embedding through to JobMatchService's pre-filter, and remaps the
-    // offset id back down to the real external id on every callback instead of on a whole
-    // response at once.
+    // כמו getMatchScoresForExternalJobs אבל בסטרימינג - מחזיר כל תוצאה ל-callback ברגע שהיא מוכנה במקום לחכות לכולן
     public void streamMatchScoresForExternalJobs(
             String email, List<Long> externalJobIds, String language,
             java.util.function.BiConsumer<Long, Map<String, Object>> onJobResult, Runnable onComplete) {
@@ -1047,14 +800,7 @@ public class ExternalJobService {
                 onComplete);
     }
 
-    // Unattended, unmonitored entry point (no controller/caller to report a failure to) - unlike
-    // ExternalJobController's /import endpoint, which returns its failure straight to whoever
-    // triggered it, an uncaught exception here would only ever surface as a generic
-    // "TaskUtils$LoggingErrorHandler" log line with no indication of which country/cycle failed
-    // or whether pruning still ran. This wraps the whole cycle so a failure is diagnosable from
-    // logs alone, and mirrors the /import endpoint's own try/catch (see
-    // ExternalJobController#importJobs) but with the specific context (country, result counts)
-    // that only matters for an unattended run.
+    // רץ אוטומטית לפי cron - מייבא משרות חדשות מהספקים ואז מפעיל מחיקת משרות ישנות שלא הופיעו יותר
     @Scheduled(cron = "${externaljobs.import.schedule-cron:0 0 */6 * * *}")
     public void scheduledImport() {
         ImportResult result;
@@ -1069,39 +815,16 @@ public class ExternalJobService {
         }
 
         try {
-            // Through the proxy (self), not a plain self-invocation - see the `self` field's own
-            // comment for why pruneExpiredJobs' @Transactional would otherwise be silently ignored.
+
             self.pruneExpiredJobs(result);
         } catch (Exception e) {
             log.error("Scheduled external job retention pruning failed (country={})", defaultCountry, e);
         }
     }
 
-    // A job's importedAt only refreshes when it reappears in a fresh fetch (see
-    // importFromProviders), so naive age-based pruning has a real false-positive risk: a job that
-    // temporarily falls out of a provider's top-50 ranked results for a few cycles - or a cycle
-    // where a provider call transiently fails - gets treated exactly like a genuinely expired
-    // posting, even though it may still be live. Two mitigations, deliberately simple rather than
-    // adding per-job "missed cycle" tracking:
-    //   1. retentionDays itself is generous (21 days by default) relative to the import cadence
-    //      (every 6 hours = ~84 cycles) - a job has to be absent from every single fetch for the
-    //      entire retention window, not just a handful of cycles, before it's ever a pruning
-    //      candidate at all.
-    //   2. If this cycle's import fetched suspiciously few results overall (a strong signal of a
-    //      broad outage - e.g. every provider failing, or a network-level problem this cycle),
-    //      skip pruning entirely this run rather than pruning against a fetch that had little
-    //      chance to confirm which postings are still live. Pruning simply waits for the next,
-    //      hopefully-healthy cycle instead.
     private static final int MIN_FETCHED_TO_TRUST_PRUNING = 1;
 
-    // public + @Transactional, and called through the self-injected proxy (see the `self` field's
-    // comment) rather than as a plain self-invocation from scheduledImport() - a private method
-    // called via "this" from within the same class never goes through Spring's proxy, so
-    // @Transactional on a private/self-invoked method is silently ignored rather than actually
-    // establishing a transaction. Confirmed via production error: the identical derived-delete
-    // pattern in removeDuplicateExternalJobs threw TransactionRequiredException the first time it
-    // ran without one; this method's deletes were the same latent bug, just never yet triggered
-    // since retention pruning had rarely found anything to actually prune this early in production.
+    // מוחק משרות חיצוניות שלא חזרו בייבוא האחרון מעבר לתקופת השמירה, כולל כל הנתונים הקשורים אליהן (ציונים/narratives/queue)
     @Transactional
     public void pruneExpiredJobs(ImportResult result) {
         if (retentionDays <= 0) {
@@ -1122,21 +845,11 @@ public class ExternalJobService {
             return;
         }
 
-        // Every persisted/queued match-score artifact for these jobs must go with them - a
-        // pruned job can never be recomputed for, so leaving these behind would just be permanent
-        // orphans. External jobs use the EXTERNAL_ID_OFFSET convention for JobMatchScore.jobId
-        // (see the class-level comment) but NOT for MatchScoreJob, which instead has its own
-        // jobType column - see MatchScoreJob's own comment for why the two differ.
         List<Long> offsetIds = idsToPrune.stream().map(id -> EXTERNAL_ID_OFFSET + id).toList();
         jobMatchScoreRepository.deleteByJobIdIn(offsetIds);
         jobMatchNarrativeRepository.deleteByJobIdIn(offsetIds);
         matchScoreJobRepository.deleteByJobIdInAndJobType(idsToPrune, "external");
 
-        // All four deletes now share this method's own @Transactional (see the method-level
-        // comment) - either the whole cleanup for this cutoff commits, or none of it does. Still
-        // safe to interrupt (e.g. a crash/redeploy mid-cycle): this whole cycle is idempotent and
-        // re-run every 6 hours, so an uncommitted attempt simply gets retried from scratch next
-        // time, never leaving a stuck, partially-cleaned state.
         externalJobRepository.deleteAllByIdInBatch(idsToPrune);
 
         int deleted = idsToPrune.size();
@@ -1145,11 +858,7 @@ public class ExternalJobService {
         }
     }
 
-    /**
-     * Runs once, right after the app finishes starting up, so the external_jobs table isn't
-     * sitting empty until the first 6-hour @Scheduled tick fires. Only imports if the table is
-     * currently empty, so restarts don't re-hit provider APIs when jobs already exist.
-     */
+    // בעליית האפליקציה - אם טבלת המשרות החיצוניות ריקה לגמרי, מייבא ישר כדי שלא יהיה מסך ריק למשתמשים
     @EventListener(ApplicationReadyEvent.class)
     public void importOnStartupIfEmpty() {
         if (externalJobRepository.count() == 0) {
@@ -1157,11 +866,7 @@ public class ExternalJobService {
         }
     }
 
-    /**
-     * One-time-per-boot catch-up for rows imported before the embedding pre-filter existed (or
-     * any row whose embedding call failed at import time) - cheap no-op once nothing is missing,
-     * so it's safe to run on every startup rather than only once ever.
-     */
+    // בעליית האפליקציה - משלים embedding למשרות שאיכשהו נשארו בלעדיו (למשל מגרסה ישנה של הקוד)
     @EventListener(ApplicationReadyEvent.class)
     public void backfillMissingEmbeddingsOnStartup() {
         List<ExternalJob> missing = externalJobRepository.findByContentEmbeddingIsNull();
@@ -1172,15 +877,7 @@ public class ExternalJobService {
         externalJobRepository.saveAll(missing);
     }
 
-    // Manually-triggered (see POST /api/external-jobs/backfill-content), NOT a startup listener
-    // like backfillMissingEmbeddingsOnStartup above - catches up every existing external job
-    // still missing requirements/skills or any language's about-summary, e.g. because it was
-    // imported before prepareJobContent existed, or its import-time prep hit OpenAI rate limits
-    // (the exact incident that motivated hardening prepareJobContent with concurrency/retry -
-    // see callWithRetry). Deliberately re-runnable any number of times: every field this touches
-    // is checked and skipped if already populated (see populateRequirementsAndSkills/
-    // populateAboutSummaryAllLanguages), so it only ever fills in what's still missing, never
-    // regenerates already-populated data.
+    // פעולת תחזוקה ידנית - מוצא משרות עם תוכן חסר (דרישות/כישורים/סיכומים) ומריץ עליהן את השלמת התוכן
     public BackfillResult backfillMissingContent() {
         List<ExternalJob> candidates = externalJobRepository.findAll().stream()
                 .filter(this::isMissingAnyContentField)
@@ -1210,25 +907,7 @@ public class ExternalJobService {
 
     public record DuplicateCleanupResult(int duplicateGroupsFound, int rowsRemoved) {}
 
-    // Manually-triggered (see POST /api/external-jobs/remove-duplicates) one-time cleanup for
-    // external jobs that were already duplicated in production BEFORE importFromProviders' title+
-    // company dedup check was extended to cover every already-stored job, not just the current
-    // fetch batch (see that method's own comment) - a provider reassigning a new external id to an
-    // already-imported posting slipped past the old batch-scoped check and landed as a second,
-    // true duplicate row. Groups every existing external job by normalized title+company, keeps
-    // the row with the LOWEST id in each group (the original, first-ever-imported copy - id order
-    // is reliable here, unlike importedAt, which every reappearing job's OWN row also gets bumped
-    // on, duplicate or not), and removes the rest along with their dependent match-score/queue/
-    // saved/recently-viewed rows so nothing is left pointing at a deleted id. Safe to re-run - a
-    // second call simply finds no groups with more than one row left.
-    //
-    // @Transactional here (unlike pruneExpiredJobs' equivalent sequence of deletes, which relies
-    // on a comment claiming each call is "individually atomic" - untrue for a derived delete-by
-    // query with no @Modifying/@Transactional of its own, see JobMatchScoreRepository#
-    // deleteByJobIdIn: it requires an ACTIVE transaction from the caller to call entityManager.
-    // remove(), and throws TransactionRequiredException without one) - confirmed via production
-    // error the first time this ran. Matches UserDeletionService#deleteUserAccount's identical
-    // multi-repository-delete pattern, which already works precisely because it's @Transactional.
+    // מקבץ משרות לפי כותרת+חברה, משאיר רק את הישנה ביותר מכל קבוצה ומוחק את השאר עם כל הנתונים הקשורים אליהן
     @Transactional
     public DuplicateCleanupResult removeDuplicateExternalJobs() {
         List<ExternalJob> all = externalJobRepository.findAll();
@@ -1273,11 +952,7 @@ public class ExternalJobService {
         return new DuplicateCleanupResult(duplicateGroups, idsToRemove.size());
     }
 
-    // Manually-triggered (see POST /api/external-jobs/resanitize-skills) one-time cleanup for
-    // external_jobs.skills rows already persisted with unsanitized tokens (see
-    // sanitizeSkillsList's own doc comment) - written before that filter existed. Pure string
-    // processing, no AI calls, so this is fast and safe to run any number of times: a value
-    // that's already clean re-sanitizes to itself and is left alone.
+    // פעולת תחזוקה ידנית - מריץ מחדש את ניקוי רשימת הכישורים על כל המשרות הקיימות ושומר רק את מה שהשתנה
     public int resanitizeExistingSkills() {
         List<ExternalJob> all = externalJobRepository.findAll();
         List<ExternalJob> changed = new ArrayList<>();

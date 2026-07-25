@@ -29,11 +29,6 @@ public class Job {
     @Column(name = "created_at", updatable = false)
     private LocalDateTime createdAt;
 
-    // Cached OpenAI embedding of this posting's own content (title + description) - backs the
-    // deterministic, keyword-free pre-filter in JobMatchService that decides whether a job is
-    // even worth an AI classification call, mirroring ExternalJob's identical fields. Lazily
-    // computed and fingerprinted the same way (see JobMatchService#ensureInternalJobEmbeddings):
-    // only recomputed when the title/description text or the embedding model/dimensions change.
     @Column(name = "content_embedding", columnDefinition = "TEXT")
     private String contentEmbedding;
 
@@ -43,20 +38,8 @@ public class Job {
     @Column(name = "content_embedding_model")
     private String contentEmbeddingModel;
 
-    // Defaults every newly-constructed Job (via this field initializer, for addJob's brand-new
-    // Job()) to ACTIVE - a job is open for applications unless a company explicitly closes it.
-    // Deliberately NO "default" in columnDefinition, even though the column itself does carry a
-    // DB-level default (see db/migration/add_job_status.sql, which is what actually adds it on an
-    // already-populated table) - reproduced live against a real Postgres database: once the
-    // column exists, Hibernate's ddl-auto=update re-evaluates it on every subsequent boot and,
-    // seeing "default" in columnDefinition, re-issues
-    // "alter table jobs alter column status set data type varchar(20) default 'ACTIVE'" - which
-    // Postgres rejects outright ("syntax error at or near default", since ALTER COLUMN ... SET
-    // DATA TYPE cannot carry a DEFAULT clause in the same statement; that requires a separate SET
-    // DEFAULT). Leaving "default" out here stops Hibernate from retrying that broken statement on
-    // every restart - the column's actual DB-level default (set once, by the migration) and this
-    // field's own initializer together still guarantee every row - old and new - resolves to
-    // ACTIVE without it being declared here too.
+    // בלי "default" ב-columnDefinition בכוונה - עם default, ה-Hibernate מנסה בכל עליה להריץ
+    // ALTER COLUMN עם SET DATA TYPE + DEFAULT באותה פקודה, ופוסטגרס דוחה את זה עם שגיאת syntax
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, columnDefinition = "varchar(20)")
     private JobStatus status = JobStatus.ACTIVE;
@@ -198,6 +181,7 @@ public class Job {
         this.status = status;
     }
 
+    // מגדיר את תאריך היצירה אוטומטית לפני השמירה הראשונה במסד, אם עוד לא הוגדר
     @PrePersist
     protected void onCreate() {
         if (createdAt == null) {

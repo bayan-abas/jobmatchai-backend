@@ -18,9 +18,6 @@ public class RecentlyViewedJob {
     private Long jobId;
     private String jobType;
 
-    // Not persisted - derivable via a (jobId, jobType) join to Job/ExternalJob, and a
-    // "recently viewed" breadcrumb should reflect the job's current details anyway, not a
-    // snapshot from whenever it was viewed. Populated by RecentlyViewedJobService on read.
     @Transient
     private String jobTitle;
 

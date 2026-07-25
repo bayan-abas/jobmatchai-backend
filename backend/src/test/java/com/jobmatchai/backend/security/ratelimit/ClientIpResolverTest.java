@@ -19,8 +19,6 @@ class ClientIpResolverTest {
         when(request.getRemoteAddr()).thenReturn("10.0.0.1");
         when(request.getHeader("X-Forwarded-For")).thenReturn("203.0.113.5");
 
-        // The header must be ignored entirely by default - it's client-supplied input unless a
-        // trusted proxy in front of the app is configured to overwrite it on every request.
         assertThat(resolver.resolve(request)).isEqualTo("10.0.0.1");
     }
 

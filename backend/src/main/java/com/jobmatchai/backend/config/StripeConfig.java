@@ -11,6 +11,7 @@ public class StripeConfig {
     @Value("${stripe.secret-key}")
     private String secretKey;
 
+    // מגדיר את מפתח ה-API הגלובלי של Stripe SDK מתוך ההגדרות, כדי שכל קריאה ל-Stripe בהמשך תעבוד בלי צורך להעביר אותו כל פעם
     @PostConstruct
     public void init() {
         if (secretKey != null && !secretKey.isBlank()) {

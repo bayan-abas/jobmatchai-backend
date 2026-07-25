@@ -23,14 +23,6 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-// Exercises the Stripe subscription lifecycle logic (findUserForSubscription/revokePremiumFor/
-// restorePremiumFor/notifyPaymentFailed - see PaymentController's webhook() switch) directly
-// against plain Stripe model objects built with setters, rather than through the full
-// webhook(payload, signature) entry point. There's no Stripe test-mode account configured in
-// this environment to fabricate a validly-signed payload against and verify end-to-end, so this
-// is the most thorough verification available: it pins down the actual "does premium status end
-// up correct" business logic, independent of Stripe's own signature verification (which is
-// Stripe's SDK code, not ours, and isn't what a real regression here would break).
 @ExtendWith(MockitoExtension.class)
 class PaymentControllerTest {
 
@@ -73,8 +65,6 @@ class PaymentControllerTest {
         return subscription;
     }
 
-    // ---- findUserForSubscription ----
-
     @Test
     void findUserForSubscription_prefersStripeSubscriptionIdLookup() {
         User user = premiumUser();
@@ -111,8 +101,6 @@ class PaymentControllerTest {
         assertThat(found).isSameAs(user);
     }
 
-    // ---- revokePremiumFor (customer.subscription.deleted / lost-access statuses) ----
-
     @Test
     void revokePremiumFor_flipsPremiumOffAndNotifies() {
         User user = premiumUser();
@@ -128,8 +116,7 @@ class PaymentControllerTest {
 
     @Test
     void revokePremiumFor_isNoOp_whenUserAlreadyNonPremium() {
-        // Covers the race where the user's own /cancel-subscription already flipped this before
-        // Stripe's .deleted event for the same cancellation arrives - must not re-notify.
+
         User user = nonPremiumUser();
         when(userRepository.findByStripeSubscriptionId("sub_123")).thenReturn(user);
 
@@ -149,8 +136,6 @@ class PaymentControllerTest {
         verify(userRepository, never()).save(any());
         verify(notificationService, never()).createNotification(any(), any(), any(), any());
     }
-
-    // ---- restorePremiumFor (customer.subscription.updated -> active, e.g. recovered from past_due) ----
 
     @Test
     void restorePremiumFor_flipsPremiumOnAndPersistsStripeIds() {
@@ -179,8 +164,6 @@ class PaymentControllerTest {
         verify(notificationService, never()).createNotification(any(), any(), any(), any());
     }
 
-    // ---- notifyPaymentFailed (invoice.payment_failed - notify only, never revokes access itself) ----
-
     @Test
     void notifyPaymentFailed_notifiesViaSubscriptionOnInvoiceParent() {
         Invoice.Parent.SubscriptionDetails details = new Invoice.Parent.SubscriptionDetails();
@@ -199,8 +182,7 @@ class PaymentControllerTest {
 
         verify(notificationService).createNotification(
                 eq("candidate@example.com"), anyString(), anyString(), eq("PREMIUM_PAYMENT_FAILED"));
-        // Never revokes access itself on a single failed payment - only subscription.updated/
-        // deleted (once Stripe's own dunning retries are exhausted) do that.
+
         verify(userRepository, never()).save(any());
     }
 

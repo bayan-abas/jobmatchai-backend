@@ -38,8 +38,6 @@ class RateLimiterServiceTest {
         rateLimiterService.tryConsume("key-c", RULE);
         assertThat(rateLimiterService.tryConsume("key-c", RULE).allowed()).isFalse();
 
-        // A different key (e.g. a different IP or a different account's email) must not be
-        // affected by key-c's exhausted budget.
         assertThat(rateLimiterService.tryConsume("key-d", RULE).allowed()).isTrue();
     }
 
@@ -49,7 +47,6 @@ class RateLimiterServiceTest {
             assertThat(rateLimiterService.hasCapacity("key-e", RULE)).isTrue();
         }
 
-        // Since hasCapacity never consumed anything, the full capacity is still available.
         assertThat(rateLimiterService.tryConsume("key-e", RULE).allowed()).isTrue();
         assertThat(rateLimiterService.tryConsume("key-e", RULE).allowed()).isTrue();
         assertThat(rateLimiterService.tryConsume("key-e", RULE).allowed()).isTrue();

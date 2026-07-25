@@ -3,13 +3,6 @@ package com.jobmatchai.backend.util;
 import java.util.Map;
 import java.util.Set;
 
-// Server-side CV upload validation (see CVController#uploadCV). Enforces exactly the file types
-// the security audit asked for - PDF and DOCX - by checking BOTH the claimed extension AND the
-// actual file content (magic bytes, detected via Tika - see
-// CVTextExtractorService#detectContentType). An executable or script renamed to end in
-// .pdf/.docx has an allowed extension but the wrong detected content type, and is rejected
-// either way; a genuine PDF renamed to .docx (or vice versa) is rejected too, since content and
-// claimed extension must agree.
 public final class CvFileValidator {
 
     private CvFileValidator() {}
@@ -19,7 +12,6 @@ public final class CvFileValidator {
             "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     );
 
-    // Null means "not one of the allowed extensions".
     public static String extensionOf(String fileName) {
         if (fileName == null) {
             return null;

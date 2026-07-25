@@ -50,10 +50,9 @@ public class PaymentController {
 
     private static final long PREMIUM_MONTHLY_PRICE_CENTS = 999L;
 
-    // Subscription statuses that mean "this subscription no longer grants access" - everything
-    // else (active, trialing, past_due - Stripe is still retrying) leaves premium as-is.
     private static final Set<String> LOST_ACCESS_STATUSES = Set.of("canceled", "unpaid", "incomplete_expired");
 
+    // יוצר Checkout Session ב-Stripe עבור שדרוג המועמד למנוי פרימיום חודשי
     @PostMapping("/create-checkout-session")
     @PreAuthorize("hasRole('CANDIDATE')")
     public ResponseEntity<?> createCheckoutSession(Authentication authentication) {
@@ -100,14 +99,7 @@ public class PaymentController {
                     .setCancelUrl(frontendUrl + "/payment/cancel")
                     .setCustomerEmail(authentication.getName())
                     .putMetadata("candidateEmail", authentication.getName())
-                    // The checkout Session's own metadata only helps activatePremium (which reads
-                    // the completed Session directly) - every OTHER lifecycle webhook
-                    // (subscription.updated/deleted, invoice.payment_failed) hands us the
-                    // Subscription/Invoice object instead, which never carries the Session's
-                    // metadata unless stamped here too. Without this, those events could only be
-                    // matched back to a user via stripeSubscriptionId/stripeCustomerId, which
-                    // aren't persisted until AFTER activatePremium's first save - a subscription
-                    // event arriving before that (unlikely but possible race) would be unmatchable.
+
                     .setSubscriptionData(
                             SessionCreateParams.SubscriptionData.builder()
                                     .putMetadata("candidateEmail", authentication.getName())
@@ -129,6 +121,7 @@ public class PaymentController {
         }
     }
 
+    // מאמת מול Stripe שה-checkout הושלם ותשלום התקבל, ומפעיל פרימיום למועמד
     @GetMapping("/confirm")
     @PreAuthorize("hasRole('CANDIDATE')")
     public ResponseEntity<?> confirm(@RequestParam("session_id") String sessionId, Authentication authentication) {
@@ -139,12 +132,6 @@ public class PaymentController {
         try {
             Session session = Session.retrieve(sessionId);
 
-            // A session_id isn't a secret the way a token is - it can end up in browser
-            // history, a shared success-URL, or a referrer header. Without this check,
-            // anyone logged in could activate premium on someone ELSE's account just by
-            // calling this endpoint with a session_id that isn't theirs (Stripe still
-            // requires the session to be genuinely paid, but ties the activation to
-            // whatever email was stashed in its metadata, not to the caller).
             String sessionCandidateEmail = session.getMetadata() != null
                     ? session.getMetadata().get("candidateEmail")
                     : null;
@@ -169,6 +156,7 @@ public class PaymentController {
         }
     }
 
+    // מטפל בהתראות Webhook מ-Stripe (תשלום הושלם/מנוי בוטל/מנוי עודכן/תשלום נכשל) ומעדכן את סטטוס הפרימיום בהתאם
     @PostMapping("/webhook")
     public ResponseEntity<?> webhook(@RequestBody String payload, @RequestHeader("Stripe-Signature") String sigHeader) {
         if (webhookSecret == null || webhookSecret.isBlank()) {
@@ -196,22 +184,12 @@ public class PaymentController {
                 }
             });
 
-            // Fires when a subscription is fully terminated - whether the user's own
-            // cancellation took effect at period end, or Stripe gave up retrying a failed
-            // payment after its dunning schedule ran out. This is the definitive "access is
-            // over" signal; cancel-subscription (the user-initiated path above) covers the
-            // immediate case, this covers every OTHER way a subscription can end.
             case "customer.subscription.deleted" -> event.getDataObjectDeserializer().getObject().ifPresent(obj -> {
                 if (obj instanceof Subscription subscription) {
                     revokePremiumFor(subscription, "Your JobMatchAI Premium subscription has ended.");
                 }
             });
 
-            // Fires on every status transition (active <-> past_due <-> unpaid <-> canceled,
-            // and re-activation after a manual retry succeeds). Handles both directions: losing
-            // access when a renewal ultimately fails without waiting for the separate .deleted
-            // event, and restoring it if a past_due subscription recovers - the checkout flow
-            // only ever runs once, so recovery has no other path back to premium=true.
             case "customer.subscription.updated" -> event.getDataObjectDeserializer().getObject().ifPresent(obj -> {
                 if (obj instanceof Subscription subscription) {
                     String status = subscription.getStatus();
@@ -223,10 +201,6 @@ public class PaymentController {
                 }
             });
 
-            // A renewal charge failed. Stripe retries automatically per its dunning schedule
-            // (surfacing as subscription.updated -> past_due, then eventually .deleted if every
-            // retry fails) - access isn't pulled on the first failure, but the candidate needs to
-            // know now, while they can still fix their payment method before losing Premium.
             case "invoice.payment_failed" -> event.getDataObjectDeserializer().getObject().ifPresent(obj -> {
                 if (obj instanceof Invoice invoice) {
                     notifyPaymentFailed(invoice);
@@ -239,10 +213,7 @@ public class PaymentController {
         return ResponseEntity.ok(Map.of("received", true));
     }
 
-    // Package-private (not private) so PaymentControllerTest can exercise this lifecycle logic
-    // directly with plain Stripe model objects, instead of having to fabricate a validly-signed
-    // webhook payload and rely on Stripe's own JSON deserializer - there's no Stripe test-mode
-    // account available in this environment to verify the real webhook end-to-end against.
+    // מאתר את המשתמש ששייך למנוי לפי subscription id, ואם לא נמצא לפי המייל או ה-customer id
     User findUserForSubscription(Subscription subscription) {
         User user = userRepository.findByStripeSubscriptionId(subscription.getId());
         if (user != null) {
@@ -259,12 +230,11 @@ public class PaymentController {
         return userRepository.findByStripeCustomerId(subscription.getCustomer());
     }
 
+    // מבטל את סטטוס הפרימיום של המשתמש ושולח לו התראה על סיום המנוי
     void revokePremiumFor(Subscription subscription, String message) {
         User user = findUserForSubscription(subscription);
         if (user == null || !user.isPremium()) {
-            // Already non-premium (e.g. the user's own /cancel-subscription already flipped
-            // this and Stripe's .deleted event for the same cancellation arrived after) -
-            // nothing to do, and re-notifying would be misleading duplicate noise.
+
             return;
         }
 
@@ -275,6 +245,7 @@ public class PaymentController {
                 user.getEmail(), "Premium Ended", message, "PREMIUM_CANCELLED");
     }
 
+    // מחזיר את הפרימיום למשתמש לאחר שהמנוי חזר להיות פעיל (למשל לאחר תשלום מאוחר שהצליח)
     void restorePremiumFor(Subscription subscription) {
         User user = findUserForSubscription(subscription);
         if (user == null || user.isPremium()) {
@@ -293,6 +264,7 @@ public class PaymentController {
                 "PREMIUM_ACTIVATED");
     }
 
+    // שולח למשתמש התראה שהחיוב האחרון על המנוי נכשל
     void notifyPaymentFailed(Invoice invoice) {
         String subscriptionId = invoice.getParent() != null && invoice.getParent().getSubscriptionDetails() != null
                 ? invoice.getParent().getSubscriptionDetails().getSubscription()
@@ -313,6 +285,7 @@ public class PaymentController {
                 "PREMIUM_PAYMENT_FAILED");
     }
 
+    // מבטל את מנוי הפרימיום דרך Stripe עבור המועמד המחובר
     @PostMapping("/cancel-subscription")
     @PreAuthorize("hasRole('CANDIDATE')")
     public ResponseEntity<?> cancelSubscription(Authentication authentication) {
@@ -356,11 +329,7 @@ public class PaymentController {
         }
     }
 
-    // --- Demo/development mode only -----------------------------------------------------
-    // Bypasses Stripe entirely: no card, no checkout session, no webhook. Activates/cancels
-    // Premium directly on the account. The frontend calls these instead of
-    // create-checkout-session / cancel-subscription for now; once real Stripe payments are
-    // wired up, point PaymentPage.tsx back at those endpoints and these can stay unused.
+    // מפעיל פרימיום ידנית ללא תשלום אמיתי - למטרות הדגמה בלבד
     @PostMapping("/demo/activate-premium")
     @PreAuthorize("hasRole('CANDIDATE')")
     public ResponseEntity<?> activatePremiumDemo(Authentication authentication) {
@@ -387,6 +356,7 @@ public class PaymentController {
         return ResponseEntity.ok(Map.of("success", true, "message", "Premium activated."));
     }
 
+    // מבטל פרימיום ידנית ללא Stripe - למטרות הדגמה בלבד
     @PostMapping("/demo/cancel-premium")
     @PreAuthorize("hasRole('CANDIDATE')")
     public ResponseEntity<?> cancelPremiumDemo(Authentication authentication) {
@@ -408,6 +378,7 @@ public class PaymentController {
         return ResponseEntity.ok(Map.of("success", true, "message", "Subscription cancelled."));
     }
 
+    // מפעיל בפועל את מנוי הפרימיום למשתמש לפי session מוצלח ושומר את פרטי ה-Stripe שלו
     private void activatePremium(Session session) {
         String email = session.getMetadata() != null ? session.getMetadata().get("candidateEmail") : null;
 
@@ -417,6 +388,7 @@ public class PaymentController {
 
         User user = userRepository.findByEmail(email);
 
+        // Stripe יכול לשלוח את אותו webhook כמה פעמים - הבדיקה הזו מונעת התראת "הופעל" כפולה
         if (user == null || user.isPremium()) {
             return;
         }

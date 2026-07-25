@@ -2,13 +2,6 @@ package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
 
-// Per-language cache of JobMatchScore's narrative text (matchReason, whyGoodMatch,
-// whyNotPerfectMatch, improvementSuggestions, recommendation). JobMatchScore itself holds the
-// deterministic score fields plus the "canonical" narrative in whatever language first generated
-// it - this table holds a translated (or natively-generated) copy per requested language, so a UI
-// language switch never has to re-call the scoring AI (which could legitimately return a
-// different score on a fresh call) just to get text in a different language. See
-// JobMatchService#getMatchDetail/scoreToPayload for the read/write logic.
 @Entity
 @Table(name = "job_match_narratives", uniqueConstraints = {
         @UniqueConstraint(columnNames = {"candidate_email", "job_id", "language"})
@@ -43,20 +36,12 @@ public class JobMatchNarrative {
     @Column(name = "recommendation", columnDefinition = "TEXT")
     private String recommendation;
 
-    // Must match the parent JobMatchScore's cvFingerprint/jobFingerprint at read time for this
-    // row to be considered fresh - otherwise the underlying CV/job content has changed since this
-    // language was translated and it must be regenerated.
     @Column(name = "cv_fingerprint")
     private String cvFingerprint;
 
     @Column(name = "job_fingerprint")
     private String jobFingerprint;
 
-    // Mirrors JobMatchService.DETAIL_PROMPT_VERSION at the time whyGoodMatch/whyNotPerfectMatch/
-    // improvementSuggestions/recommendation were last (re)generated for THIS language. Null when
-    // only matchReason has been translated for this language and the detail fields haven't been
-    // generated/translated yet - a null-or-mismatched value means the detail fields on this row
-    // are not (yet) usable, even if matchReason is fine.
     @Column(name = "detail_prompt_version")
     private Integer detailPromptVersion;
 

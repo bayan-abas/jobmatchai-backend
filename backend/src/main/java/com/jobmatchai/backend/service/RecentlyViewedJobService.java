@@ -28,6 +28,7 @@ public class RecentlyViewedJobService {
     @Autowired
     private ExternalJobRepository externalJobRepository;
 
+    // מתעד/מעדכן צפייה במשרה, ואם נשמרות יותר מ-10 משרות מוחק את הישנות ביותר
     public void recordView(String candidateEmail, Long jobId, String jobType) {
         RecentlyViewedJob row = recentlyViewedJobRepository
                 .findByCandidateEmailAndJobIdAndJobType(candidateEmail, jobId, jobType)
@@ -46,9 +47,7 @@ public class RecentlyViewedJobService {
         }
     }
 
-    // jobTitle/companyName/location aren't stored (see RecentlyViewedJob) - joined here
-    // against the live Job/ExternalJob tables instead, batched per jobType so this stays
-    // one extra query each rather than one per row.
+    // מחזיר את המשרות שנצפו לאחרונה, ומעשיר כל רשומה בפרטי המשרה (כותרת, חברה, מיקום) ממשרה פנימית או חיצונית
     public List<RecentlyViewedJob> getRecentlyViewed(String candidateEmail) {
         List<RecentlyViewedJob> rows = recentlyViewedJobRepository.findByCandidateEmailOrderByViewedAtDesc(candidateEmail);
 

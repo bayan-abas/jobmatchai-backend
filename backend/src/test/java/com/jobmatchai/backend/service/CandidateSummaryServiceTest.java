@@ -19,8 +19,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
 
-// Exercises CandidateSummaryService against a mocked OpenAICVAnalysisService, matching this
-// repo's existing plain-JUnit5+Mockito controller/service test convention (no @SpringBootTest).
 @ExtendWith(MockitoExtension.class)
 class CandidateSummaryServiceTest {
 
@@ -52,9 +50,7 @@ class CandidateSummaryServiceTest {
         when(candidateAiSummaryRepository.findFirstByCandidateEmailAndJobIdOrderByIdDesc(any(), any()))
                 .thenReturn(Optional.empty());
         when(candidateAiSummaryRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
-        // No cached translation on file for any of these tests, so resolveWithNarrative's
-        // freshly-generated branch seeds the narrative cache directly from the just-generated
-        // (already-correct-language) text instead of calling out to translateCandidateSummaryNarrative.
+
         when(candidateAiSummaryNarrativeRepository.findByCandidateEmailAndJobIdAndLanguage(any(), any(), any()))
                 .thenReturn(Optional.empty());
         when(candidateAiSummaryNarrativeRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
@@ -66,9 +62,6 @@ class CandidateSummaryServiceTest {
         job.setId(1L);
         return job;
     }
-
-    // ---- the real contradiction this filter exists to catch: a sentence genuinely claiming a
-    // keySkill is missing must still be dropped ----
 
     @Test
     void weaknessesSentence_genuinelyContradictingKeySkill_isDropped() {
@@ -91,10 +84,6 @@ class CandidateSummaryServiceTest {
                 .doesNotContain("lacking Java")
                 .contains("Overall a solid profile.");
     }
-
-    // ---- the negation-handling regression found via real end-to-end testing: a sentence that
-    // EXPLICITLY DENIES any gap (containing "missing"/"gap" only as part of saying there ISN'T
-    // one) must survive untouched, even though it names every keySkill by name ----
 
     @Test
     void weaknessesSentence_explicitlyDenyingAnyGap_isNotDropped() {
@@ -121,9 +110,6 @@ class CandidateSummaryServiceTest {
                 .contains("Spring Boot")
                 .contains("REST APIs");
     }
-
-    // ---- recommendation is a pure, deterministic function of matchScore (see MatchLabelUtil) -
-    // never independently invented, and always present alongside the score ----
 
     @Test
     void recommendation_isDerivedFromMatchScore_neverIndependentlyInvented() {

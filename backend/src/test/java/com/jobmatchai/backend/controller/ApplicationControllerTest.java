@@ -28,12 +28,6 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-// Covers PUT /api/applications/{id}/status - specifically the candidate-facing notification this
-// endpoint fires when a company Accepts/Rejects an application (see ApplicationController#updateStatus).
-// Ownership enforcement, the one-final-decision guard (which is also what prevents a duplicate
-// notification from an unchanged resubmission), and the notification text itself (job title +
-// company name) are all exercised directly against the controller, mirroring JobControllerTest's
-// approach of mocking only the repositories/services the method under test actually touches.
 @ExtendWith(MockitoExtension.class)
 class ApplicationControllerTest {
 
@@ -74,9 +68,7 @@ class ApplicationControllerTest {
     }
 
     private Application pendingApplication(long id, String companyEmail) {
-        // Application has no public id setter (it's @GeneratedValue-only) - not needed here
-        // anyway, since updateStatus looks the row up by the path-variable id, never by
-        // application.getId().
+
         Application application = new Application();
         application.setCandidateEmail("candidate@example.com");
         application.setCompanyEmail(companyEmail);
@@ -85,8 +77,6 @@ class ApplicationControllerTest {
         application.setStatus("AI Screening");
         return application;
     }
-
-    // ---- Accepted ----
 
     @Test
     void updateStatus_accepting_notifiesCandidate_withJobTitleAndCompanyName() {
@@ -131,11 +121,8 @@ class ApplicationControllerTest {
         verify(notificationService).createNotification(
                 eq("candidate@example.com"), eq("Application Accepted"), message.capture(), eq("APPLICATION_ACCEPTED"));
 
-        // No dangling "at" when companyName is missing - reads as a complete sentence either way.
         assertThat(message.getValue()).doesNotContain(" at ").contains("Backend Engineer");
     }
-
-    // ---- Stale rejectionReason is cleared on any non-Rejected transition ----
 
     @Test
     void updateStatus_accepting_clearsStaleRejectionReason() {
@@ -197,8 +184,6 @@ class ApplicationControllerTest {
                 .contains("Not enough backend experience");
     }
 
-    // ---- Duplicate-notification guard (resubmitting an already-final decision) ----
-
     @Test
     void updateStatus_isRejected_whenApplicationAlreadyAccepted_andNeverNotifiesAgain() {
         long id = 30L;
@@ -235,8 +220,6 @@ class ApplicationControllerTest {
         verify(notificationService, never()).createNotification(any(), any(), any(), any());
     }
 
-    // ---- Ownership ----
-
     @Test
     void updateStatus_isRejected_whenCallerDoesNotOwnApplication_andNeverNotifies() {
         long id = 40L;
@@ -254,9 +237,6 @@ class ApplicationControllerTest {
         verify(applicationRepository, never()).save(any(Application.class));
         verify(notificationService, never()).createNotification(any(), any(), any(), any());
     }
-
-    // ---- applyToJob (POST /api/applications/apply) - CLOSED jobs must reject new applications
-    // even when called directly, regardless of how the frontend got the jobId ----
 
     @Test
     void applyToJob_isRejected_whenJobIsClosed_evenWhenCalledDirectlyWithoutGoingThroughTheListing() {
@@ -292,10 +272,6 @@ class ApplicationControllerTest {
         assertThat(response.get("success")).isEqualTo(true);
         verify(applicationRepository).save(any(Application.class));
     }
-
-    // ---- getApplicationsByCandidate (GET /api/applications/candidate/{email}) - enriches each
-    // application with the referenced job's CURRENT status, so a candidate keeps seeing an
-    // application whose job has since closed, marked accordingly ----
 
     @Test
     void getApplicationsByCandidate_enrichesEachApplicationWithTheJobsCurrentStatus() {

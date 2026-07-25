@@ -4,15 +4,6 @@ import jakarta.persistence.*;
 
 import java.time.LocalDateTime;
 
-// The persistent work queue backing background match-score computation (see
-// service.MatchScoreQueueService / service.MatchScoreQueueWorker). A row here represents "this
-// candidate+job+jobType needs a fresh AI comparison" - claimed by a worker via SELECT ... FOR
-// UPDATE SKIP LOCKED (see MatchScoreJobRepository#claimBatch), which is what makes claiming safe
-// across multiple concurrent worker threads AND multiple app instances without needing an
-// external broker: two workers racing for the same row can never both win it. The result of a
-// completed job is NOT stored here - it's written straight to JobMatchScore (the durable,
-// fingerprint-cached result every reader already queries) and this row is deleted; only FAILED
-// rows (after exhausting retries) are kept, for observability.
 @Entity
 @Table(name = "match_score_jobs",
         indexes = {
@@ -34,32 +25,18 @@ public class MatchScoreJob {
     @Column(name = "job_id", nullable = false)
     private Long jobId;
 
-    // "internal" or "external" - which repository/service owns this job id, so the worker knows
-    // how to load it (JobRepository vs ExternalJobService's transient-Job wrapper).
     @Column(name = "job_type", nullable = false)
     private String jobType;
 
     @Column(name = "language")
     private String language;
 
-    // Informational only - the worker always re-derives the CURRENT fingerprint fresh at process
-    // time rather than trusting this snapshot, so a CV/job edit between enqueue and processing is
-    // never scored against stale data.
     @Column(name = "cv_fingerprint")
     private String cvFingerprint;
 
     @Column(name = "job_fingerprint")
     private String jobFingerprint;
 
-    // A content snapshot of the job at enqueue time, captured directly from the Job object the
-    // enqueueing request already had in hand - deliberately NOT a foreign key the worker resolves
-    // later. This is what lets the worker process a row without re-fetching the job (internal
-    // jobs via JobRepository, external ones via ExternalJobService's offset-id transient-Job
-    // wrapper) at all, which would otherwise require JobMatchService to depend on
-    // ExternalJobService - a circular dependency, since ExternalJobService already depends on
-    // JobMatchService. A snapshot a few seconds stale is a non-issue: if the job's real content
-    // changed in that window, the next time any candidate views it the fingerprint simply won't
-    // match and it naturally gets recomputed, exactly like any other cache staleness.
     @Column(name = "job_title", columnDefinition = "TEXT")
     private String jobTitle;
 
@@ -84,8 +61,6 @@ public class MatchScoreJob {
     @Column(name = "job_skills", columnDefinition = "TEXT")
     private String jobSkills;
 
-    // PENDING -> IN_PROGRESS -> (row deleted on success) or -> PENDING again with backoff (retry)
-    // or -> FAILED (attempts exhausted).
     @Column(name = "status", nullable = false)
     private String status;
 
@@ -107,6 +82,7 @@ public class MatchScoreJob {
     public MatchScoreJob() {
     }
 
+    // בעת יצירת job חדש בתור - קובע זמן יצירה, זמן זמינות וסטטוס התחלתי אם עוד לא הוגדרו
     @PrePersist
     protected void onCreate() {
         LocalDateTime now = LocalDateTime.now();
@@ -122,6 +98,7 @@ public class MatchScoreJob {
         }
     }
 
+    // מעדכן את חותמת הזמן "עודכן לאחרונה" בכל שינוי של רשומת ה-job
     @PreUpdate
     protected void onUpdate() {
         updatedAt = LocalDateTime.now();

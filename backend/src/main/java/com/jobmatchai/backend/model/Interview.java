@@ -17,18 +17,20 @@ public class Interview {
 
     private LocalDateTime scheduledAt;
     private String type;
+    private String location;
     private String notes;
     private String status;
 
     public Interview() {}
 
     public Interview(Long applicationId, String candidateEmail, String companyEmail,
-                      LocalDateTime scheduledAt, String type, String notes, String status) {
+                      LocalDateTime scheduledAt, String type, String location, String notes, String status) {
         this.applicationId = applicationId;
         this.candidateEmail = candidateEmail;
         this.companyEmail = companyEmail;
         this.scheduledAt = scheduledAt;
         this.type = type;
+        this.location = location;
         this.notes = notes;
         this.status = status;
     }
@@ -75,6 +77,14 @@ public class Interview {
 
     public void setType(String type) {
         this.type = type;
+    }
+
+    public String getLocation() {
+        return location;
+    }
+
+    public void setLocation(String location) {
+        this.location = location;
     }
 
     public String getNotes() {

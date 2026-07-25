@@ -43,13 +43,6 @@ public class AIChatContextService {
 
     public record ChatContext(String mode, String contextBlock, List<CanonicalFact> facts) {}
 
-    // The same canonical per-(job, candidate) match facts the contextBlock text is built FROM,
-    // kept as typed data alongside the stringified prompt so ChatConsistencyValidator can check an
-    // AI-generated reply against the exact numbers/skill lists it was given, instead of the
-    // validator having to re-parse contextBlock's free-text formatting (which is prompt-tuning
-    // surface, not a stable data contract) or re-query the database itself. candidateName is null
-    // in candidate mode - the chat's "you" is unambiguous there - and non-null in company mode,
-    // where several candidates can be discussed for the same job in one reply.
     public record CanonicalFact(
             Long jobId,
             String jobTitle,
@@ -68,6 +61,7 @@ public class AIChatContextService {
 
     private record ModeContext(String contextBlock, List<CanonicalFact> facts) {}
 
+    // בונה את הקשר הנתונים לצ'אט לפי סוג המשתמש (מועמד/חברה/אנונימי) - זה מה שנשתל בפרומפט כדי שה-AI יענה על סמך נתונים אמיתיים
     public ChatContext buildContext(String email, String language) {
         if (email == null || email.isBlank()) {
             return new ChatContext("anonymous", "", List.of());
@@ -87,6 +81,7 @@ public class AIChatContextService {
         return new ChatContext("candidate", candidate.contextBlock(), candidate.facts());
     }
 
+    // אוסף למועמד את ניתוח קורות החיים שלו, הבקשות שהגיש והמשרות הזמינות עם אחוזי ההתאמה שלו - ומרכיב מזה טקסט הקשר אחד לצ'אט
     private ModeContext buildCandidateContext(String email, String language) {
         CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(email).orElse(null);
         List<Application> applications = applicationRepository.findByCandidateEmail(email);
@@ -139,6 +134,7 @@ public class AIChatContextService {
         return new ModeContext(sb.toString(), facts);
     }
 
+    // אוסף לחברה את המשרות שפרסמה, כל המועמדים שהגישו בקשה לכל משרה, וניתוח/ציון ההתאמה של כל מועמד - לצורך תשובות צ'אט לחברה
     private ModeContext buildCompanyContext(String email, String language) {
         List<Job> companyJobs = jobRepository.findByCompanyEmail(email);
         if (companyJobs.size() > 20) {
@@ -165,11 +161,6 @@ public class AIChatContextService {
         Map<Long, List<Application>> applicationsByJobId = allApplications.stream()
                 .collect(Collectors.groupingBy(app -> app.getJobId()));
 
-        // Batch-fetch CVAnalysis and cached JobMatchScore rows for every applicant up front,
-        // instead of one query per applicant (and, for match scores, previously one query PLUS
-        // a possible synchronous OpenAI call per applicant-per-job pair). This context is only
-        // ever read from cache - it must never trigger fresh AI scoring, which belongs solely
-        // to the candidate-facing "Job Matches" and company-facing "AI Summary" features.
         List<String> candidateEmails = allApplications.stream().map(Application::getCandidateEmail).distinct().toList();
 
         Map<String, CVAnalysis> analysisByEmail = new HashMap<>();
@@ -269,6 +260,7 @@ public class AIChatContextService {
         return List.of(value.split("\\|"));
     }
 
+    // מפרמט את ניתוח קורות החיים של המועמד לטקסט קריא שנכנס להקשר הצ'אט
     private String buildCandidateProfileBlock(CVAnalysis analysis) {
         if (analysis == null) {
             return "No CV analysis on file for this candidate yet.\n";
@@ -297,6 +289,7 @@ CV quality notes: %s
         );
     }
 
+    // מפרמט את רשימת הבקשות של המועמד לטקסט קריא שנכנס להקשר הצ'אט
     private String buildApplicationsBlock(List<Application> applications, String language) {
         if (applications == null || applications.isEmpty()) {
             return pickByLanguage(language,
@@ -317,10 +310,7 @@ CV quality notes: %s
         return sb.toString();
     }
 
-    // email/facts: email identifies the (single, implicit) candidate these matches belong to -
-    // every fact this appends is for THAT candidate, one per job - and facts is the typed,
-    // structured twin of the text this method also writes into sb (see CanonicalFact's own
-    // comment for why both exist).
+    // מפרמט את המשרות עם נתוני ההתאמה של המועמד, ובמקביל אוסף אותם כ"עובדות קנוניות" שישמשו לוודא שהצ'אט לא ימציא אחוזים אחרים
     private String buildJobsWithMatchBlock(
             List<Job> jobs, Map<Long, Map<String, Object>> matchByJobId, String email, List<CanonicalFact> facts) {
         if (jobs == null || jobs.isEmpty()) {

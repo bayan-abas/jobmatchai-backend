@@ -23,6 +23,7 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     @Autowired
     private TokenRevocationService tokenRevocationService;
 
+    // רץ פעם אחת על כל בקשה נכנסת - שולף את הטוקן מה-header, מוודא שהוא תקף ולא בוטל, ואם כן שם אותו ב-SecurityContext
     @Override
     protected void doFilterInternal(
             HttpServletRequest request,
@@ -36,10 +37,7 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
             String token = authHeader.substring(7);
 
             if (jwtService.isValid(token)) {
-                // Email and role are both signed into the token at login time (see
-                // JwtService.generateToken), so authenticating a request never needs to hit the
-                // database - against a remote DB that round trip cost more than the rest of most
-                // requests combined, on every single authenticated call in the app.
+
                 String email = jwtService.extractEmail(token);
                 String role = jwtService.extractRole(token);
                 boolean revoked = email != null
@@ -47,6 +45,7 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
                 if (!revoked && email != null && role != null
                         && SecurityContextHolder.getContext().getAuthentication() == null) {
+                    // hasRole(...) של Spring Security מצפה לפריפיקס ROLE_
                     String authority = "ROLE_" + role.toUpperCase();
 
                     UsernamePasswordAuthenticationToken authentication = new UsernamePasswordAuthenticationToken(

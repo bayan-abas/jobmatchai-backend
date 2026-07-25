@@ -29,19 +29,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 
-// Drains the persistent match-score queue (see MatchScoreJob / MatchScoreQueueService) on a fixed
-// poll interval. This is what "background jobs, not synchronous inline computation" actually
-// means here: every OpenAI call this app makes for match scoring now happens on THIS worker's own
-// bounded pool, not on the thread of whatever HTTP request happened to trigger the cache miss - a
-// candidate closing their browser mid-computation doesn't cancel anything, and a burst of
-// candidates opening their dashboards at once fans into the SAME shared, rate-limited pool instead
-// of each spawning its own uncapped burst of concurrent AI calls.
-//
-// Horizontally scalable without any external broker: claimBatch's SELECT ... FOR UPDATE SKIP
-// LOCKED (see MatchScoreJobRepository#lockNextBatch) means running this exact same @Scheduled
-// poller on multiple app instances at once is already safe - two instances' workers racing for
-// the same row can never both claim it. Postgres's own row locking is the only coordination this
-// needs.
 @Component
 public class MatchScoreQueueWorker {
 
@@ -65,21 +52,12 @@ public class MatchScoreQueueWorker {
     @Autowired
     private MatchMetrics matchMetrics;
 
-    // How many queue rows one poll tick claims at once - deliberately small relative to Supabase's
-    // 15-connection pool cap (this claim itself is one short transaction/connection, released
-    // immediately; processing afterward doesn't hold a DB connection open for the AI call).
     @Value("${matching.queue.batch-size:10}")
     private int batchSize;
 
-    // How many AI calls this worker runs at once, across ALL claimed jobs - the actual protection
-    // against a batch of newly-claimed jobs firing an uncontrolled burst at OpenAI. Passed as the
-    // Semaphore JobMatchService#computeChunkWithRetry already acquires/releases around every call.
     @Value("${matching.queue.worker-concurrency:5}")
     private int workerConcurrency;
 
-    // Independent of the concurrency cap above: a hard calls-PER-SECOND ceiling, so even a wide-
-    // open concurrency setting can never spike faster than this - the actual "protect the OpenAI
-    // API from traffic spikes" control, decoupled from "protect the DB/pool" (workerConcurrency).
     @Value("${matching.openai.rate-limit-per-second:3}")
     private int openAiRateLimitPerSecond;
 
@@ -90,27 +68,12 @@ public class MatchScoreQueueWorker {
     private int staleInProgressMinutes;
 
     private Semaphore aiConcurrencyLimiter;
-    // Bounds how many processOne() calls actually RUN (not just how many are dispatched) at
-    // once - found via production incident: claimBatch() marks a whole batch IN_PROGRESS and
-    // dispatchExecutor (virtual-thread-per-task, uncapped) starts a task for every row
-    // immediately, but aiConcurrencyLimiter only ever gated the OpenAI call INSIDE
-    // computeChunkWithRetry - every row's surrounding DB work (the CVAnalysis lookup, the
-    // "already fresh" JobMatchScore check, the final save) ran fully unbounded outside that gate.
-    // With poll-interval-ms=1000 continuing to claim new batches every second regardless of how
-    // many previous rows were still mid-processing, concurrent DB connection demand from this
-    // worker alone scaled with backlog size, not with worker-concurrency - exhausting the Hikari
-    // pool (observed: "Connection is not available... waiting=30" against a pool of just a few
-    // connections) and making every affected row fail with CannotCreateTransactionException /
-    // DataAccessResourceFailureException, retry, fail again, and eventually land FAILED - which
-    // is what made already-cached-forever candidates see their match scores "recompute" on
-    // every visit: those jobs were never actually finishing, not being recalculated from a
-    // working cache. Acquiring this BEFORE any DB work starts (not just before the AI call) is
-    // what actually caps concurrent connection usage to workerConcurrency, matching what the
-    // comment on dispatchExecutor below always assumed was already true.
+
     private Semaphore rowConcurrencyLimiter;
     private Bucket rateLimitBucket;
     private ExecutorService dispatchExecutor;
 
+    // מכין את מגבלות הריצה במקביל (AI + שורות) ואת ה-rate limit bucket לפני שהworker מתחיל לרוץ
     @PostConstruct
     void init() {
         aiConcurrencyLimiter = new Semaphore(Math.max(1, workerConcurrency));
@@ -119,11 +82,11 @@ public class MatchScoreQueueWorker {
                 .addLimit(limit -> limit.capacity(Math.max(1, openAiRateLimitPerSecond))
                         .refillGreedy(Math.max(1, openAiRateLimitPerSecond), java.time.Duration.ofSeconds(1)))
                 .build();
-        // Cheap to dispatch generously on virtual threads - a claimed-but-not-yet-processed row
-        // just blocks on rowConcurrencyLimiter in memory (no DB connection held) until its turn.
+
         dispatchExecutor = Executors.newVirtualThreadPerTaskExecutor();
     }
 
+    // רץ כל כמה שניות - שולף באטש מהתור ומפזר כל שורה ל-thread נפרד שמעבד אותה במקביל
     @Scheduled(fixedDelayString = "${matching.queue.poll-interval-ms:1000}")
     public void pollAndProcess() {
         List<MatchScoreJob> batch;
@@ -156,6 +119,7 @@ public class MatchScoreQueueWorker {
         }
     }
 
+    // lockNextBatch נועל את השורות ב-DB (FOR UPDATE SKIP LOCKED) כדי שכמה worker/אינסטנסים לא יתפסו אותה שורה פעמיים
     @Transactional
     List<MatchScoreJob> claimBatch() {
         List<MatchScoreJob> rows = matchScoreJobRepository.lockNextBatch(LocalDateTime.now(), batchSize);
@@ -165,6 +129,7 @@ public class MatchScoreQueueWorker {
         return matchScoreJobRepository.saveAll(rows);
     }
 
+    // מעבד משימה אחת מהתור - קורא ל-AI לחישוב ציון ההתאמה ושומר את התוצאה, כולל בדיקות רענון (fingerprint) וטיפול בכשלים
     private void processOne(MatchScoreJob row) {
         long start = System.nanoTime();
         try {
@@ -172,7 +137,7 @@ public class MatchScoreQueueWorker {
 
             CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(row.getCandidateEmail()).orElse(null);
             if (analysis == null) {
-                // The candidate's CV was deleted since this was enqueued - nothing left to score.
+
                 matchScoreJobRepository.delete(row);
                 matchScoreQueueService.completeIfAwaited(row.getCandidateEmail(), row.getJobId(), row.getJobType(), null);
                 return;
@@ -186,11 +151,6 @@ public class MatchScoreQueueWorker {
             String cvFingerprint = jobMatchService.fingerprintCv(analysis);
             String jobFingerprint = jobMatchService.fingerprintJob(job);
 
-            // A newer JobMatchScore may already exist with these exact current fingerprints - e.g.
-            // another worker (a different instance, in a horizontally-scaled deployment) already
-            // finished this exact candidate+job since this row was claimed. Skip the AI call
-            // entirely rather than duplicate it; this is the queue-level half of the singleflight
-            // guarantee (JobMatchScoreRepository's unique constraint is the storage-level half).
             JobMatchScore alreadyFresh = jobMatchScoreRepository
                     .findByCandidateEmailAndJobId(row.getCandidateEmail(), row.getJobId())
                     .filter(s -> cvFingerprint.equals(s.getCvFingerprint()) && jobFingerprint.equals(s.getJobFingerprint()))
@@ -216,14 +176,6 @@ public class MatchScoreQueueWorker {
                 return;
             }
 
-            // Re-checked HERE (right before persisting), not just against the fingerprint captured
-            // when this row was claimed - the AI call above can take several seconds, and a
-            // candidate can re-analyze their CV in that window. Without this, the save below would
-            // land with the OLD cvFingerprint baked in even though a newer CV now exists: the row
-            // would look "done" to this worker, but the next request's isStale check (comparing
-            // against the CURRENT CV) would still see it as stale and re-enqueue the exact same
-            // job, wasting the AI call just made. Mirrors the identical guard singleflightComputeJob
-            // already applies on the synchronous path - see that method's own comment.
             CVAnalysis currentAnalysis = cvAnalysisRepository.findByUserEmail(row.getCandidateEmail()).orElse(null);
             if (currentAnalysis == null || !cvFingerprint.equals(jobMatchService.fingerprintCv(currentAnalysis))) {
                 log.info("match-score-queue jobId={} candidate={} -> CV changed mid-computation, discarding stale result",
@@ -247,10 +199,7 @@ public class MatchScoreQueueWorker {
             matchScoreQueueService.completeIfAwaited(row.getCandidateEmail(), row.getJobId(), row.getJobType(), score);
             matchMetrics.recordQueueJobProcessed("success", elapsedMs(start));
         } catch (Throwable t) {
-            // Throwable, not Exception: an OutOfMemoryError or StackOverflowError from a
-            // pathological job/CV payload must still land this row back in PENDING/FAILED via
-            // handleFailure - otherwise the row (and the request awaiting it) is stuck forever,
-            // since nothing else ever marks it terminal.
+
             log.error("Unexpected failure processing match-score queue row id={} candidate={} jobId={}",
                     row.getId(), row.getCandidateEmail(), row.getJobId(), t);
             try {
@@ -262,13 +211,7 @@ public class MatchScoreQueueWorker {
         }
     }
 
-    // Reclaims rows a worker claimed (IN_PROGRESS) but never finished - the app crashed,
-    // restarted, or was redeployed mid-processing. Without this, such a row stays IN_PROGRESS
-    // forever: enqueueIfNeeded (see MatchScoreQueueService) treats IN_PROGRESS as "already being
-    // worked" and never touches it again, permanently blocking that candidate+job from ever being
-    // recomputed. Routed through the normal handleFailure path so it gets the same retry/backoff
-    // and eventual FAILED-after-max-attempts treatment as any other failure, rather than being
-    // reset to PENDING unconditionally forever.
+    // מאתר שורות שנתקעו ב-IN_PROGRESS יותר מדי זמן (worker שקרס באמצע) ומחזיר אותן לתור או מכשיל אותן
     @Scheduled(fixedDelayString = "${matching.queue.reap-interval-ms:60000}")
     public void reclaimStaleInProgress() {
         LocalDateTime cutoff = LocalDateTime.now().minusMinutes(Math.max(1, staleInProgressMinutes));
@@ -292,6 +235,7 @@ public class MatchScoreQueueWorker {
         }
     }
 
+    // מטפל בכישלון עיבוד - מגדיל את מונה הניסיונות ומחליט אם לנסות שוב עם backoff או לסמן FAILED סופית
     private void handleFailure(MatchScoreJob row, String error) {
         int attempts = row.getAttempts() + 1;
         row.setAttempts(attempts);
@@ -305,15 +249,10 @@ public class MatchScoreQueueWorker {
         }
         matchScoreJobRepository.save(row);
 
-        // The awaiting request (if any) doesn't wait out the full retry/backoff cycle - it gets
-        // the honest "couldn't compute right now" sentinel promptly, exactly like a same-request
-        // AI failure always has. The queue keeps retrying in the background regardless; the next
-        // page load picks up whatever it eventually produces via the normal fingerprint cache.
         matchScoreQueueService.completeIfAwaited(row.getCandidateEmail(), row.getJobId(), row.getJobType(), null);
     }
 
-    // Exponential backoff with a cap - 10s, 20s, 40s, 80s, capped at 5 minutes so a persistently
-    // failing job (e.g. a sustained OpenAI outage) doesn't spin the worker pool hot.
+    // exponential backoff: 10, 20, 40... שניות, לא יותר מ-5 דקות
     private long backoffSeconds(int attempts) {
         return Math.min(300, (long) (10 * Math.pow(2, attempts - 1)));
     }

@@ -2,8 +2,6 @@ package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
 
-// Looked up by user_email on every single match-scoring request (the hottest read in this whole
-// pipeline - one lookup per candidate per dashboard/job-list load) - indexed for exactly that.
 @Entity
 @Table(name = "cv_analysis", indexes = {
         @Index(name = "idx_cv_analysis_user_email", columnList = "user_email")
@@ -20,10 +18,6 @@ public class CVAnalysis {
     @Column(name = "candidate_field", columnDefinition = "TEXT")
     private String candidateField;
 
-    // The specific profession/title (e.g. "Doctor", "Registered Nurse", "Information Systems
-    // Analyst") - candidateField alone is too coarse a bucket for the job matcher to reliably
-    // judge field relevance from (e.g. "healthcare" covers both doctors and nurses, which are
-    // related but not interchangeable for licensing purposes).
     @Column(name = "profession_title", columnDefinition = "TEXT")
     private String professionTitle;
 
@@ -45,36 +39,21 @@ public class CVAnalysis {
     @Column(name = "overall_score")
     private Integer overallScore;
 
-    // Structured evidence fields the job matcher relies on for regulated-profession decisions
-    // (fieldRelated + education/certification component scores) instead of inferring them from
-    // whatever the free-text summary/strengths prose happened to mention.
     @Column(name = "education_evidence")
     private String educationEvidence;
 
     @Column(name = "certifications_evidence")
     private String certificationsEvidence;
 
-    // Distinct from certificationsEvidence: certifications are a general credential signal (any
-    // field), while this is specifically about a LEGAL PRACTICE LICENSE (medical license, bar
-    // admission, nursing license, PE license, etc.) - the exact evidence the regulated-profession
-    // fieldRelated guardrail needs, that a generic "certifications" bucket would blur.
     @Column(name = "licenses_evidence")
     private String licensesEvidence;
 
     @Column(name = "years_of_experience")
     private String yearsOfExperience;
 
-    // Bucketed seniority (none/entry_level/mid_level/senior_level), distinct from
-    // yearsOfExperience's free-text display string - this is the value JobMatchService's
-    // deterministic experience-scoring formula actually compares against a job's required
-    // seniority level, since two free-text strings ("8+" vs "senior") can't be compared
-    // numerically without this kind of shared, fixed vocabulary on both sides.
     @Column(name = "experience_level")
     private String experienceLevel;
 
-    // Named technologies/tools/domain-specific practical skills, split from softSkills so the
-    // job matcher can score "required skills" against a clean, comparable list instead of a
-    // mixed bag of hard and soft skills.
     @Column(name = "technical_skills", columnDefinition = "TEXT")
     private String technicalSkills;
 
@@ -96,12 +75,6 @@ public class CVAnalysis {
     @Column(name = "cv_text_hash")
     private String cvTextHash;
 
-    // Cached OpenAI embedding of this candidate's profile (professionTitle + candidateField +
-    // skills + summary) - backs the deterministic, keyword-free pre-filter in JobMatchService
-    // that decides whether a job is even worth an AI classification call. Lazily computed and
-    // fingerprinted the same way cvTextHash is: profileEmbeddingHash/-Model only match (and this
-    // vector only gets reused) when the underlying profile text and embedding model/dimensions
-    // are both unchanged - see EmbeddingService#ensureProfileEmbedding.
     @Column(name = "profile_embedding", columnDefinition = "TEXT")
     private String profileEmbedding;
 
@@ -314,5 +287,3 @@ public class CVAnalysis {
         this.previousJobTitles = previousJobTitles;
     }
 }
-
-

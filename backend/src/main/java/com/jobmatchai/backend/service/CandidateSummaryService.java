@@ -41,17 +41,9 @@ public class CandidateSummaryService {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    // Bump this whenever the AI prompt/response schema for computeCandidateSummary changes,
-    // so previously cached rows (missing the new fields) are treated as stale and recomputed.
-    // v2: added matchScore/matchLabel to the prompt/schema - rows saved under v1 have those
-    // fields null and must be forced to regenerate once, which bumping this version does.
     private static final String SUMMARY_SCHEMA_VERSION = "v2";
 
-    // Per (candidateEmail, jobId) locks. Without this, two overlapping requests for the
-    // same candidate+job (e.g. the modal reopened before the first OpenAI call finished)
-    // can both see "no cached row yet" and both call OpenAI, producing two different
-    // scores and a race on which one gets saved last. Serializing on this key means the
-    // second request always waits and then reads back what the first one just saved.
+    // מונע שני requests בו-זמנית לאותו candidate+job יריצו קריאת AI כפולה
     private final ConcurrentHashMap<String, Object> locks = new ConcurrentHashMap<>();
 
     public record SummaryResult(
@@ -64,27 +56,16 @@ public class CandidateSummaryService {
             String overallSuitability,
             Integer matchScore,
             String matchLabel,
-            // Fixed-vocabulary hiring-decision category ("accept"/"consider"/"reject"), derived
-            // from matchScore by MatchLabelUtil - the single authoritative source for this
-            // judgment (see MatchLabelUtil#recommendationFromScore). The frontend only maps this
-            // category to a localized label/description; it never decides the category itself.
+
             String recommendation
     ) {}
 
+    // מחזיר תקציר AI למועמד מול משרה - משתמש במטמון אם קורות החיים והמשרה לא השתנו, ומריץ קריאת AI חדשה רק אם הם השתנו
     public SummaryResult getCandidateSummary(String candidateEmail, Job job, String language) {
         String jobFingerprint = fingerprintJob(job);
         String lockKey = candidateEmail + "::" + job.getId();
         Object lock = locks.computeIfAbsent(lockKey, k -> new Object());
 
-        // Everything from the CVAnalysis read to the cache write happens under this lock, so a
-        // second request for the same candidate+job that arrives while the first is still
-        // waiting on OpenAI blocks here instead of racing it, then simply reads the row the
-        // first request just saved. `analysis`/`cvFingerprint` are deliberately read INSIDE the
-        // lock (not before it) - reading them before blocking would risk this request being
-        // granted the lock only after a CONCURRENT CV replace on the same account has already run
-        // (which deletes this candidate's rows via CVController.discardStaleMatchScores), in which
-        // case a pre-lock snapshot would silently resurrect a summary generated against the CV
-        // that request just invalidated.
         synchronized (lock) {
             CVAnalysis analysis = cvAnalysisRepository.findByUserEmail(candidateEmail).orElse(null);
 
@@ -119,15 +100,6 @@ public class CandidateSummaryService {
             String result = openAICVAnalysisService.computeCandidateSummary(analysis, job, language);
             JsonNode json = readObject(result);
 
-            // Self-consistency guard: keySkills and weaknesses are two independent fields the SAME
-            // AI call can disagree with itself on - nothing previously stopped a skill from being
-            // listed in keySkills (a positive claim) while a weaknesses sentence separately claims
-            // the candidate lacks that exact skill (a negative claim about the identical evidence).
-            // Rather than silently trusting whichever field a reader happens to look at first, drop
-            // the specific contradicting SENTENCE from weaknesses (never the keySkills entry itself
-            // - keySkills is the more specific, structured claim) - same "drop the unsupported
-            // claim rather than the validated data" precedent JobMatchService.validateDetailClaims
-            // already uses for whyGoodMatch/whyNotPerfectMatch vs. matchedSkills/missingSkills.
             List<String> keySkillsList = extractStringList(json.path("keySkills"));
             String weaknessesText = removeSentencesContradictingKeySkills(json.path("weaknesses").asText(""), keySkillsList);
 
@@ -156,13 +128,7 @@ public class CandidateSummaryService {
         }
     }
 
-    // Resolves the narrative text (professionalBackground/strengths/weaknesses/overallSuitability)
-    // for `language`, independently of `resolved`'s own matchScore/keySkills/yearsOfExperience
-    // (which are ALWAYS taken from `resolved` regardless of language - never recomputed, never
-    // duplicated). `freshlyGeneratedInLanguage` is true only when `resolved` was JUST generated (or
-    // regenerated) by computeCandidateSummary using `language` as its target language - in that
-    // case its own text fields ARE already the correct-language text, so this seeds the narrative
-    // cache directly from them instead of paying for a redundant self-translate call.
+    // מחזיר את הטקסט של התקציר בשפה המבוקשת - אם הוא נוצר עכשיו בשפה הזו שומר אותו כמו שהוא, אחרת מביא/מייצר תרגום ממטמון נפרד לפי שפה
     private SummaryResult resolveWithNarrative(CandidateAiSummary resolved, String language, boolean freshlyGeneratedInLanguage) {
         String candidateEmail = resolved.getCandidateEmail();
         Long jobId = resolved.getJobId();
@@ -280,27 +246,14 @@ public class CandidateSummaryService {
         return items;
     }
 
-    // Mirrors JobMatchService.ABSENCE_PHRASES - phrases pairing a skill mention with claimed
-    // absence. Kept as its own small local copy rather than a shared constant: this method
-    // operates on whole SENTENCES (not the short, atomic bullets validateDetailClaims checks), so
-    // it deliberately requires the cue phrase and the skill name to co-occur within the same
-    // sentence - a much smaller, less ambiguous unit than a whole weaknesses paragraph, which
-    // keeps the false-positive rate low without needing to share validation logic across classes
-    // built around different-shaped input (bullet lists vs. free-text prose).
     private static final List<String> ABSENCE_PHRASES = List.of(
             "lack", "lacking", "missing", "don't have", "doesn't have", "not reflected",
             "not evident", "no experience with", "need to develop", "gap in", "not shown", "absent"
     );
 
-    // Words that, appearing shortly before an ABSENCE_PHRASES match, flip its meaning from a real
-    // gap claim into an explicit denial of one - e.g. "does not indicate any missing skills...
-    // all key requirements, including Java, Spring Boot, REST APIs, are well covered" CONFIRMS
-    // there is no gap, even though it contains "missing". Found via real end-to-end testing: a
-    // genuinely gap-free candidate's weaknesses text was having every one of its own keySkills
-    // wrongly stripped out as "contradicting" itself, because the bare substring check never
-    // accounted for the sentence explicitly negating its own absence phrase.
     private static final List<String> NEGATION_WORDS = List.of("no ", "not ", "n't", "never ", "without ", "none ");
 
+    // בודק אם המשפט באמת טוען שמשהו חסר (ולא, למשל, "לא חסר לו ניסיון" - שלילה כפולה שהופכת את המשמעות)
     private boolean hasGenuineAbsenceClaim(String textLower) {
         for (String phrase : ABSENCE_PHRASES) {
             int idx = textLower.indexOf(phrase);
@@ -315,12 +268,7 @@ public class CandidateSummaryService {
         return false;
     }
 
-    // Drops any sentence in `weaknesses` that both (a) names a skill already listed in keySkills
-    // and (b) uses an absence phrase - i.e. a sentence claiming the candidate lacks a skill the
-    // SAME AI response's keySkills field just said they have. An empty or short result is left as
-    // whatever remains (including empty) rather than backfilled with invented text - consistent
-    // with this codebase's "an honest empty list beats a fabricated one" rule (see
-    // JobMatchService.validateDetailClaims's docstring for the same principle applied to bullets).
+    // מסנן מתוך "חולשות" משפטים שסותרים כישור שכבר מופיע ברשימת ה-keySkills, כדי שה-AI לא יגיד גם "יש לו" וגם "חסר לו" אותו דבר
     private String removeSentencesContradictingKeySkills(String weaknesses, List<String> keySkills) {
         if (weaknesses == null || weaknesses.isBlank() || keySkills.isEmpty()) {
             return weaknesses == null ? "" : weaknesses;
@@ -356,6 +304,7 @@ public class CandidateSummaryService {
         return List.of(value.split("\\|"));
     }
 
+    // מייצר טביעת אצבע לקורות החיים הנוכחיים כדי לדעת אם הם השתנו מאז התקציר השמור ולהחליט אם צריך לרענן אותו
     private String fingerprintCv(CVAnalysis analysis) {
         String cvTextHash = analysis.getCvTextHash();
 
@@ -374,6 +323,7 @@ public class CandidateSummaryService {
         ));
     }
 
+    // מייצר טביעת אצבע למשרה כדי לדעת אם פרטיה השתנו מאז התקציר השמור ולהחליט אם צריך לרענן אותו
     private String fingerprintJob(Job job) {
         return HashUtil.sha256(String.join("|",
                 nullToEmpty(job.getTitle()),

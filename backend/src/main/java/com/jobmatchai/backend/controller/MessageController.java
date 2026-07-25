@@ -29,6 +29,7 @@ public class MessageController {
 
     public record SendRequest(Long applicationId, String content) {}
 
+    // שולח הודעה מהחברה למועמד על בקשה ספציפית ומודיע לו על כך בהתראה
     @PostMapping
     @PreAuthorize("hasRole('COMPANY')")
     public Map<String, Object> send(@RequestBody SendRequest request, Authentication authentication) {
@@ -38,10 +39,6 @@ public class MessageController {
                 ? null
                 : applicationRepository.findById(request.applicationId()).orElse(null);
 
-        // Without this check, any authenticated company could message ANY candidate by guessing/
-        // enumerating an application id belonging to a DIFFERENT company's job posting - and the
-        // resulting notification is labeled with that other company's real name (line ~60 below),
-        // making this a direct impersonation vector, not just unauthorized access.
         if (application == null || application.getCandidateEmail() == null
                 || !authentication.getName().equals(application.getCompanyEmail())
                 || request.content() == null || request.content().isBlank()) {

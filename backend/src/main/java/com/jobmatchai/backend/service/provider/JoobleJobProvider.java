@@ -13,12 +13,6 @@ import org.springframework.web.client.RestClient;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * Fetches jobs from the Jooble API (https://jooble.org/api/about), which operates a dedicated
- * Israel job board (il.jooble.org) and accepts a free-text "location" so it returns real
- * listings for Israel. Requires a free API key from jooble.org/api/about, supplied via
- * externaljobs.jooble.api-key (JOOBLE_API_KEY env var).
- */
 @Component
 public class JoobleJobProvider implements ExternalJobProvider {
 
@@ -33,6 +27,7 @@ public class JoobleJobProvider implements ExternalJobProvider {
             .baseUrl("https://jooble.org")
             .build();
 
+    // שולח בקשת POST ל-API של Jooble עם מילות מפתח ומיקום, ומחזיר עד maxResults משרות ממופות למודל הפנימי
     @Override
     public List<ExternalJobData> fetchJobs(String keywords, String country, int maxResults) {
         if (apiKey == null || apiKey.isBlank()) {
@@ -78,6 +73,7 @@ public class JoobleJobProvider implements ExternalJobProvider {
         }
     }
 
+    // ממיר קוד מדינה למחרוזת מיקום שה-API של Jooble מבין, וברירת המחדל היא ישראל
     private String resolveLocation(String country) {
         if (country == null || country.isBlank() || country.equalsIgnoreCase("il")) {
             return "Israel";
@@ -85,16 +81,7 @@ public class JoobleJobProvider implements ExternalJobProvider {
         return country;
     }
 
-    // ExternalJobService.isIsraelOrRemote decides whether a job is even shown to candidates by
-    // checking whether its location/type text literally contains "israel" or "remote" - it only
-    // trusts Jobicy's sourceName outright because Jobicy always sets it to the literal string
-    // "Jobicy". Jooble's sourceName (joobleSourceLabel below) is instead whatever underlying job
-    // board Jooble aggregated the listing from, so it can't be trusted the same way. Since this
-    // fetch was ALREADY scoped to Israel (resolveLocation above) whenever israelScoped is true,
-    // appending "Israel" onto the location text here is what lets isIsraelOrRemote's existing
-    // substring check pass honestly instead of silently dropping every on-site Israel job this
-    // provider returns (Jooble's own "location" field, e.g. "Tel Aviv", never contains the word
-    // "israel").
+    // ממיר משרה בודדת מהפורמט של Jooble למודל הפנימי ExternalJobData
     private ExternalJobData mapResult(JsonNode result, boolean israelScoped) {
         String applyUrl = textOrNull(result, "link");
         String externalId = textOrNull(result, "id");
@@ -102,6 +89,7 @@ public class JoobleJobProvider implements ExternalJobProvider {
             externalId = applyUrl;
         }
         String rawLocation = textOrNull(result, "location");
+        // Jooble לפעמים מחזיר עיר בלי "Israel" כשמחפשים כאן - מוסיפים ידנית כדי שהסינון לפי מדינה בהמשך לא יפספס את המשרה
         String location = (israelScoped && (rawLocation == null || !rawLocation.toLowerCase().contains("israel")))
                 ? (rawLocation == null ? "Israel" : rawLocation + ", Israel")
                 : rawLocation;
@@ -121,8 +109,7 @@ public class JoobleJobProvider implements ExternalJobProvider {
                 applyUrl,
                 applyUrl,
                 joobleSourceLabel(result),
-                // Jooble's API doesn't surface a category/occupation field - the frontend
-                // classifier falls back to title-based inference for these.
+
                 null,
                 ExternalDateParser.parse(textOrNull(result, "updated"))
         );

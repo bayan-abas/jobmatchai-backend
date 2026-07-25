@@ -38,18 +38,7 @@ public class AIChatService {
             .baseUrl("https://api.openai.com")
             .build();
 
-    // Entry point used by ChatController. Generates a reply, then runs it through
-    // ChatConsistencyValidator against the SAME canonicalFacts the context block was built from
-    // (see AIChatContextService.CanonicalFact) so a reply can never tell the user something that
-    // contradicts the match score/skills/reasoning shown elsewhere in the app. Non-critical
-    // contradictions (a bullet praising a missing skill, a stray wrong percentage outside the
-    // headline "## Match Score" line) are corrected/dropped in place and served immediately - no
-    // extra AI call. A critical one (the "## Match Score" line itself was wrong) is worth one
-    // regeneration attempt with the specific contradiction spelled out as corrective feedback,
-    // mirroring the retry-with-feedback pattern JobMatchService's batch scoring already uses -
-    // capped at one retry so a persistently-wrong model can't turn one chat message into an
-    // unbounded (and increasingly expensive) loop; if the retry is still critical, the
-    // auto-corrected FIRST reply is served rather than a second uncorrected wrong one.
+    // מייצר תשובת צ'אט ובודק שהיא לא סותרת נתונים ידועים (כמו אחוז התאמה); אם היא סותרת - ניסיון תיקון אחד בלבד ולא לולאה אינסופית של קריאות ל-AI
     public String chat(String userMessage, String language, String contextBlock, String mode,
             List<Map<String, String>> history, List<CanonicalFact> canonicalFacts) {
         String reply = generateReply(userMessage, language, contextBlock, mode, history);
@@ -91,6 +80,7 @@ public class AIChatService {
         return retryResult.reply();
     }
 
+    // בונה את הפרומפט המלא לצ'אט (פרסונה לפי סוג המשתמש, כללי פורמט, הקשר נתונים והיסטוריית שיחה) ושולח אותו ל-AI
     private String generateReply(String userMessage, String language, String contextBlock, String mode, List<Map<String, String>> history) {
         try {
             String languageInstruction = switch (language) {
@@ -119,10 +109,6 @@ CRITICAL RULE: Only use facts found in the "DATA CONTEXT" section below. Never i
 Exception: when suggesting courses, certifications, learning resources, or a career roadmap, you may use your own general professional knowledge, since the system has no course catalog — make clear these are general suggestions, not data from the platform.
 """;
 
-            // One fixed structural template for every mode - the frontend chat UI parses these
-            // exact markers ("## Heading" lines, "- " bullets, "**bold**" spans) to render
-            // scannable cards/badges instead of a text block, so the syntax here must stay
-            // stable. Never write long paragraphs; this is a template, not a style suggestion.
             String responseFormatTemplate = """
 Response format - follow this exact structure, since the UI parses these markers and renders them visually:
 - Always start with a line "## Summary" followed by exactly ONE short sentence (max ~20 words) that answers the question at a glance.
@@ -218,6 +204,7 @@ Tone: fast, professional ATS assistant (like Greenhouse, Lever, or Ashby) - not 
         }
     }
 
+    // שולף את הטקסט של תשובת הצ'אט מתוך המבנה המקונן שמחזיר ה-API של OpenAI
     private String extractText(Map<String, Object> response) {
         try {
             String json = objectMapper.writeValueAsString(response);

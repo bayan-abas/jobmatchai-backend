@@ -25,6 +25,7 @@ public class SkillExplanationService {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    // מחזיר הסבר על כישור מסוים - קודם בודק מטמון לפי שם הכישור והשפה, ורק אם אין שולח בקשה חדשה ל-AI ושומר את התוצאה
     public Map<String, Object> getExplanation(String skillName, String jobTitle, String language) {
         String key = skillName.trim().toLowerCase();
         String lang = (language == null || language.isBlank()) ? "en" : language;

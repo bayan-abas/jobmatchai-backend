@@ -8,6 +8,7 @@ import java.util.Optional;
 
 public interface CandidateAiSummaryRepository extends JpaRepository<CandidateAiSummary, Long> {
 
+    // מביא את התקציר האחרון שנוצר לצירוף הזה של מועמד ומשרה, אם נוצרו כמה גרסאות בעבר
     Optional<CandidateAiSummary> findFirstByCandidateEmailAndJobIdOrderByIdDesc(String candidateEmail, Long jobId);
 
     List<CandidateAiSummary> findByCandidateEmailInAndJobIdIn(List<String> candidateEmails, List<Long> jobIds);

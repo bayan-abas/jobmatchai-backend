@@ -10,21 +10,6 @@ import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.SQLException;
 
-/**
- * Fixes a specific historical schema mismatch on Postgres: saved_jobs.saved_at was created
- * under a type Postgres cannot implicitly cast to timestamp (e.g. an earlier varchar/text
- * column, from before the SavedJob entity's saved_at field was LocalDateTime). Hibernate's
- * ddl-auto=update trying to bring the column in line with the entity emits a bare
- * "ALTER COLUMN saved_at TYPE timestamp" with no USING clause, which Postgres rejects with
- * "column saved_at cannot be automatically cast to type timestamp without time zone" -
- * Hibernate logs that failure and continues (schema update failures are non-fatal, unlike
- * validate), leaving the column stuck in its old type indefinitely rather than crashing startup.
- *
- * This inspects the column's actual current type first (via information_schema, not a blind
- * assumption) and only issues the explicit USING-cast ALTER if it isn't already a timestamp -
- * a no-op on every subsequent startup once fixed, and a no-op entirely on non-Postgres
- * datasources (e.g. local H2 dev), which don't have this cast restriction in the first place.
- */
 @Component
 public class SavedJobSchemaConfig {
 
@@ -36,6 +21,7 @@ public class SavedJobSchemaConfig {
         this.jdbcTemplate = jdbcTemplate;
     }
 
+    // בסביבות ישנות saved_at נוצרה כ-date/varchar בטעות - מתקן את זה אוטומטית בעליה כדי לא לדרוש migration ידני
     @PostConstruct
     public void fixSavedAtColumnType() {
         if (!isPostgres()) {
@@ -45,8 +31,7 @@ public class SavedJobSchemaConfig {
         String currentType = currentSavedAtType();
 
         if (currentType == null) {
-            // Column/table doesn't exist yet (fresh database) - Hibernate will create it with
-            // the correct type on its own; nothing to migrate.
+
             return;
         }
 

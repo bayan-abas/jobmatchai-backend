@@ -15,15 +15,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
-// Selected when app.storage.type=supabase (see application-production.properties). Talks to the
-// Supabase Storage HTTP REST API directly (PUT/GET/HEAD/DELETE under /storage/v1/object/{bucket}/
-// {key}) rather than the S3-compatible endpoint, specifically so the app never needs AWS-style
-// access-key/secret credentials - a single service_role key (already required for every other
-// Supabase interaction this app has) both authenticates the request and bypasses row-level
-// security, since this layer does its own ownership checks upstream (see FileStorageService's own
-// comment). Same object keys (the existing UUID.<ext> convention) and same store/exists/delete/
-// loadAsResource/withLocalFile contract as LocalFileStorageService and the S3 implementation it
-// replaces - callers never know the storage backend changed.
 @Service
 @ConditionalOnProperty(name = "app.storage.type", havingValue = "supabase")
 public class SupabaseFileStorageService implements FileStorageService {
@@ -39,28 +30,22 @@ public class SupabaseFileStorageService implements FileStorageService {
 
     private RestClient client;
 
-    // Built once at startup (not lazily on first use) specifically so the singleton bean never
-    // races multiple request threads over initializing the same field - matches the prior S3
-    // client's own init pattern.
+    // מאתחל את הלקוח ל-REST API של Supabase Storage עם כותרות האימות הנדרשות
     @PostConstruct
     private void init() {
         client = RestClient.builder()
                 .baseUrl(supabaseUrl + "/storage/v1/object")
-                // Both headers are the standard Supabase idiom: apikey identifies the project/key,
-                // Authorization carries the same key as a bearer token for RLS evaluation. Using
-                // the service_role key for both bypasses RLS entirely - this layer already enforces
-                // ownership before ever calling into storage (see FileStorageService's own comment).
+
                 .defaultHeader("apikey", serviceRoleKey)
                 .defaultHeader("Authorization", "Bearer " + serviceRoleKey)
                 .build();
     }
 
+    // מעלה את הקובץ ל-bucket של Supabase תחת המפתח הנתון (PUT מחליף קובץ קיים)
     @Override
     public void store(File source, String key) throws IOException {
         byte[] bytes = Files.readAllBytes(source.toPath());
-        // PUT (not POST) is Supabase Storage's upsert route - it overwrites an existing object at
-        // the same key instead of failing, matching this method's own "overwriting any existing
-        // object" contract without needing a separate x-upsert header.
+
         client.put()
                 .uri("/{bucket}/{key}", bucket, key)
                 .contentType(MediaType.APPLICATION_OCTET_STREAM)
@@ -69,6 +54,7 @@ public class SupabaseFileStorageService implements FileStorageService {
                 .toBodilessEntity();
     }
 
+    // בודק קיום קובץ ב-Supabase באמצעות בקשת HEAD - תשובת 404 אומרת שהוא לא קיים
     @Override
     public boolean exists(String key) {
         try {
@@ -79,21 +65,20 @@ public class SupabaseFileStorageService implements FileStorageService {
         }
     }
 
+    // מוחק את הקובץ מ-Supabase
     @Override
     public void delete(String key) {
         try {
             client.delete().uri("/{bucket}/{key}", bucket, key).retrieve().toBodilessEntity();
         } catch (Exception e) {
-            // See FileStorageService#delete's own comment - best-effort, never fails the caller.
+            // מתעלמים בכוונה - מחיקה צריכה להיות אידמפוטנטית גם אם הקובץ כבר לא שם
         }
     }
 
+    // מוריד את תוכן הקובץ מ-Supabase ועוטף אותו כ-Resource עם שם הקובץ המקורי
     @Override
     public Resource loadAsResource(String key) throws IOException {
-        // Buffered fully into memory rather than streamed - CVs are capped well under 10MB (see
-        // app.cv.upload.max-size-bytes), so this is cheap, and it sidesteps the double-read pitfall
-        // Spring's message converters have with hand-wrapped InputStreamResources (the previous S3
-        // implementation needed a contentLength() override specifically to work around this).
+
         byte[] bytes = fetchBytes(key);
         return new ByteArrayResource(bytes) {
             @Override
@@ -103,6 +88,7 @@ public class SupabaseFileStorageService implements FileStorageService {
         };
     }
 
+    // מוריד את הקובץ מ-Supabase לקובץ זמני מקומי, מריץ עליו את הפעולה הנתונה ואז מנקה אותו
     @Override
     public <T> T withLocalFile(String key, FileFunction<T> action) throws IOException {
         Path tempFile = Files.createTempFile("cv-", "-" + key);
@@ -114,6 +100,7 @@ public class SupabaseFileStorageService implements FileStorageService {
         }
     }
 
+    // מוריד את הבייטים הגולמיים של הקובץ מ-Supabase לפי המפתח
     private byte[] fetchBytes(String key) {
         return client.get().uri("/{bucket}/{key}", bucket, key).retrieve().body(byte[].class);
     }

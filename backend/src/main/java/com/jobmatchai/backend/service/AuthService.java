@@ -8,8 +8,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
 
-// Single place both /api/auth/login and /api/users/login go through, so credential
-// checking and token issuance can't drift between the two copies of this endpoint.
 @Service
 public class AuthService {
 
@@ -23,14 +21,13 @@ public class AuthService {
 
     public record LoginResult(User user, String token) {}
 
-    // Same message for both cases - a distinct "User not found" vs "Wrong password"
-    // lets an attacker enumerate which emails have accounts on this platform.
     private static final String INVALID_CREDENTIALS_MESSAGE = "Invalid email or password";
 
     public LoginResult login(String email, String password) {
         return login(email, password, false);
     }
 
+    // בודק שהמייל קיים והסיסמה תואמת ל-hash השמור, ואם הכל תקין מנפיק JWT ומחזיר אותו עם המשתמש
     public LoginResult login(String email, String password, boolean rememberMe) {
         User user = userRepository.findByEmail(email);
 

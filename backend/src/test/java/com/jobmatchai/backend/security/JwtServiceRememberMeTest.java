@@ -8,8 +8,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class JwtServiceRememberMeTest {
 
-    private static final long EXPIRATION_MS = 86_400_000L; // 24h
-    private static final long REMEMBER_ME_EXPIRATION_MS = 2_592_000_000L; // 30d
+    private static final long EXPIRATION_MS = 86_400_000L; // יום
+    private static final long REMEMBER_ME_EXPIRATION_MS = 2_592_000_000L; // 30 יום
 
     private final JwtService jwtService = new JwtService(
             "dev-only-insecure-secret-change-me-before-deploying-to-production-0123456789",

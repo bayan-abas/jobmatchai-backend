@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDateTime;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 @RestController
@@ -27,10 +28,30 @@ public class InterviewController {
     @Autowired
     private NotificationService notificationService;
 
-    public record ScheduleRequest(Long applicationId, LocalDateTime scheduledAt, String type, String notes) {}
+    public record ScheduleRequest(Long applicationId, LocalDateTime scheduledAt, String type, String location, String notes) {}
 
-    public record UpdateRequest(LocalDateTime scheduledAt, String type, String notes, String status) {}
+    public record UpdateRequest(LocalDateTime scheduledAt, String type, String location, String notes, String status) {}
 
+    // מחזיר את הראיונות של בקשה ספציפית (החדש ביותר קודם) - רק למועמד או לחברה ששייכים לבקשה הזו
+    @GetMapping("/application/{applicationId}")
+    public List<Interview> getByApplication(@PathVariable Long applicationId, Authentication authentication) {
+        Application application = applicationRepository.findById(applicationId).orElse(null);
+
+        if (application == null) {
+            return List.of();
+        }
+
+        boolean isOwner = authentication.getName().equals(application.getCandidateEmail())
+                || authentication.getName().equals(application.getCompanyEmail());
+
+        if (!isOwner) {
+            return List.of();
+        }
+
+        return interviewRepository.findByApplicationIdOrderByIdDesc(applicationId);
+    }
+
+    // קובע ראיון חדש למועמד על בסיס בקשת עבודה קיימת ושולח לו התראה על כך
     @PostMapping
     @PreAuthorize("hasRole('COMPANY')")
     public Map<String, Object> schedule(@RequestBody ScheduleRequest request, Authentication authentication) {
@@ -40,11 +61,6 @@ public class InterviewController {
                 ? null
                 : applicationRepository.findById(request.applicationId()).orElse(null);
 
-        // Without this check, any authenticated company could schedule an interview against
-        // ANY application by guessing/enumerating its numeric id - including another company's
-        // applicant - and the resulting row + candidate-facing notification would misrepresent
-        // it as coming from the job's real owning company. Same ownership check update() already
-        // enforces below, just applied at creation time too.
         if (application == null || application.getCandidateEmail() == null
                 || !authentication.getName().equals(application.getCompanyEmail())) {
             response.put("success", false);
@@ -58,6 +74,7 @@ public class InterviewController {
                 authentication.getName(),
                 request.scheduledAt(),
                 request.type(),
+                request.location(),
                 request.notes(),
                 "SCHEDULED"
         );
@@ -68,7 +85,8 @@ public class InterviewController {
                 application.getCandidateEmail(),
                 "Interview Scheduled",
                 "An interview has been scheduled for your application to " + application.getJobTitle() + ".",
-                "INTERVIEW_SCHEDULED"
+                "INTERVIEW_SCHEDULED",
+                application.getId()
         );
 
         response.put("success", true);
@@ -76,6 +94,7 @@ public class InterviewController {
         return response;
     }
 
+    // מעדכן פרטי ראיון קיים (מועד/סוג/הערות/סטטוס) ומודיע למועמד על השינוי
     @PutMapping("/{id}")
     @PreAuthorize("hasRole('COMPANY')")
     public Map<String, Object> update(@PathVariable Long id, @RequestBody UpdateRequest request, Authentication authentication) {
@@ -95,6 +114,9 @@ public class InterviewController {
         if (request.type() != null) {
             interview.setType(request.type());
         }
+        if (request.location() != null) {
+            interview.setLocation(request.location());
+        }
         if (request.notes() != null) {
             interview.setNotes(request.notes());
         }
@@ -106,7 +128,8 @@ public class InterviewController {
                 interview.getCandidateEmail(),
                 "Interview Updated",
                 "Your interview details have been updated.",
-                "INTERVIEW_UPDATED"
+                "INTERVIEW_UPDATED",
+                interview.getApplicationId()
         );
 
         response.put("success", true);

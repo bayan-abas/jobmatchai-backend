@@ -14,6 +14,7 @@ public interface NotificationRepository extends JpaRepository<Notification, Long
     boolean existsByRecipientEmailAndTypeAndReferenceId(String recipientEmail, String type, Long referenceId);
     void deleteByRecipientEmail(String recipientEmail);
 
+    // מסמן בבת אחת את כל ההתראות של המשתמש כנקראו, במקום לעדכן כל אחת בנפרד
     @Modifying
     @Query("UPDATE Notification n SET n.read = true WHERE n.recipientEmail = :recipientEmail AND n.read = false")
     int markAllAsReadByRecipientEmail(@Param("recipientEmail") String recipientEmail);

@@ -56,6 +56,7 @@ public class PasswordResetService {
 
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
+    // אם המייל קיים, מייצר טוקן איפוס חד-פעמי לחצי שעה ושולח למייל לינק לאיפוס סיסמה
     public String requestReset(String email) {
         User user = userRepository.findByEmail(email);
 
@@ -80,22 +81,14 @@ public class PasswordResetService {
         } else if ("dev".equals(appEnvironment)) {
             log.info("Password reset link for {}: {}", email, resetLink);
         } else {
-            // Never log the raw token/link (or the email tied to it) outside dev - this branch
-            // means mail isn't configured at all, so unlike the catch block above there's no
-            // delivery failure detail worth trading that off for.
+
             log.warn("Password reset email could not be sent because mail is not configured.");
         }
 
-        // Only ever hand the raw reset link back in the API response in dev mode -
-        // a prod deploy with mail misconfigured must never leak it to the client.
+        // אותו רעיון - בdev מחזירים את הלינק ישירות בתגובה כדי לא להיות תלויים בשליחת מייל
         return "dev".equals(appEnvironment) ? resetLink : null;
     }
 
-    // Plain-text-only, link-only emails from a bare personal address are a classic spam
-    // signature. Sending a proper multipart (HTML + plain text) message with a display
-    // name, real body copy and an unsubscribe-style footer materially improves inbox
-    // placement - it can't fix domain-level SPF/DKIM/DMARC reputation, which is outside
-    // application code, but it removes the content-based red flags we do control.
     private void sendResetEmail(String email, String resetLink) throws Exception {
         MimeMessage mimeMessage = mailSender.createMimeMessage();
         MimeMessageHelper helper = new MimeMessageHelper(mimeMessage, true, "UTF-8");
@@ -127,6 +120,7 @@ public class PasswordResetService {
         mailSender.send(mimeMessage);
     }
 
+    // מוודא שהטוקן תקף ולא נוצל, ואם כן מעדכן את הסיסמה, מבטל טוקנים ישנים ושולח התראת אבטחה למשתמש
     public boolean resetPassword(String token, String newPassword) {
         PasswordResetToken resetToken = passwordResetTokenRepository.findByToken(token).orElse(null);
 
@@ -143,8 +137,7 @@ public class PasswordResetService {
         user.setPassword(passwordEncoder.encode(newPassword));
         userRepository.save(user);
 
-        // Same reasoning as AuthController#changePassword - a token issued before this reset
-        // must stop working immediately.
+        // אותה סיבה כמו ב-AuthController#changePassword - טוקן ישן חייב להיפסל מיד אחרי איפוס סיסמה
         tokenRevocationService.revokeTokensIssuedBefore(user.getEmail(), Instant.now());
 
         resetToken.setUsed(true);
@@ -160,10 +153,7 @@ public class PasswordResetService {
         return true;
     }
 
-    // Used and expired tokens have no ongoing value - without this they only ever get
-    // removed when the whole account is deleted, so this table would otherwise grow forever.
-    // Runs once a day; a day's delay past expiry/use is irrelevant since an expired or
-    // already-used token can't be redeemed anyway.
+    // ג'וב לילי שמנקה טוקני איפוס סיסמה ישנים שכבר נוצלו או פגו, אותו רעיון כמו ניקוי קודי האימות
     @Scheduled(cron = "0 0 3 * * *")
     @Transactional
     public void cleanupExpiredTokens() {

@@ -13,9 +13,6 @@ import java.util.Date;
 @Service
 public class JwtService {
 
-    // Must match application.properties' app.jwt.secret default exactly - that default is
-    // committed to git (public to anyone with repo access), so letting it silently sign
-    // production tokens would let anyone forge a valid JWT for any email/role.
     private static final String INSECURE_DEFAULT_SECRET =
             "dev-only-insecure-secret-change-me-before-deploying-to-production-0123456789";
 
@@ -23,15 +20,14 @@ public class JwtService {
     private final long expirationMs;
     private final long rememberMeExpirationMs;
 
+    // בסביבת prod מסרב לעלות אם עדיין משתמשים במפתח החתימה ברירת המחדל (כדי שלא יופצו טוקנים עם סוד ידוע לכולם)
     public JwtService(
             @Value("${app.jwt.secret}") String secret,
             @Value("${app.jwt.expiration-ms}") long expirationMs,
             @Value("${app.jwt.remember-me-expiration-ms}") long rememberMeExpirationMs,
             @Value("${app.environment:dev}") String environment
     ) {
-        // Fails startup outright rather than silently running with a publicly-known signing
-        // key - JWT_SECRET being unset in a "prod" deployment previously had no signal at all
-        // beyond a comment in application.properties that's easy to miss.
+
         if ("prod".equals(environment) && INSECURE_DEFAULT_SECRET.equals(secret)) {
             throw new IllegalStateException(
                     "app.environment=prod but JWT_SECRET was never set - refusing to start with the "
@@ -48,6 +44,7 @@ public class JwtService {
         return generateToken(email, role, false);
     }
 
+    // יוצר JWT חתום עם אימייל ותפקיד בתוך ה-claims, ותוקף ארוך יותר אם המשתמש סימן "זכור אותי"
     public String generateToken(String email, String role, boolean rememberMe) {
         Date now = new Date();
         Date expiry = new Date(now.getTime() + (rememberMe ? rememberMeExpirationMs : expirationMs));
@@ -61,6 +58,7 @@ public class JwtService {
                 .compact();
     }
 
+    // מפענח ומאמת את חתימת הטוקן מול המפתח שלנו, וזורק חריגה אם הטוקן זויף או פגום
     public Claims parseClaims(String token) {
         return Jwts.parser()
                 .verifyWith(signingKey)
@@ -81,6 +79,7 @@ public class JwtService {
         return parseClaims(token).getIssuedAt();
     }
 
+    // בודק שהטוקן חתום כמו שצריך ושעדיין לא פג תוקפו - זה מה שקובע אם בקשה נחשבת מאומתת
     public boolean isValid(String token) {
         try {
             Claims claims = parseClaims(token);

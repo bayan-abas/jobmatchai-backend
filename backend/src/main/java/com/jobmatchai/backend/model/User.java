@@ -26,9 +26,6 @@ public class User {
 
     private String cvFileName;
 
-    // The file name exactly as the candidate uploaded it, kept separate from cvFileName
-    // (the sanitized/timestamp-prefixed name it's actually stored under on disk) so the
-    // UI can always show the real name back to the user.
     private String originalCvFileName;
 
     private Boolean premium;
@@ -52,9 +49,6 @@ public class User {
     @Column(columnDefinition = "TEXT")
     private String professionalSummary;
 
-    // Company-side profile fields. Collected on the company registration form but previously
-    // only ever written to browser localStorage - never persisted, invisible on any other
-    // device, and gone the moment local storage was cleared.
     private String industry;
 
     private String companySize;
@@ -68,13 +62,8 @@ public class User {
 
     private String github;
 
-    // Just the founding year (e.g. "2022") - kept as a String like the other free-text
-    // company fields rather than an Integer, since it's display-only and never used in
-    // date arithmetic.
     private String founded;
 
-    // Free text rather than an enum: the examples (Startup/Private Company/Enterprise/
-    // Non-profit) are UI suggestions, not a fixed backend vocabulary to validate against.
     private String companyType;
 
     public User() {}
@@ -121,7 +110,7 @@ public class User {
     public void setRole(String role) {
         this.role = role;
     }
-    
+
     public String getCvFileName() {
         return cvFileName;
     }
@@ -138,6 +127,7 @@ public class User {
         this.originalCvFileName = originalCvFileName;
     }
 
+    // עוטף את השדה הבוליאני כדי ש-null יתפרש כלא-פרימיום במקום לזרוק שגיאה
     public boolean isPremium() {
         return Boolean.TRUE.equals(premium);
     }

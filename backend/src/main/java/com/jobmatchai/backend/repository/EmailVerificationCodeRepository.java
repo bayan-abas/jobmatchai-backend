@@ -9,18 +9,13 @@ import java.util.Optional;
 
 public interface EmailVerificationCodeRepository extends JpaRepository<EmailVerificationCode, Long> {
 
-    // Only the most recently requested code for an email is ever valid - requestCode()
-    // invalidates every prior unused row before saving a new one, so this should normally
-    // return at most one entry, but ordering by id descending makes it correct even if that
-    // invariant is ever violated.
+    // מביא את קוד האימות האחרון והפעיל שנשלח למייל הזה - כדי לבדוק מול הקוד שהמשתמש הזין
     Optional<EmailVerificationCode> findFirstByEmailAndUsedFalseOrderByIdDesc(String email);
 
     List<EmailVerificationCode> findAllByEmailAndUsedFalse(String email);
 
     void deleteByEmail(String email);
 
-    // Used-up or expired codes have zero ongoing value - without this they'd otherwise sit in
-    // this table forever, since nothing else ever removes a row (unlike password reset tokens,
-    // there's no user account yet to cascade-delete from).
+    // ניקוי תקופתי של קודים שכבר נוצלו או שפג תוקפם, כדי שהטבלה לא תגדל לנצח
     int deleteByUsedTrueOrExpiresAtBefore(LocalDateTime cutoff);
 }

@@ -20,18 +20,6 @@ import org.springframework.web.client.RestClient;
 import java.util.ArrayList;
 import java.util.List;
 
-// Backs the generic, keyword-free pre-filter in JobMatchService: a cheap, deterministic,
-// purely arithmetic (no per-request AI call) semantic-similarity gate computed from OpenAI
-// embeddings, so "is this job even worth an AI classification call" never depends on matching
-// job-title/skill substrings against a hand-maintained keyword list - the exact kind of
-// heuristic that caused two real scoring bugs earlier this session (a job's own bad "skills"
-// text misleading the model, and a "delivery" substring false-matching a Director-level role).
-//
-// Every public method here fails OPEN, never closed: any error (missing key, network failure,
-// malformed response, request timeout) returns an empty/null result rather than throwing, so a
-// caller that can't get an embedding always falls back to "send this to the AI" - the pre-filter
-// can only ever skip an AI call when it has real, positive evidence of low similarity, never as
-// a side effect of an embeddings-API hiccup.
 @Service
 public class EmbeddingService {
 
@@ -43,10 +31,6 @@ public class EmbeddingService {
     @Value("${openai.embedding-model:text-embedding-3-small}")
     private String embeddingModel;
 
-    // A shortened, still-unit-normalized vector (OpenAI's Matryoshka-representation support for
-    // the text-embedding-3-* family) - this is a coarse "same field or not" gate, not a
-    // fine-grained search-ranking use case, so the default 1536 dimensions would only cost more
-    // storage/compute for no real gain here.
     @Value("${openai.embedding-dimensions:512}")
     private int embeddingDimensions;
 
@@ -56,9 +40,7 @@ public class EmbeddingService {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    // Returns one float[] per input text, in the SAME order as `texts`. Never throws - returns
-    // an empty list on any failure (missing key, HTTP error, malformed response), which every
-    // caller must treat as "no embedding available", never as "these are unrelated".
+    // שולח batch של טקסטים ל-OpenAI ומחזיר את וקטורי ה-embedding שלהם, מסודרים לפי סדר הקלט המקורי
     public List<float[]> embedBatch(List<String> texts) {
         if (texts == null || texts.isEmpty() || apiKey == null || apiKey.isBlank()) {
             return List.of();
@@ -86,9 +68,7 @@ public class EmbeddingService {
                 return List.of();
             }
 
-            // Response order is not guaranteed to match input order - each item carries its own
-            // "index", so size the result array up front and place each vector by that index
-            // rather than assuming positional order.
+            // OpenAI לא מבטיח שהתשובות יחזרו באותו סדר של הקלט, לכן ממפים לפי שדה index
             float[][] ordered = new float[texts.size()][];
             for (JsonNode item : response.get("data")) {
                 int index = item.path("index").asInt(-1);
@@ -106,6 +86,7 @@ public class EmbeddingService {
             List<float[]> result = new ArrayList<>();
             for (float[] vector : ordered) {
                 if (vector == null) {
+                    // עדיף לזרוק את כל ה-batch מאשר להחזיר embeddings חלקיים שלא מסונכרנים עם הטקסטים
                     return List.of();
                 }
                 result.add(vector);
@@ -122,9 +103,7 @@ public class EmbeddingService {
         return result.isEmpty() ? null : result.get(0);
     }
 
-    // Full formula (dot / (|a|*|b|)) rather than assuming pre-normalized input - OpenAI
-    // embeddings are documented as unit-normalized (including the shortened `dimensions` form),
-    // but computing it properly costs nothing and stays correct even if that ever changes.
+    // מחשב את דמיון הקוסינוס בין שני וקטורי embedding - זה הבסיס למדידת קרבה סמנטית בין קו"ח למשרה
     public static float cosineSimilarity(float[] a, float[] b) {
         if (a == null || b == null || a.length != b.length || a.length == 0) {
             return 0f;
@@ -169,10 +148,7 @@ public class EmbeddingService {
         return embeddingModel + "@" + embeddingDimensions;
     }
 
-    // Lazy + fingerprinted, same shape as JobMatchService#fingerprintCv: only calls the
-    // embeddings API the first time a given candidate profile is matched against anything, or
-    // after the profile text actually changes (new CV analysis) or the embedding model/dimension
-    // config changes - every request after that is a pure cache hit, zero API calls.
+    // מחזיר embedding קיים אם הפרופיל לא השתנה (לפי hash), ורק אם צריך מחשב מחדש ושומר - חוסך קריאות API מיותרות
     public float[] ensureProfileEmbedding(CVAnalysis analysis, CVAnalysisRepository cvAnalysisRepository) {
         String inputText = buildProfileEmbeddingText(analysis);
         if (inputText.isBlank()) {
@@ -200,6 +176,7 @@ public class EmbeddingService {
         return vector;
     }
 
+    // בונה את הטקסט המייצג את פרופיל המועמד שעליו מחושב ה-embedding (תפקיד, תחום, מיומנויות, תקציר)
     private String buildProfileEmbeddingText(CVAnalysis analysis) {
         return String.join(". ",
                 nullToEmpty(analysis.getProfessionTitle()),

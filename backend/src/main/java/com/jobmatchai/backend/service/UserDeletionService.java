@@ -84,6 +84,7 @@ public class UserDeletionService {
     @Autowired
     private FileStorageService fileStorageService;
 
+    // מוחק חשבון משתמש לגמרי - קובץ CV, כל הנתונים הקשורים בכל הטבלאות, ואם זו חברה גם את המשרות שלה
     @Transactional
     public void deleteUserAccount(String email) {
         User user = userRepository.findByEmail(email);
@@ -92,8 +93,7 @@ public class UserDeletionService {
             return;
         }
 
-        // A token issued for this account before deletion must stop authenticating immediately,
-        // not linger until it naturally expires (see TokenRevocationService).
+        // בזיכרון בלבד, לא חלק מהטרנזקציה - גם אם המחיקה למטה תיכשל ותתבטל, הטוקנים כבר נפסלים
         tokenRevocationService.revokeTokensIssuedBefore(email, Instant.now());
 
         deleteCvFile(user.getCvFileName());

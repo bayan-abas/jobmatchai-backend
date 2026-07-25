@@ -23,11 +23,6 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-// Covers the security-audit fix: PasswordResetService used to log the full reset link (raw token
-// included) and the email it belongs to whenever mail isn't configured, regardless of environment
-// - see the mail-not-configured branch of requestReset(). That must now depend on app.environment:
-// the raw link/token is only ever logged in dev; every other environment gets a generic warning
-// with no token, link, or email in it.
 @ExtendWith(MockitoExtension.class)
 class PasswordResetServiceTest {
 
@@ -51,7 +46,7 @@ class PasswordResetServiceTest {
         ReflectionTestUtils.setField(passwordResetService, "passwordResetTokenRepository", passwordResetTokenRepository);
         ReflectionTestUtils.setField(passwordResetService, "notificationService", notificationService);
         ReflectionTestUtils.setField(passwordResetService, "tokenRevocationService", tokenRevocationService);
-        // Mail not configured - the scenario the audit finding is about.
+
         ReflectionTestUtils.setField(passwordResetService, "mailSender", null);
         ReflectionTestUtils.setField(passwordResetService, "mailHost", "");
         ReflectionTestUtils.setField(passwordResetService, "mailUsername", "");
@@ -102,8 +97,7 @@ class PasswordResetServiceTest {
         String returnedLink = passwordResetService.requestReset("candidate@example.com");
 
         assertThat(returnedLink).isNull();
-        // A fixed generic literal with no interpolation - the only way this passes is if no
-        // token/link/email ever made it into any log call for this request.
+
         assertThat(formattedLogMessages())
                 .containsExactly("Password reset email could not be sent because mail is not configured.");
     }

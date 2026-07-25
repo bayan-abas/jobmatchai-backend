@@ -6,17 +6,11 @@ import org.springframework.http.ResponseEntity;
 import java.util.HashMap;
 import java.util.Map;
 
-// Shared by every controller that gates an endpoint with RateLimiterService (currently
-// AuthController and UserController, which expose two independent routes - /api/auth/* and
-// /api/users/* - to the same login/registration actions) so the 429 response shape and the
-// email-normalization used to build rate-limit keys can't drift between them.
 public final class RateLimitSupport {
 
     private RateLimitSupport() {}
 
-    // Generic message + optional Retry-After, deliberately vague so a client can't distinguish
-    // "too many requests from your IP" from "too many requests for this email" - either would
-    // otherwise leak information about which dimension is being throttled.
+    // בונה תשובת 429 אחידה לכל מקומות ה-rate limiting, כולל header של Retry-After אם ידוע כמה לחכות
     public static ResponseEntity<Map<String, Object>> tooManyRequests(long retryAfterSeconds) {
         Map<String, Object> response = new HashMap<>();
         response.put("success", false);
@@ -29,6 +23,7 @@ public final class RateLimitSupport {
         return builder.body(response);
     }
 
+    // מנרמל אימייל (trim + lowercase) כדי שאותו משתמש תמיד ייספר תחת אותו מפתח, בלי קשר לאותיות רישיות ורווחים
     public static String normalizeEmail(String email) {
         if (email == null || email.isBlank()) {
             return null;

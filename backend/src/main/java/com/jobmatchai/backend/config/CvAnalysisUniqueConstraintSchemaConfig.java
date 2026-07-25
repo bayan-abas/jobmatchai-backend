@@ -12,29 +12,6 @@ import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
 
-/**
- * Backstops CVController#analyzeCV's check-then-insert
- * (cvAnalysisRepository.findByUserEmail(email).orElse(new CVAnalysis()), then save) against the
- * same class of race SavedApplication's unique constraint already guards: two concurrent
- * /api/cv/analyze calls for the same user can both pass the "not found" check before either
- * insert lands, leaving two cv_analysis rows for one user_email. Every subsequent
- * findByUserEmail (a derived single-result query used throughout CVController and
- * JobMatchService) then throws IncorrectResultSizeDataAccessException on every read for that
- * user, forever - not just once.
- *
- * A unique constraint alone doesn't retroactively fix data that's already duplicated, so this:
- *   1. Checks (via information_schema) whether the constraint already exists - a no-op on every
- *      later startup once added.
- *   2. Checks for existing duplicate user_email rows FIRST. If any exist, logs a warning and
- *      skips adding the constraint entirely - adding a UNIQUE constraint over duplicate data
- *      would fail outright (Postgres refuses), and silently deleting/merging the "extra" rows
- *      is not this migration's call to make against a real production database with real user
- *      data. An operator can be alerted by this warning and resolve the duplicates deliberately.
- *   3. Only then adds the constraint.
- *
- * No-op entirely on non-Postgres datasources, matching every other schema-migration component in
- * this package.
- */
 @Component
 public class CvAnalysisUniqueConstraintSchemaConfig {
 
@@ -55,8 +32,7 @@ public class CvAnalysisUniqueConstraintSchemaConfig {
         }
 
         if (!tableExists("cv_analysis")) {
-            // Fresh database, Hibernate hasn't created the table on this boot yet - nothing to
-            // constrain; a later restart (once the table exists) will pick this up.
+
             return;
         }
 
@@ -65,6 +41,7 @@ public class CvAnalysisUniqueConstraintSchemaConfig {
             return;
         }
 
+        // ADD CONSTRAINT UNIQUE נכשל אם כבר קיימות כפילויות - חייבים לבדוק לפני שמנסים
         List<Map<String, Object>> duplicates = jdbcTemplate.queryForList("""
                 SELECT user_email, COUNT(*) AS row_count
                 FROM cv_analysis

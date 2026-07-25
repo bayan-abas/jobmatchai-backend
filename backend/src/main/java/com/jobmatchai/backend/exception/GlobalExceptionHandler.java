@@ -14,6 +14,7 @@ import java.util.Map;
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
+    // תופס שגיאות ולידציה של @Valid ומחזיר רק את הודעת השגיאה הראשונה בפורמט JSON אחיד במקום כל השגיאות של Spring
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<Map<String, Object>> handleValidationErrors(MethodArgumentNotValidException ex) {
         Map<String, Object> response = new HashMap<>();
@@ -28,12 +29,7 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
     }
 
-    // Thrown at multipart-parsing time (before any controller method body runs) whenever a
-    // request exceeds spring.servlet.multipart.max-file-size/max-request-size - without this
-    // handler it falls through to Spring Boot's generic error page instead of this app's normal
-    // {"success":false,"message":...} shape. Endpoint-specific limits (e.g. CVController's own
-    // CV-size check) still produce their own more specific message when a request is under this
-    // global ceiling; this is only the outermost safety net.
+    // תופס קובץ גדול מדי שהועלה ומחזיר הודעה ברורה למשתמש במקום שגיאת שרת גנרית
     @ExceptionHandler(MaxUploadSizeExceededException.class)
     public ResponseEntity<Map<String, Object>> handleMaxUploadSizeExceeded(MaxUploadSizeExceededException ex) {
         Map<String, Object> response = new HashMap<>();

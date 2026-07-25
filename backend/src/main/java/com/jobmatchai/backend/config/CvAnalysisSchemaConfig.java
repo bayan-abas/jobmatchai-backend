@@ -13,6 +13,7 @@ public class CvAnalysisSchemaConfig {
         this.jdbcTemplate = jdbcTemplate;
     }
 
+    // בעת עליית השרת יוצר את טבלת cv_analysis אם היא לא קיימת ומוסיף עמודות חסרות - תיקון סכימה אוטומטי במקום מיגרציה ידנית
     @PostConstruct
     public void ensureCvAnalysisSchema() {
         jdbcTemplate.execute("""

@@ -1,4 +1,3 @@
-
 package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
@@ -27,11 +26,6 @@ public class JobMatchScore {
     @Column(name = "match_reason", columnDefinition = "TEXT")
     private String matchReason;
 
-    // Combined (mandatory + preferred) lists, kept for backward compatibility with existing
-    // readers (AI chat context, frontend job cards). matchedRequiredSkills/matchedPreferredSkills
-    // and missingRequiredSkills/missingPreferredSkills below are the same data split out for
-    // callers that need the mandatory/preferred distinction (e.g. the UI badging a missing skill
-    // as "required" vs "preferred" instead of showing every gap as equally severe).
     @Column(name = "matched_skills", columnDefinition = "TEXT")
     private String matchedSkills;
 
@@ -68,11 +62,6 @@ public class JobMatchScore {
     @Column(name = "recommendation", columnDefinition = "TEXT")
     private String recommendation;
 
-    // Which version of JobMatchService.DETAIL_PROMPT_VERSION whyGoodMatch/whyNotPerfectMatch/
-    // improvementSuggestions/recommendation were last generated (and filtered) under. Compared
-    // against the current constant in getMatchDetail's detailStale check so a fix to the
-    // contradiction-filtering logic forces every existing cached narrative to regenerate under the
-    // new rules, rather than staying frozen at whatever guard existed when it was first written.
     @Column(name = "detail_prompt_version")
     private Integer detailPromptVersion;
 
@@ -94,8 +83,6 @@ public class JobMatchScore {
     @Column(name = "language_match_percent")
     private Integer languageMatchPercent;
 
-    // Weighted-scoring components (see MatchScoreCalculator) - matchPercent is the single
-    // backend-computed weighted combination of these, not a number the AI invents directly.
     @Column(name = "field_relevance_percent")
     private Integer fieldRelevancePercent;
 
@@ -105,38 +92,15 @@ public class JobMatchScore {
     @Column(name = "location_match_percent")
     private Integer locationMatchPercent;
 
-    // The per-job fingerprint (jobId + title + company + normalized title + content hash) the
-    // AI was asked to echo back for this result, so a stale/misattributed cache row can be told
-    // apart from one that was actually validated against the exact job it's attached to.
     @Column(name = "job_content_fingerprint")
     private String jobContentFingerprint;
 
-    // True when this job's own posting text was too thin (title-only, or a one-line description
-    // with no real requirements/skills) to support a reliable comparison at all - a deterministic,
-    // pre-AI gate (see JobMatchService#isInsufficientJobData), never an AI judgment call. Distinct
-    // from fieldRelated=null (JobMatchService's transient "AI call failed, please retry" sentinel,
-    // which is NEVER persisted): this is a real, stable, cacheable verdict about the JOB POSTING
-    // itself, not a failure - a candidate never gets asked to "retry" a job that will never have
-    // enough content to score, and matchPercent/skills/component fields are correctly left null
-    // rather than a fabricated-looking number computed from almost nothing.
     @Column(name = "insufficient_data")
     private Boolean insufficientData;
 
-    // The AI-classified requirement level this job was scored against for each dimension (e.g.
-    // "mid", "relevant_degree", "specific_license") - set alongside the corresponding *MatchPercent
-    // in applyParsedMatchToScore, so the Match Details page can show WHAT was required, not just
-    // the resulting percentage. Null when that dimension wasn't applicable to this job (mirrors
-    // the corresponding *MatchPercent being null for the same reason).
     @Column(name = "required_experience_level")
     private String requiredExperienceLevel;
 
-    // Non-null only when this job named a distinct experience sub-domain/type beyond general
-    // seniority (e.g. "Clinical Research") - see JobMatchService.ParsedMatch's
-    // requiredExperienceType and MatchScoreCalculator#scoreExperience's amount-vs-type blending.
-    // candidateHasRequiredExperienceType is null exactly when this is null, otherwise true/false
-    // for whether the candidate's history showed real evidence of THAT specific type - lets the
-    // Match Details page (and the detail-narrative prompt) explain a low experience score as
-    // "right amount, wrong specialty" rather than "not enough experience."
     @Column(name = "required_experience_type")
     private String requiredExperienceType;
 
@@ -149,12 +113,10 @@ public class JobMatchScore {
     @Column(name = "required_certification_level")
     private String requiredCertificationLevel;
 
-    // When this row's core score was last (re)computed - the Match Details page's "Last
-    // Analyzed" timestamp. Auto-maintained by JPA lifecycle callbacks rather than set manually at
-    // every call site, so it can never drift out of sync with an actual row change.
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 
+    // מעדכן את תאריך העדכון האחרון בכל שמירה או עדכון של רשומת ההתאמה
     @PrePersist
     @PreUpdate
     protected void onSave() {
@@ -183,12 +145,7 @@ public class JobMatchScore {
         this.jobId = jobId;
     }
 
-    // Defensively re-clamped on every read (not just re-trusting whatever MatchScoreCalculator
-    // wrote at save time) - this is the single choke point every consumer of this entity reads
-    // through (JobController, ApplicationController, ExternalJobController, AI chat context,
-    // notifications), so it's the one place that can guarantee no caller ever sees an
-    // out-of-range percent, regardless of how a bad value got into this column (a future write
-    // path that forgets to clamp, or a row written by a since-changed scoring version).
+    // הגנה כפולה - אם איכשהו נשמר ערך מחוץ לטווח ב-DB, לא לצאת עם זה החוצה
     public Integer getMatchPercent() {
         return matchPercent == null ? null : Math.max(0, Math.min(100, matchPercent));
     }
@@ -441,13 +398,6 @@ public class JobMatchScore {
         this.insufficientData = insufficientData;
     }
 
-    // In-memory only, never persisted - set by JobMatchService's ensureCoreScores/
-    // computeMatchScoresStreaming when a recompute attempt fails and this row's fields are the
-    // last KNOWN-GOOD result being served as a fallback instead of a bare error, per the product
-    // requirement that a transient failure must never blank out an already-known match percentage.
-    // Every persisted row is otherwise indistinguishable from a genuinely fresh one - this flag
-    // exists purely to tell the payload/frontend layer "keep quietly retrying in the background,
-    // this number is real but may be a little behind."
     @Transient
     private boolean stale = false;
 

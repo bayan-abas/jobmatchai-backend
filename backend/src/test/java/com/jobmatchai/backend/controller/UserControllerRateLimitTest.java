@@ -39,13 +39,6 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-// Mirrors AuthControllerRateLimitTest, but for the /api/users/login and /api/users/register
-// endpoints - the routes the real frontend actually calls for login/registration (see
-// LoginPage.tsx and CandidateRegisterPage.tsx/CompanyRegisterPage.tsx). AuthController's
-// /api/auth/login and /api/auth/register were rate-limited first, but the frontend never hits
-// them, so this closes the gap by applying the identical rules to UserController's routes -
-// reusing the same RateLimiterService/RateLimitProperties/ClientIpResolver/RateLimitSupport
-// rather than a second implementation.
 @ExtendWith(MockitoExtension.class)
 class UserControllerRateLimitTest {
 
@@ -99,8 +92,6 @@ class UserControllerRateLimitTest {
     private static RegisterRequest registerRequest(String email) {
         return new RegisterRequest("Jane Doe", email, "password1", "candidate", "0500000000", "123456");
     }
-
-    // ---- /api/users/login (fixed lockout: LOGIN_CAPACITY failed attempts, then a full lockout) ----
 
     @Test
     void loginUser_allowsFailedAttemptsUpToCapacity_thenLocksOutSameIpWith429() {
@@ -168,9 +159,7 @@ class UserControllerRateLimitTest {
 
     @Test
     void loginUser_sharesLockoutWithAuthControllerLogin() {
-        // AuthController#login and UserController#loginUser must lock out together - otherwise
-        // an attacker doubles their effective failed-attempt budget by alternating between the
-        // two routes to the same AuthService#login action.
+
         LoginLockoutService sharedLockoutService = new LoginLockoutService();
         RateLimitProperties sharedProperties = testProperties();
         ClientIpResolver sharedIpResolver = new ClientIpResolver();
@@ -197,21 +186,16 @@ class UserControllerRateLimitTest {
 
         HttpServletRequest ip = requestFrom("198.51.100.12");
 
-        // Exhaust the lockout threshold entirely through /api/auth/login...
         for (int i = 0; i < LOGIN_CAPACITY; i++) {
             authController.login(new AuthController.LoginRequest("shared@example.com", "wrongpassword"), ip);
         }
 
-        // ...and /api/users/login for the same IP/email must already be locked out, without ever
-        // reaching this controller's own authService.
         ResponseEntity<Map<String, Object>> blocked =
                 userController.loginUser(loginData("shared@example.com", "wrongpassword"), ip);
 
         assertThat(blocked.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);
         verify(authService, times(0)).login(anyString(), anyString(), anyBoolean());
     }
-
-    // ---- /api/users/register ----
 
     @Test
     void registerUser_successfulRegistrations_neverConsumeVerifyCodeBudget() {
@@ -283,13 +267,10 @@ class UserControllerRateLimitTest {
         HttpServletRequest ip = requestFrom("198.51.100.16");
         RegisterRequest request = registerRequest("shared-guesser@example.com");
 
-        // Exhaust the failed-attempt budget entirely through /api/auth/register...
         for (int i = 0; i < VERIFY_CODE_CAPACITY; i++) {
             authController.register(request, ip);
         }
 
-        // ...and /api/users/register for the same IP/email must already be blocked, without ever
-        // reaching userRegistrationService.register.
         ResponseEntity<Map<String, Object>> blocked = userController.registerUser(request, ip);
 
         assertThat(blocked.getStatusCode()).isEqualTo(HttpStatus.TOO_MANY_REQUESTS);

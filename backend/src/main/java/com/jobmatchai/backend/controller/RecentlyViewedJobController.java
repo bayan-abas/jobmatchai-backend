@@ -27,6 +27,7 @@ public class RecentlyViewedJobController {
         return "Recently Viewed API is working";
     }
 
+    // מתעד שהמועמד צפה במשרה מסוימת, לצורך רשימת "נצפו לאחרונה"
     @PostMapping("/track")
     public Map<String, Object> track(@RequestBody TrackRequest request, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
@@ -37,20 +38,19 @@ public class RecentlyViewedJobController {
                 return response;
             }
 
-            // jobTitle/companyName/location are still accepted in the request body for
-            // backward compatibility with the current frontend, but are no longer stored -
-            // recordView only needs the identity of what was viewed, not a snapshot of it.
             recentlyViewedJobService.recordView(
                     authentication.getName(), request.jobId(), request.jobType());
 
             response.put("success", true);
             return response;
         } catch (Exception e) {
+            // מעקב צפיות זה לא קריטי - לא רוצים שזה יפיל למשתמש בקשה בגלל שגיאה כאן
             response.put("success", false);
             return response;
         }
     }
 
+    // מחזיר למועמד את רשימת המשרות שצפה בהן לאחרונה
     @GetMapping("/candidate/{email}")
     public List<RecentlyViewedJob> getRecentlyViewed(Authentication authentication) {
         return recentlyViewedJobService.getRecentlyViewed(authentication.getName());

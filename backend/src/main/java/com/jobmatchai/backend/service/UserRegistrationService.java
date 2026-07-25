@@ -12,11 +12,6 @@ import org.springframework.stereotype.Service;
 
 import java.util.Set;
 
-// Registration must never bind the client's JSON straight onto the User entity - User has
-// public setters for role/premium/stripeCustomerId etc., and those fields (role especially,
-// since @PreAuthorize("hasRole(...)") checks it everywhere) must only ever be set here, on
-// the server, never taken from the request body as-is. This is the single place both
-// /api/auth/register and /api/users/register go through so that guarantee holds everywhere.
 @Service
 public class UserRegistrationService {
 
@@ -30,6 +25,7 @@ public class UserRegistrationService {
 
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
+    // בודק שהמייל פנוי, שה-role חוקי ושקוד האימות נכון, ורק אז יוצר משתמש חדש עם סיסמה מוצפנת
     public User register(RegisterRequest request) {
         if (userRepository.findByEmail(request.email()) != null) {
             throw new EmailAlreadyExistsException();
@@ -41,9 +37,6 @@ public class UserRegistrationService {
             throw new InvalidRoleException();
         }
 
-        // Must be checked (and consumed - a code can only ever create one account) before the
-        // account is created, never after - there is no account to roll back to if this were
-        // checked last and failed.
         if (!emailVerificationService.verifyAndConsume(request.email(), request.verificationCode())) {
             throw new InvalidVerificationCodeException();
         }
@@ -57,7 +50,7 @@ public class UserRegistrationService {
         user.setPremium(false);
 
         User saved = userRepository.save(user);
-        saved.setPassword(null);
+        saved.setPassword(null); // לא להחזיר את ה-hash של הסיסמה בתשובה ל-client
         return saved;
     }
 }

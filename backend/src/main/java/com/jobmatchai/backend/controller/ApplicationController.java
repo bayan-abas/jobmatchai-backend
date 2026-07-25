@@ -3,6 +3,7 @@ package com.jobmatchai.backend.controller;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jobmatchai.backend.model.Application;
+import com.jobmatchai.backend.model.Interview;
 import com.jobmatchai.backend.model.Job;
 import com.jobmatchai.backend.model.JobStatus;
 import com.jobmatchai.backend.model.User;
@@ -12,6 +13,7 @@ import com.jobmatchai.backend.model.JobMatchScore;
 import com.jobmatchai.backend.repository.ApplicationRepository;
 import com.jobmatchai.backend.repository.CandidateAiSummaryRepository;
 import com.jobmatchai.backend.repository.CVAnalysisRepository;
+import com.jobmatchai.backend.repository.InterviewRepository;
 import com.jobmatchai.backend.repository.JobMatchScoreRepository;
 import com.jobmatchai.backend.repository.JobRepository;
 import com.jobmatchai.backend.repository.UserRepository;
@@ -42,17 +44,10 @@ public class ApplicationController {
 
     private static final Logger log = LoggerFactory.getLogger(ApplicationController.class);
 
-    // "Accepted"/"Rejected" are the only FINAL decisions - once set, updateStatus refuses any
-    // further change (see the guard below). "Shortlisted"/"Under Review" are reversible
-    // intermediate states a company can move between freely before making a final call.
     private static final Set<String> ALLOWED_COMPANY_STATUSES =
             Set.of("Accepted", "Rejected", "Shortlisted", "Under Review");
     private static final Set<String> FINAL_COMPANY_STATUSES = Set.of("Accepted", "Rejected");
 
-    // Fixed vocabulary for how the company will contact an accepted candidate - "other" is the
-    // one value that requires the accompanying free-text contactMethodOther to be non-blank
-    // (validated in updateStatus). Keys are what the API accepts; buildContactMethodLabel maps
-    // each to the human-readable text used in the acceptance notification.
     private static final Set<String> ALLOWED_CONTACT_METHODS =
             Set.of("phone_call", "email", "whatsapp", "linkedin", "in_person_meeting", "other");
 
@@ -85,6 +80,9 @@ public class ApplicationController {
     @Autowired
     private CVAnalysisRepository cvAnalysisRepository;
 
+    @Autowired
+    private InterviewRepository interviewRepository;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @GetMapping("/test")
@@ -92,9 +90,7 @@ public class ApplicationController {
         return "Applications API is working";
     }
 
-    // Deliberately NOT filtered/blocked by the referenced job's status - a candidate must keep
-    // seeing an application here even after the company closes that job (see JobStatus). The
-    // jobStatus enrichment below is what lets the frontend show a "Closed" badge on it instead.
+    // מחזיר למועמד המחובר את כל הבקשות שהגיש, כולל סטטוס עדכני של כל משרה
     @GetMapping("/candidate/{email}")
     public List<Application> getApplicationsByCandidate(Authentication authentication) {
         List<Application> applications = applicationRepository.findByCandidateEmail(authentication.getName());
@@ -105,13 +101,20 @@ public class ApplicationController {
             statusByJobId.put(job.getId(), job.getStatus());
         }
 
+        List<Long> applicationIds = applications.stream().map(Application::getId).toList();
+        Map<Long, Interview> latestInterviewByApplicationId = new HashMap<>();
+        for (Interview interview : interviewRepository.findByApplicationIdIn(applicationIds)) {
+            Interview existing = latestInterviewByApplicationId.get(interview.getApplicationId());
+            if (existing == null || interview.getId() > existing.getId()) {
+                latestInterviewByApplicationId.put(interview.getApplicationId(), interview);
+            }
+        }
+
         for (Application application : applications) {
             JobStatus status = statusByJobId.get(application.getJobId());
-            // Null (rather than defaulting to ACTIVE) when the job no longer exists at all - e.g.
-            // deleted via JobController#deleteJob, which never cascade-deletes applications -
-            // deliberately distinct from "still active", so the frontend doesn't falsely imply
-            // the job is still open.
+
             application.setJobStatus(status != null ? status.name() : null);
+            application.setInterview(latestInterviewByApplicationId.get(application.getId()));
         }
 
         return applications;
@@ -125,28 +128,12 @@ public class ApplicationController {
             String candidateEmail,
             String status,
             String appliedDate,
-            // Sourced from JobMatchScore (see resolveCachedMatchScores below) - the same
-            // deterministic, backend-weighted score the candidate's own "Job Matches" page shows
-            // for this pair, so a recruiter and a candidate never see two different numbers for
-            // the same match.
+
             Integer matchPercent,
             String matchLabel,
-            // Fixed-vocabulary hiring-decision category ("accept"/"consider"/"reject"). NOT
-            // derived from matchPercent above - it stays sourced from CandidateAiSummary's own
-            // internal matchScore (see resolveCachedSummaries/MatchLabelUtil.recommendationFromScore),
-            // which still exists purely to drive this field and the AI Summary's narrative -
-            // it is deliberately never exposed as a displayed percentage anymore. The frontend
-            // must only map this to a localized label, never compute its own recommendation.
+
             String recommendation,
-            // Whether a CandidateAiSummary row already exists for this candidate+job - i.e.
-            // whether POST /{id}/ai-summary is guaranteed to be a cache hit right now rather than
-            // a fresh (billed) OpenAI call. Before matchPercent moved to JobMatchScore, the
-            // frontend used "matchPercent !== null" as a proxy for this, which happened to be
-            // safe only because matchPercent WAS CandidateAiSummary's own score at the time. That
-            // proxy silently broke the moment the source changed - JobMatchScore is typically
-            // populated well before any CandidateAiSummary is ever generated - so this field
-            // exists specifically to give the frontend an honest, source-independent signal to
-            // gate on instead.
+
             boolean hasAiSummary,
             boolean viewedByCompany,
             Map<String, String> preInterviewAnswers,
@@ -168,17 +155,6 @@ public class ApplicationController {
         }
     }
 
-    // CandidateAiSummary now backs ONLY `recommendation` (via MatchLabelUtil.recommendationFromScore
-    // below) and the AI Summary narrative (getCandidateAiSummary) - its matchScore is never
-    // returned as a displayed percentage anymore (see resolveCachedMatchScores for that). Kept
-    // as its own lookup specifically so `recommendation` keeps working exactly as it did before -
-    // this task's constraint was to swap the DISPLAYED percentage's source, not to touch how the
-    // AI's own recommendation judgment is derived.
-    //
-    // Keyed by "candidateEmail::jobId" so a batch of summaries fetched with one query
-    // (findByCandidateEmailInAndJobIdIn) can be looked up the same way per-item queries
-    // were before, without hitting the database once per row in a list endpoint - against
-    // a remote database, N applications used to mean N extra round trips here.
     private Map<String, CandidateAiSummary> resolveCachedSummaries(List<Application> applications) {
         if (applications.isEmpty()) {
             return Map.of();
@@ -199,12 +175,6 @@ public class ApplicationController {
         return latestByKey;
     }
 
-    // JobMatchScore is now the single source of truth for the displayed match percentage/label
-    // on every company-facing applicant card (see ApplicantView's own comment) - the exact same
-    // number JobMatchService computes for the candidate's own "Job Matches" page. A plain cache
-    // read, same as resolveCachedSummaries above (no on-demand computation in a list endpoint) -
-    // see JobController#getApplicationsForJob for why a still-missing row here just means "not
-    // scored yet" rather than an error.
     private Map<String, JobMatchScore> resolveCachedMatchScores(List<Application> applications) {
         if (applications.isEmpty()) {
             return Map.of();
@@ -220,6 +190,7 @@ public class ApplicationController {
         return byKey;
     }
 
+    // מחזיר לחברה את כל הבקשות שהוגשו למשרותיה כולל ציוני התאמה ותקצירי AI של מועמדים
     @GetMapping("/company")
     @PreAuthorize("hasRole('COMPANY')")
     public List<ApplicantView> getApplicationsByCompany(Authentication authentication) {
@@ -266,6 +237,7 @@ public class ApplicationController {
             Map<String, String> preInterviewAnswers
     ) {}
 
+    // מגיש בקשה למשרה עבור המועמד המחובר, כולל אכיפת מגבלת המועמדויות החודשית במסלול החינמי
     @PostMapping("/apply")
     @PreAuthorize("hasRole('CANDIDATE')")
     public Map<String, Object> applyToJob(@RequestBody ApplyRequest request, Authentication authentication) {
@@ -286,10 +258,6 @@ public class ApplicationController {
                 return response;
             }
 
-            // Authoritative server-side gate - never trust that the candidate only ever reached
-            // this jobId through the (already-filtered-to-ACTIVE) listing endpoint. A closed job
-            // must reject a new application even when called directly with a stale/bookmarked
-            // jobId, exactly like the id-hijack checks elsewhere in this controller.
             if (job.getStatus() == JobStatus.CLOSED) {
                 response.put("success", false);
                 response.put("message", "This job is no longer accepting applications.");
@@ -329,8 +297,7 @@ public class ApplicationController {
             application.setCompanyName(job.getCompanyName());
             application.setCompanyEmail(job.getCompanyEmail());
             application.setCandidateName(candidate != null ? candidate.getName() : null);
-            // Starts in automated AI screening; only moves to "Under Review" once the company
-            // actually opens it (see markViewed below).
+
             application.setStatus("AI Screening");
             application.setCreatedAt(LocalDateTime.now());
 
@@ -363,9 +330,7 @@ public class ApplicationController {
             return response;
 
         } catch (DataIntegrityViolationException e) {
-            // Backstop for the check-then-insert race above (see the unique constraint on
-            // Application) - a double-click or overlapping request lands here instead of
-            // creating a duplicate row.
+
             response.put("success", false);
             response.put("message", "You already applied to this job");
             return response;
@@ -378,9 +343,6 @@ public class ApplicationController {
         }
     }
 
-    // contactMethod/contactMethodOther/contactMessage are only meaningful (and only validated -
-    // see updateStatus) when status is "Accepted"; rejectionReason is only meaningful (and
-    // mandatory) when status is "Rejected". Each is a harmless no-op for the other status.
     public record StatusUpdateRequest(
             String status, String contactMethod, String contactMethodOther, String contactMessage,
             String rejectionReason) {}
@@ -393,8 +355,6 @@ public class ApplicationController {
             "in_person_meeting", "In-person meeting"
     );
 
-    // "other" resolves to the company's own custom text rather than a fixed label - every other
-    // key has a fixed, known label.
     private String buildContactMethodLabel(String contactMethod, String contactMethodOther) {
         if ("other".equals(contactMethod)) {
             return contactMethodOther;
@@ -402,6 +362,7 @@ public class ApplicationController {
         return CONTACT_METHOD_LABELS.getOrDefault(contactMethod, contactMethod);
     }
 
+    // מעדכן סטטוס בקשה (אישור/דחייה/שורטליסט/בבדיקה) ושולח למועמד התראה מתאימה
     @PutMapping("/{id}/status")
     @PreAuthorize("hasRole('COMPANY')")
     public Map<String, Object> updateStatus(@PathVariable long id, @RequestBody StatusUpdateRequest request, Authentication authentication) {
@@ -416,9 +377,6 @@ public class ApplicationController {
         boolean accepting = "Accepted".equalsIgnoreCase(request.status());
         boolean rejecting = "Rejected".equalsIgnoreCase(request.status());
 
-        // Contact info is meaningless for a rejection - only required (and only validated) when
-        // actually accepting a candidate, matching the feature's whole purpose: an accepted
-        // candidate must always know how the company will reach them.
         if (accepting) {
             if (request.contactMethod() == null || !ALLOWED_CONTACT_METHODS.contains(request.contactMethod())) {
                 response.put("success", false);
@@ -433,9 +391,6 @@ public class ApplicationController {
             }
         }
 
-        // A rejection reason must be the company's own written feedback, never a
-        // system-generated fallback - so a blank/missing value is rejected outright rather than
-        // silently defaulted to a generic message.
         if (rejecting && (request.rejectionReason() == null || request.rejectionReason().isBlank())) {
             response.put("success", false);
             response.put("message", "A rejection reason is required to reject an application");
@@ -451,11 +406,6 @@ public class ApplicationController {
                 return response;
             }
 
-            // Accepted/Rejected is a final decision - without this check, a company could flip an
-            // already-accepted application to rejected (or vice versa) any number of times, each
-            // time firing a fresh, contradictory notification to the candidate, while leftover
-            // fields from the earlier decision (e.g. contactMethod from an old acceptance) stayed
-            // on the row instead of being cleared by the new one.
             if (FINAL_COMPANY_STATUSES.contains(existing.getStatus())) {
                 response.put("success", false);
                 response.put("message", "This application has already been " + existing.getStatus().toLowerCase()
@@ -473,20 +423,15 @@ public class ApplicationController {
                                     "other".equals(request.contactMethod()) ? request.contactMethodOther().trim() : null);
                             String message = request.contactMessage();
                             application.setContactMessage(message != null && !message.isBlank() ? message.trim() : null);
-                            // A candidate must never see a stale rejection reason once the
-                            // decision has moved to Accepted - unreachable today (Rejected is
-                            // itself a final status the guard above never lets this method touch
-                            // again), but this keeps the row honest if that guard ever loosens.
+
                             application.setRejectionReason(null);
                         } else if (rejecting) {
                             application.setRejectionReason(request.rejectionReason().trim());
                         } else {
-                            // Shortlisted / Under Review - same stale-reason guard as above.
+
                             application.setRejectionReason(null);
                         }
 
-                        // A company decision implies the application has been reviewed, even if
-                        // the company never separately opened the detail view / mark-viewed call.
                         if (!application.isViewedByCompany()) {
                             application.setViewedByCompany(true);
                             application.setViewedAt(LocalDateTime.now());
@@ -496,10 +441,7 @@ public class ApplicationController {
 
                         if (saved.getCandidateEmail() != null && !saved.getCandidateEmail().isBlank()) {
                             String jobTitle = saved.getJobTitle() != null ? saved.getJobTitle() : "the position";
-                            // " at Acme Corp" when available, otherwise omitted entirely rather than
-                            // leaving a dangling "at" - companyName isn't guaranteed to be set on
-                            // every historical Application row (it's copied from the Job at apply
-                            // time, see applyToJob).
+
                             String companySuffix = saved.getCompanyName() != null && !saved.getCompanyName().isBlank()
                                     ? " at " + saved.getCompanyName()
                                     : "";
@@ -518,8 +460,7 @@ public class ApplicationController {
                                 notificationService.createNotification(
                                         saved.getCandidateEmail(), "Application Accepted", text.toString(), "APPLICATION_ACCEPTED");
                             } else if (rejecting) {
-                                // The reason is appended verbatim - the company's exact wording,
-                                // never rewritten or replaced with a generic message.
+
                                 String text = "Your application for " + jobTitle + companySuffix
                                         + " has been rejected. Reason: " + saved.getRejectionReason();
 
@@ -557,6 +498,7 @@ public class ApplicationController {
         }
     }
 
+    // מסמן בקשה כנצפתה על ידי החברה ומעביר אותה אוטומטית לסטטוס "בבדיקה"
     @PostMapping("/{id}/mark-viewed")
     @PreAuthorize("hasRole('COMPANY')")
     public Map<String, Object> markViewed(@PathVariable long id, Authentication authentication) {
@@ -586,6 +528,7 @@ public class ApplicationController {
         return response;
     }
 
+    // מוחק בקשה - מאפשר למועמד למשוך מועמדות (כל עוד לא נצפתה) או לחברה להסיר אותה
     @DeleteMapping("/{id}")
     public Map<String, Object> deleteApplication(@PathVariable long id, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
@@ -619,8 +562,6 @@ public class ApplicationController {
             boolean isCompany = authentication.getName().equals(existing.getCompanyEmail());
             applicationRepository.deleteById(id);
 
-            // A company removing an application otherwise vanishes it from the candidate's
-            // list with no trace - let them know instead of it silently disappearing.
             if (isCompany) {
                 notificationService.createNotification(
                         existing.getCandidateEmail(),
@@ -643,6 +584,7 @@ public class ApplicationController {
         }
     }
 
+    // מחזיר לחברה תקציר AI על המועמד (חוזקות, חולשות, המלצה) עבור בקשה ספציפית
     @PostMapping("/{id}/ai-summary")
     @PreAuthorize("hasRole('COMPANY')")
     public ResponseEntity<?> getCandidateAiSummary(
@@ -675,14 +617,6 @@ public class ApplicationController {
             return ResponseEntity.ok(response);
         }
 
-        // The displayed percentage is always JobMatchService's deterministic score - the same
-        // number the candidate's own "Job Matches" page shows for this pair - computed on demand
-        // if it doesn't exist yet. This endpoint already does real AI work on a cache miss for
-        // the summary narrative itself, so doing the same here for the match score is consistent
-        // with what this endpoint already does, not a new class of side effect. result.matchScore()
-        // (CandidateAiSummary's own AI-invented number) stays purely internal from here on - it
-        // already drove result.recommendation() inside CandidateSummaryService and still does,
-        // but is no longer returned to the client as "the" match percentage.
         JobMatchService.MatchScoresResult matchScoresResult =
                 jobMatchService.getMatchScores(application.getCandidateEmail(), List.of(job), language);
         Integer matchPercent = null;
@@ -706,10 +640,7 @@ public class ApplicationController {
         return ResponseEntity.ok(response);
     }
 
-    // Raw, already-extracted CVAnalysis fields for the company's candidate-details view (skills
-    // chips, experience, education, languages) - a plain DB read, never calling OpenAI, so it's
-    // always safe to fetch on every page load (unlike ai-summary above, which can trigger a
-    // fresh generation the first time it's called for a candidate+job pair).
+    // מחזיר לחברה פרופיל מועמד מפורט שחולץ מניתוח קורות החיים (כישורים, ניסיון, השכלה)
     @GetMapping("/{id}/candidate-profile")
     @PreAuthorize("hasRole('COMPANY')")
     public ResponseEntity<?> getCandidateProfile(@PathVariable Long id, Authentication authentication) {
@@ -753,9 +684,6 @@ public class ApplicationController {
         return ResponseEntity.ok(response);
     }
 
-    // technicalSkills/softSkills are the structured v3 fields; skills is the legacy combined
-    // string kept for CVs analyzed before that split existed - falls back to it only when both
-    // structured fields are empty, and never shows the same skill twice.
     private List<String> splitSkills(String technicalSkills, String softSkills, String legacySkills) {
         String combined = String.join(",",
                 technicalSkills == null ? "" : technicalSkills,

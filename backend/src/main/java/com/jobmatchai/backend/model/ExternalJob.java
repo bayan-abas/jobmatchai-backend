@@ -17,11 +17,6 @@ public class ExternalJob {
 
     private String location;
 
-    // Not persisted - every import provider only ever fetches from the single configured
-    // country (externaljobs.import.country), and city was either an exact copy of location
-    // or unset depending on the provider, so neither was real per-row data worth storing.
-    // Populated by ExternalJobService when jobs are read, so the API response shape (and the
-    // frontend's country/city filters) stay exactly as they were.
     @Transient
     private String country;
 
@@ -31,26 +26,9 @@ public class ExternalJob {
     private String type;
     private String salary;
 
-    // TEXT (not a bounded VARCHAR) - match scoring must see the posting's COMPLETE description,
-    // not a truncated excerpt (found via live testing that a real posting's requirements section
-    // can start well past character 2000, after a long company-intro paragraph). See
-    // JobicyJobProvider#resolveDescription for the one remaining safety ceiling (a generous
-    // upper bound against a pathologically huge response, not a normal-case truncation).
     @Column(columnDefinition = "TEXT")
     private String description;
 
-    // AI-generated structured summary of the full description (JSON: roleOverview,
-    // responsibilities, requiredQualifications, preferredQualifications, experienceLevel,
-    // workArrangement, importantConditions - see OpenAICVAnalysisService#summarizeJobDescription)
-    // shown in the frontend's "About this job" section instead of the long raw description, which
-    // stays available in full for match scoring. One column PER SUPPORTED LANGUAGE (not one column
-    // plus a content hash) - the app supports en/ar/he, and a single shared slot meant a candidate
-    // viewing in Hebrew right after another viewed in English would silently discard and
-    // regenerate over the previous language's cached copy every time. Prepared proactively for all
-    // three languages at import time (see ExternalJobService#prepareJobContent); a job imported
-    // before this existed, or whose import-time generation failed, still falls back to lazy
-    // per-language generation on first request (see ExternalJobService#getOrGenerateAboutSummary),
-    // it just won't have already been ready in advance.
     @Column(columnDefinition = "TEXT")
     private String aboutSummaryEn;
 
@@ -60,26 +38,12 @@ public class ExternalJob {
     @Column(columnDefinition = "TEXT")
     private String aboutSummaryHe;
 
-    // Populated for every job proactively at import time (see
-    // ExternalJobService#prepareJobContent) since no provider currently supplies a separate
-    // structured requirements/skills field of its own (see JobicyJobProvider#resolveDescription) -
-    // extracted from the raw description via AI and persisted here permanently so every match
-    // computation (any candidate, any code path) reads real structured text instead of "N/A". A
-    // job imported before this existed, or whose import-time extraction failed, still falls back
-    // to a lazy backfill the first time its match detail is requested (see
-    // ExternalJobService#ensureRequirementsAndSkills). TEXT (not the JPA default VARCHAR(255))
-    // since that default silently caps out far below what a real requirements paragraph needs -
-    // description already had to make the same change for the same reason.
     @Column(columnDefinition = "TEXT")
     private String requirements;
 
     @Column(columnDefinition = "TEXT")
     private String skills;
 
-    // One of frontend/src/utils/jobInference.ts's INDUSTRY_KEYS, resolved by the provider from
-    // its own category/occupation data at import time (see ExternalJobData.industry) - null
-    // when the provider gave no such signal, in which case the frontend falls back to
-    // title-based classification instead of guessing from this field.
     private String industry;
 
     private String sourceName;
@@ -90,16 +54,8 @@ public class ExternalJob {
 
     private LocalDateTime importedAt;
 
-    // The provider's own posted/updated date for this listing (see ExternalDateParser) - null
-    // when the provider didn't supply one or it didn't parse. Distinct from importedAt (this
-    // app's own "when did WE last confirm it's still live" timestamp) - this is what the
-    // frontend shows as the job's publication date.
     private LocalDateTime publishedAt;
 
-    // Cached OpenAI embedding of this job's title+description, computed once at import time (see
-    // ExternalJobService) - backs the deterministic, keyword-free pre-filter in JobMatchService
-    // that decides whether a job is even worth an AI classification call, by cosine similarity
-    // against the candidate's own profile embedding (CVAnalysis#profileEmbedding).
     @Column(name = "content_embedding", columnDefinition = "TEXT")
     private String contentEmbedding;
 

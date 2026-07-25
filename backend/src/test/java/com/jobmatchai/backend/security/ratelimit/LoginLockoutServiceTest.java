@@ -45,7 +45,6 @@ class LoginLockoutServiceTest {
             assertThat(loginLockoutService.check("key-d").lockedOut()).isFalse();
         }
 
-        // Peeking 20 times must not itself have registered any failures.
         for (int i = 0; i < MAX_ATTEMPTS - 1; i++) {
             loginLockoutService.recordFailure("key-d", MAX_ATTEMPTS, LOCKOUT);
         }
@@ -69,8 +68,6 @@ class LoginLockoutServiceTest {
         }
         loginLockoutService.recordSuccess("key-g");
 
-        // A fresh set of MAX_ATTEMPTS failures should be required again - the single failure
-        // right after the reset must not be treated as failure number MAX_ATTEMPTS.
         loginLockoutService.recordFailure("key-g", MAX_ATTEMPTS, LOCKOUT);
 
         assertThat(loginLockoutService.check("key-g").lockedOut()).isFalse();
@@ -87,8 +84,6 @@ class LoginLockoutServiceTest {
         Thread.sleep(100);
         assertThat(loginLockoutService.check("key-h").lockedOut()).isFalse();
 
-        // A single failure right after expiry must not immediately re-lock - it's failure #1 of
-        // a fresh count, not #(MAX_ATTEMPTS+1) of the old one.
         loginLockoutService.recordFailure("key-h", MAX_ATTEMPTS, shortLockout);
         assertThat(loginLockoutService.check("key-h").lockedOut()).isFalse();
     }

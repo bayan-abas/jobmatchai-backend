@@ -19,10 +19,6 @@ public class CVTextExtractorService {
 
     private final Tika tika = new Tika();
 
-    // Sniffs the actual file format from its content (magic bytes / container structure), not
-    // from any filename - deliberately does NOT pass a filename hint to Tika, since a hint would
-    // let a mismatched-but-plausible extension influence detection for ambiguous content,
-    // defeating the point of checking real content instead of the claimed extension.
     public String detectContentType(InputStream inputStream) throws IOException {
         return tika.detect(inputStream);
     }
@@ -38,21 +34,11 @@ public class CVTextExtractorService {
     private static final Pattern YEAR_PATTERN = Pattern.compile("\\b(19|20)\\d{2}\\b");
     private static final Pattern NUMBER_ONLY_PATTERN = Pattern.compile("(?m)^\\s*\\d+(\\.\\d+)?\\s*$");
 
+    // מחלץ טקסט מקובץ קורות החיים שהמשתמש העלה (PDF/DOCX/DOC וכו') ובוחר בין חילוץ Tika לחילוץ HTML מוטמע לפי מי שהצליח יותר
     public String extractText(File file) {
         try {
             String tikaText = cleanExtractedText(tika.parseToString(file));
 
-            // The raw-bytes-as-UTF-16LE rescue below only makes sense for Word-family binary
-            // formats, where Word can store paragraph text as UTF-16LE runs recoverable even when
-            // the container itself parses badly - it was never meaningful for PDF, whose binary
-            // structure decoded as UTF-16LE is essentially never blank (mostly replacement
-            // characters and stray symbols), yet isBetterExtraction() below unconditionally
-            // prefers ANY non-blank candidate over a blank current result. Applying it to every
-            // file type meant a PDF that genuinely has no extractable text (scanned/image-only, or
-            // fonts with no Unicode mapping) had its correctly-blank result silently replaced with
-            // meaningless byte-soup, which then passed CVController's isBlank() check and got sent
-            // to the AI CV-classifier as if it were real content - masking the true "no readable
-            // text" condition behind a confusing "not a CV" rejection instead.
             String tikaTextForLogging = tikaText;
             String extractedText = tikaText;
             if (isWordDocument(file)) {
@@ -88,8 +74,10 @@ public class CVTextExtractorService {
         return singleLine.length() > 150 ? singleLine.substring(0, 150) + "..." : singleLine;
     }
 
+    // שיטת חילוץ חלופית לקבצי Word: קוראת את הקובץ כ-UTF-16LE גולמי כדי לתפוס טקסט מוטמע ש-Tika לפעמים מפספס
     private String extractEmbeddedWordHtml(File file) {
         try {
+            // ל-Tika יש בעיה לפעמים עם doc/docx ישנים - קריאה גולמית כ-UTF-16LE תופסת את ה-HTML המוטמע שהוא מפספס
             byte[] bytes = Files.readAllBytes(file.toPath());
             String utf16Text = new String(bytes, java.nio.charset.StandardCharsets.UTF_16LE);
             return cleanExtractedText(utf16Text);
@@ -98,6 +86,7 @@ public class CVTextExtractorService {
         }
     }
 
+    // מנקה את הטקסט שחולץ: מסיר תגי HTML/CSS שנשארו מהמרה, ומצמצם רווחים ושורות ריקות מיותרות
     private String cleanExtractedText(String text) {
         if (text == null || text.isBlank()) {
             return "";
@@ -117,7 +106,7 @@ public class CVTextExtractorService {
         cleaned = CSS_LIKE_PATTERN.matcher(cleaned).replaceAll(" ");
         cleaned = WHITESPACE_PATTERN.matcher(cleaned).replaceAll(" ");
         cleaned = NEWLINE_PATTERN.matcher(cleaned).replaceAll("\n\n");
-        
+
         return cleaned.trim();
     }
 
@@ -131,6 +120,7 @@ public class CVTextExtractorService {
                 || lower.contains("mso-");
     }
 
+    // משווה בין שתי גרסאות חילוץ טקסט ומחליט אם הגרסה החלופית (candidate) עדיפה משמעותית על זו של Tika
     private boolean isBetterExtraction(String candidate, String current) {
         if (candidate == null || candidate.isBlank()) {
             return false;
@@ -142,14 +132,17 @@ public class CVTextExtractorService {
         int candidateScore = extractionQualityScore(candidate);
         int currentScore = extractionQualityScore(current);
 
+        // מרווח של 20 כדי לא להחליף את הטקסט מ-Tika בגלל הבדל שולי - רק אם השיטה השנייה ממש עדיפה
         return candidateScore > currentScore + 20;
     }
 
+    // מחשב ציון איכות לטקסט שחולץ - מוסיף נקודות על אותיות/מילות מפתח של קו"ח ומוריד נקודות על שאריות HTML/CSS
     private int extractionQualityScore(String text) {
         String lower = text.toLowerCase();
         int score = 0;
 
         score += Math.min(countMatches(text, LETTERS_PATTERN), 300);
+        // בדיקת מילות מפתח נפוצות בקוח בעברית - סימן חזק שהחילוץ הצליח
         score += countContains(lower, "\u05e7\u05d5\u05e8\u05d5\u05ea", "\u05d7\u05d9\u05d9\u05dd", "\u05e0\u05d9\u05e1\u05d9\u05d5\u05df", "\u05ea\u05e2\u05e1\u05d5\u05e7\u05ea\u05d9", "\u05d4\u05e9\u05db\u05dc\u05d4", "\u05de\u05e0\u05d4\u05dc", "\u05e2\u05d1\u05d5\u05d3\u05d4", "\u05d1\u05e0\u05d9\u05d9\u05df") * 25;
         score += countContains(lower, "resume", "experience", "education", "skills", "work", "employment") * 20;
         score += countMatches(text, YEAR_PATTERN) * 8;

@@ -23,12 +23,14 @@ public class NotificationController {
         return "Notifications API is working";
     }
 
+    // מחזיר את כל ההתראות של המשתמש המחובר
     @GetMapping
     public ResponseEntity<List<Notification>> getNotifications(Authentication authentication) {
         List<Notification> notifications = notificationService.getNotifications(authentication.getName());
         return ResponseEntity.ok(notifications);
     }
 
+    // מחזיר את מספר ההתראות שטרם נקראו, לתצוגת התג באייקון ההתראות
     @GetMapping("/unread-count")
     public ResponseEntity<Map<String, Object>> getUnreadCount(Authentication authentication) {
         long count = notificationService.getUnreadCount(authentication.getName());
@@ -37,6 +39,7 @@ public class NotificationController {
         return ResponseEntity.ok(response);
     }
 
+    // מסמן התראה בודדת כנקראה
     @PostMapping("/{id}/read")
     public ResponseEntity<Map<String, Object>> markAsRead(@PathVariable Long id, Authentication authentication) {
         Notification updated = notificationService.markAsRead(id, authentication.getName());
@@ -54,6 +57,7 @@ public class NotificationController {
         return ResponseEntity.ok(response);
     }
 
+    // מסמן את כל ההתראות של המשתמש המחובר כנקראו בבת אחת
     @PostMapping("/mark-all-read")
     public ResponseEntity<Map<String, Object>> markAllAsRead(Authentication authentication) {
         int updated = notificationService.markAllAsRead(authentication.getName());
@@ -63,6 +67,7 @@ public class NotificationController {
         return ResponseEntity.ok(response);
     }
 
+    // מוחק התראה מרשימת ההתראות של המשתמש
     @DeleteMapping("/{id}")
     public ResponseEntity<Map<String, Object>> deleteNotification(@PathVariable Long id, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();

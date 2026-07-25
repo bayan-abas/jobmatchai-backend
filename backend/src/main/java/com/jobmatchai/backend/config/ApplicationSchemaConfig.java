@@ -10,21 +10,6 @@ import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.SQLException;
 
-/**
- * Fixes a specific historical schema mismatch on Postgres, same shape as SavedJobSchemaConfig's
- * saved_at fix: applications.pre_interview_answers_json was created as an "oid" column (a
- * Postgres large-object reference) because the entity used to map it with @Lob, before that was
- * corrected to @Column(columnDefinition = "TEXT") - the same fix contactMessage/rejectionReason
- * already had. Any row written under the old mapping has real content sitting in pg_largeobject,
- * addressable only via lo_get(oid); a bare "ALTER COLUMN ... TYPE text" would just stringify the
- * numeric oid itself and silently discard the actual answers. This reads that large-object
- * content back out explicitly before switching the column to plain TEXT, so existing
- * pre-interview answers survive the migration instead of being lost.
- *
- * Inspects the column's actual current type first (via information_schema) and only migrates if
- * it isn't already text - a no-op on every subsequent startup once fixed, and a no-op entirely on
- * non-Postgres datasources (e.g. local H2 dev).
- */
 @Component
 public class ApplicationSchemaConfig {
 
@@ -45,8 +30,7 @@ public class ApplicationSchemaConfig {
         String currentType = currentColumnType();
 
         if (currentType == null) {
-            // Column/table doesn't exist yet (fresh database) - Hibernate creates it with the
-            // correct type on its own; nothing to migrate.
+
             return;
         }
 
@@ -58,8 +42,6 @@ public class ApplicationSchemaConfig {
         log.info("Migrating applications.pre_interview_answers_json from oid (large object) to TEXT, "
                 + "preserving existing large-object content.");
 
-        // 1) Pull the real text out of pg_largeobject via lo_get BEFORE the column that
-        //    references those oids is touched, into a new plain-text column.
         jdbcTemplate.execute(
                 "ALTER TABLE applications ADD COLUMN IF NOT EXISTS pre_interview_answers_json_migrated TEXT");
         jdbcTemplate.execute("""
@@ -68,17 +50,13 @@ public class ApplicationSchemaConfig {
                 WHERE pre_interview_answers_json IS NOT NULL
                 """);
 
-        // 2) Release the now-migrated large objects so they don't leak in pg_largeobject once
-        //    the oid column referencing them is dropped.
+        // lo_unlink כדי לא להשאיר large objects יתומים ב-pg_largeobject אחרי המעבר לטקסט רגיל
         jdbcTemplate.execute("""
                 SELECT lo_unlink(pre_interview_answers_json)
                 FROM applications
                 WHERE pre_interview_answers_json IS NOT NULL
                 """);
 
-        // 3) Drop the old oid column and rename the migrated one into its place, so the entity's
-        //    existing column name (pre_interview_answers_json, now TEXT per @Column above) still
-        //    matches with no Java-side change needed beyond the annotation already fixed.
         jdbcTemplate.execute("ALTER TABLE applications DROP COLUMN pre_interview_answers_json");
         jdbcTemplate.execute(
                 "ALTER TABLE applications RENAME COLUMN pre_interview_answers_json_migrated TO pre_interview_answers_json");

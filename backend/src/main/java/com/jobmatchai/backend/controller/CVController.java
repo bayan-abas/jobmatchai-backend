@@ -91,13 +91,6 @@ public class CVController {
     @Autowired
     private FileStorageService fileStorageService;
 
-    // Bump this whenever the analyzeCV prompt changes materially (mirrors JobMatchService's
-    // MATCH_SCHEMA_VERSION pattern) - keeps a prompt improvement from being silently masked by
-    // stale cached results for CV content that was already analyzed under the old prompt.
-    // v3 added the structured evidence fields (professionTitle, educationEvidence,
-    // certificationsEvidence, licensesEvidence, yearsOfExperience, technicalSkills, softSkills,
-    // languages, previousJobTitles) the job matcher now relies on instead of free-text prose -
-    // any CV analyzed under v2 has all of those as null/blank, so it must be recomputed.
     private static final String ANALYSIS_PROMPT_VERSION = "v3-structured-evidence";
 
     @Value("${app.cv.upload.max-size-bytes:10485760}")
@@ -118,16 +111,10 @@ public class CVController {
         };
     }
 
-    // JSON (not a bare String, which Spring serializes as text/plain) so the frontend's
-    // apiFetch can actually read "message" out of the error body and show it to the user,
-    // instead of falling back to a generic "Request failed with status 400".
     private ResponseEntity<Map<String, Object>> badRequest(String message) {
         return ResponseEntity.badRequest().body(Map.of("success", false, "message", message));
     }
 
-    // Diagnostic-only: a short, single-line snippet of the extracted CV text for the log line
-    // right before validation, per the ask to be able to see what extraction actually produced
-    // (or didn't) without dumping an entire candidate's CV into the logs.
     private static String previewOf(String text) {
         if (text == null || text.isBlank()) {
             return "";
@@ -136,6 +123,7 @@ public class CVController {
         return singleLine.length() > 150 ? singleLine.substring(0, 150) + "..." : singleLine;
     }
 
+    // מעלה קובץ קורות חיים חדש, מוודא שהוא תקין ושמדובר באמת ב-CV, ושומר אותו במקום קבצי המשתמש
     @PostMapping("/upload")
     public ResponseEntity<?> uploadCV(
             @RequestParam("file") MultipartFile file,
@@ -160,8 +148,6 @@ public class CVController {
                         "שם קובץ לא תקין."));
             }
 
-            // Extension allowlist first (cheap, no I/O) - the actual content is verified below,
-            // this just rejects obviously-wrong files fast and with a targeted message.
             String extension = CvFileValidator.extensionOf(originalFileName);
 
             if (extension == null) {
@@ -186,9 +172,6 @@ public class CVController {
                         "הקובץ חורג מהגודל המרבי המותר של " + maxSizeMb + "MB."));
             }
 
-            // Verify the actual bytes, not just the claimed extension - a renamed executable or
-            // script has an allowed extension but the wrong detected content type, and is
-            // rejected either way. Runs before anything is written to disk.
             String detectedContentType;
             try (InputStream fileStream = file.getInputStream()) {
                 detectedContentType = cvTextExtractorService.detectContentType(fileStream);
@@ -206,32 +189,12 @@ public class CVController {
                         "תוכן הקובץ שהועלה אינו תואם למסמך PDF או DOCX תקין."));
             }
 
-            // Fully server-generated - none of the uploaded filename's content ends up in the
-            // storage key, so there's nothing in it left to sanitize or exploit (unusual
-            // encodings, excessive length, path-traversal tricks). The original name the user
-            // uploaded is preserved separately as originalCvFileName purely for display/download,
-            // exactly as before.
             String fileName = UUID.randomUUID() + "." + extension;
 
-            // Written to a LOCAL temp file first, regardless of app.storage.type - extraction
-            // (below) needs a real java.io.File either way, and validating against a temp file
-            // before ever calling fileStorageService.store() means a rejected upload never
-            // touches the configured storage backend at all (local disk or S3), not even
-            // momentarily. The temp file is always cleaned up in the finally block, whether the
-            // upload is accepted or rejected.
             File tempFile = File.createTempFile("cv-upload-", "." + extension);
             try {
                 file.transferTo(tempFile);
 
-                // Three genuinely distinct failure modes below, each surfaced with its own
-                // message instead of one generic "unreadable" catch-all - a file that opens fine
-                // for the user but has no real text layer (scanned/image-only) looks nothing like
-                // an actually corrupted/unparseable file, and both look nothing like a document
-                // that DID extract real text but isn't a CV. Conflating them previously meant a
-                // valid, non-corrupted PDF that simply had no extractable text (or - before the
-                // CVTextExtractorService fix above - got contaminated with binary byte-soup that
-                // passed the blank check and confused the AI classifier) was reported to the user
-                // as if the file itself were broken.
                 String extractedText;
                 try {
                     extractedText = cvTextExtractorService.extractText(tempFile);
@@ -278,8 +241,6 @@ public class CVController {
                 tempFile.delete();
             }
 
-            // Drop the previous CV file now that the new one is validated and stored - otherwise
-            // every re-upload leaves the old one behind forever.
             String previousFileName = user.getCvFileName();
             if (previousFileName != null && !previousFileName.isBlank() && !previousFileName.equals(fileName)) {
                 fileStorageService.delete(previousFileName);
@@ -298,10 +259,7 @@ public class CVController {
         }
     }
 
-    // Transactional so the user-record update and the CVAnalysis delete either both
-    // commit or both roll back - otherwise a failure between the two could clear
-    // cvFileName while leaving a stale CVAnalysis row behind, letting match scores
-    // keep showing for a candidate who believes they have no CV on file.
+    // מוחק את קובץ קורות החיים של המשתמש וכל נתוני ההתאמה שהתבססו עליו
     @Transactional
     @DeleteMapping("/delete")
     public ResponseEntity<?> deleteCV(Authentication authentication) {
@@ -326,11 +284,6 @@ public class CVController {
             cvAnalysisRepository.findByUserEmail(email)
                     .ifPresent(cvAnalysisRepository::delete);
 
-            // No CV left means every cached match score/pending computation for this candidate
-            // is now meaningless (getMatchScores/computeMatchScoresStreaming both refuse to show
-            // a score without a CVAnalysis on file anyway) - clearing them here, rather than
-            // leaving them as invisible orphans, is what actually frees the DB space and keeps a
-            // subsequent re-upload from having any stale state to collide with.
             jobMatchScoreRepository.deleteByCandidateEmail(email);
             jobMatchNarrativeRepository.deleteByCandidateEmail(email);
             matchScoreJobRepository.deleteByCandidateEmail(email);
@@ -339,10 +292,7 @@ public class CVController {
 
         } catch (Exception e) {
             log.error("Failed to delete CV", e);
-            // @Transactional only auto-rolls-back on an exception that propagates OUT of the
-            // method - this catch block returns a normal error response instead of rethrowing, so
-            // without this, a failure partway through (e.g. the match-score cleanup throwing)
-            // would still COMMIT whatever had already happened (e.g. the file delete/user update).
+
             TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
             return ResponseEntity.internalServerError()
                     .body("Failed to delete CV. Please try again.");
@@ -365,8 +315,6 @@ public class CVController {
         return ResponseEntity.ok(user.getCvFileName());
     }
 
-    // Storage key (for building the download URL) and the original upload name
-    // (for display) together, since /current alone only ever exposed the storage key.
     @GetMapping("/current-info")
     public ResponseEntity<?> getCurrentCVInfo(Authentication authentication) {
         String email = authentication.getName();
@@ -389,15 +337,12 @@ public class CVController {
                 "originalFileName", originalFileName != null && !originalFileName.isBlank() ? originalFileName : fileName));
     }
 
+    // מאפשר למשתמש להוריד את קובץ קורות החיים שלו עצמו בלבד
     @GetMapping("/download/{fileName}")
     public ResponseEntity<?> downloadCV(@PathVariable String fileName, Authentication authentication) {
 
         try {
-            // This only ever needs to serve the requesting candidate's own CV (no other
-            // part of the app - company or otherwise - links to this endpoint), so require
-            // the file to actually belong to them. Without this, any authenticated user
-            // could download any other candidate's CV just by guessing/enumerating the
-            // "{timestamp}_{name}" storage filename.
+
             User owner = userRepository.findByEmail(authentication.getName());
             if (owner == null || !fileName.equals(owner.getCvFileName())) {
                 return ResponseEntity.status(403).body("You do not have access to this file");
@@ -412,10 +357,7 @@ public class CVController {
         }
     }
 
-    // Company-side equivalent of downloadCV above - scoped by applicationId (never a raw
-    // filename, so there's no filename to guess/enumerate) and ownership-checked the same way
-    // every other company endpoint in this app checks an application: the requester must be the
-    // company that owns the job the application was submitted to.
+    // מאפשר לחברה להוריד את קורות החיים של מועמד שהגיש בקשה לאחת ממשרותיה
     @GetMapping("/company-download/{applicationId}")
     @PreAuthorize("hasRole('COMPANY')")
     public ResponseEntity<?> downloadCandidateResume(@PathVariable Long applicationId, Authentication authentication) {
@@ -448,10 +390,6 @@ public class CVController {
         }
     }
 
-    // Shared by downloadCV (candidate downloading their own resume) and
-    // downloadCandidateResume (company downloading an applicant's resume) - both already
-    // verify the caller is entitled to fileName before calling this; it only resolves the
-    // path safely and picks the right content type/display name.
     private ResponseEntity<?> serveCvFile(String fileName, String originalFileName) throws Exception {
         if (!fileStorageService.exists(fileName)) {
             return ResponseEntity.notFound().build();
@@ -460,8 +398,6 @@ public class CVController {
         Resource resource = fileStorageService.loadAsResource(fileName);
         String lowerFileName = fileName.toLowerCase();
 
-        // Prefer the name actually uploaded over the generated storage key, so the browser's
-        // save dialog and inline viewer both show the real file name instead of a generic one.
         String displayFilename = originalFileName != null && !originalFileName.isBlank()
                 ? originalFileName
                 : fileName;
@@ -485,6 +421,7 @@ public class CVController {
                 .body(resource);
     }
 
+    // מחלץ ומחזיר את הטקסט הגולמי מתוך קובץ קורות החיים השמור של המשתמש
     @GetMapping({"/extract", "/extract-text"})
     public ResponseEntity<?> extractCVText(Authentication authentication) {
         String email = authentication.getName();
@@ -523,8 +460,7 @@ public class CVController {
         }
     }
 
-    // Transactional so saving the new analysis and discarding the now-stale match scores it
-    // invalidates either both commit or both roll back - see discardStaleMatchScores.
+    // מריץ ניתוח AI מלא על קורות החיים (עם קאש לפי hash של הטקסט) ושומר את התוצאה המובנית
     @Transactional
     @PostMapping({"/analyze", "/analyze/"})
     public ResponseEntity<?> analyzeCV(
@@ -556,9 +492,6 @@ public class CVController {
                 return ResponseEntity.badRequest().body("Could not extract text from this CV");
             }
 
-            // Fingerprint includes language so re-analyzing in a different language still
-            // regenerates wording, but re-running with the same CV + language is a no-op -
-            // this is what keeps the score stable instead of drifting across repeated calls.
             String cvTextHash = HashUtil.sha256(text + "|" + language);
 
             CVAnalysis analysis = cvAnalysisRepository
@@ -569,12 +502,7 @@ public class CVController {
                 return ResponseEntity.ok(analysis);
             }
 
-            // Durable, content-addressable cache that survives CV deletion (unlike the
-            // per-user CVAnalysis row above, which deleteCV removes entirely). The exact same
-            // file re-uploaded after a delete hashes to the exact same value, so a hit here
-            // gives byte-identical results instead of relying on the AI to reproduce the same
-            // output for the same input - which the OpenAI Responses API this app uses does
-            // not guarantee (it has no seed parameter, unlike the Chat Completions API).
+            // הקאש הוא לפי hash של הטקסט - שני משתמשים עם אותו CV בדיוק (או אותו משתמש שמעלה שוב) חוסכים קריאת AI
             Optional<CVAnalysisCache> cached = cvAnalysisCacheRepository
                     .findByCvTextHashAndLanguageAndPromptVersion(cvTextHash, language, ANALYSIS_PROMPT_VERSION);
 
@@ -611,12 +539,6 @@ public class CVController {
             String aiResult = openAICVAnalysisService.analyzeCV(text, language);
             JsonNode json = objectMapper.readTree(aiResult);
 
-            // analyzeCV() swallows OpenAI failures (timeout, rate limit, malformed response)
-            // internally and returns a normally-shaped JSON with overallScore left blank and
-            // the error message stuffed into "summary" - that's the only signal a failure
-            // happened. Treating it as a real result would cache a fake "0%" analysis under
-            // this CV's hash, and since the hash wouldn't change on retry, the user would be
-            // stuck seeing that fake failure forever instead of ever getting a real score.
             if (json.path("overallScore").asText("").isBlank()) {
                 String failureMessage = json.path("summary").asText("");
                 return ResponseEntity.internalServerError()
@@ -648,9 +570,6 @@ public class CVController {
             cvAnalysisRepository.save(analysis);
             discardStaleMatchScores(email);
 
-            // Store in the durable cache too, so the next analysis of this exact CV content -
-            // by this user after a delete/re-upload, or by anyone else who uploads
-            // byte-identical content - reuses this result instead of calling the AI again.
             CVAnalysisCache cacheEntry = new CVAnalysisCache();
             cacheEntry.setCvTextHash(cvTextHash);
             cacheEntry.setLanguage(language);
@@ -680,28 +599,14 @@ public class CVController {
 
         } catch (Exception e) {
             log.error("Failed to analyze CV for user={}", email, e);
-            // Same reasoning as deleteCV's catch block - this returns a normal error response
-            // rather than rethrowing, so @Transactional's automatic rollback never triggers on
-            // its own; without this, a failure after the analysis was already saved (e.g. in the
-            // CVAnalysisCache write) could commit a saved CVAnalysis while this response still
-            // reports failure.
+
             TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
             return ResponseEntity.internalServerError()
                     .body("Failed to analyze CV. Please try again.");
         }
     }
 
-    // Called once a candidate's CV content is CONFIRMED different from what was last analyzed
-    // (new upload, or the same account's CV replaced) and the new CVAnalysis is already safely
-    // saved - every JobMatchScore/MatchScoreJob/CandidateAiSummary row still on file at that
-    // point was computed against the OLD CV and is no longer valid. Deleting them outright
-    // (rather than leaving them for the existing cvFingerprint-mismatch check to quietly skip one
-    // row at a time) is what makes "upload a new CV -> every job/summary gets re-analyzed against
-    // it" an explicit, immediate guarantee instead of something that only happens incidentally as
-    // each one is next viewed. Also covers the two per-language narrative caches
-    // (JobMatchNarrative/CandidateAiSummaryNarrative) - without this they'd be orphaned rows that
-    // linger indefinitely (never read back once their parent score/summary row is gone, but never
-    // cleaned up either).
+    // מנקה ציוני התאמה ותקצירים ישנים כי הם התבססו על ה-CV הקודם ואינם רלוונטיים יותר
     private void discardStaleMatchScores(String email) {
         jobMatchScoreRepository.deleteByCandidateEmail(email);
         jobMatchNarrativeRepository.deleteByCandidateEmail(email);
@@ -710,6 +615,7 @@ public class CVController {
         candidateAiSummaryNarrativeRepository.deleteByCandidateEmail(email);
     }
 
+    // מחזיר את תוצאת ניתוח ה-AI האחרונה שנשמרה עבור קורות החיים של המשתמש
     @GetMapping("/analysis")
     public ResponseEntity<?> getCVAnalysis(Authentication authentication) {
         String email = authentication.getName();

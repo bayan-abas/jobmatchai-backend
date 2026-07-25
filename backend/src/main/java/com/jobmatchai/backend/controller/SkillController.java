@@ -20,6 +20,7 @@ public class SkillController {
 
     public record ExplainRequest(String skillName, String jobTitle, String language) {}
 
+    // מסביר למועמד באמצעות AI מה זה כישור מסוים ולמה הוא רלוונטי לתפקיד
     @PostMapping("/explain")
     public ResponseEntity<?> explainSkill(@RequestBody ExplainRequest request) {
         try {

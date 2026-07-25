@@ -10,17 +10,6 @@ import org.springframework.web.util.HtmlUtils;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * Fetches remote jobs from the Jobicy API (https://jobicy.com/apidocs) that are open to
- * candidates based in Israel. Jobicy resolves geo=israel server-side into jobs actually
- * eligible for Israel-based remote workers (returned under broader region tags like "EMEA"),
- * so no local eligibility guessing is needed here. No API key required - Jobicy's API is free
- * and public; their only requirement is crediting Jobicy with a link to the original job URL,
- * which ExternalJobCard already does via sourceName/applyUrl.
- *
- * This provider always searches geo=israel regardless of the requested country, since that is
- * its whole purpose - use JoobleJobProvider (or a future provider) for on-site Israel jobs.
- */
 @Component
 public class JobicyJobProvider implements ExternalJobProvider {
 
@@ -35,6 +24,7 @@ public class JobicyJobProvider implements ExternalJobProvider {
         return false;
     }
 
+    // מביא משרות remote מתוך ישראל מה-API של Jobicy (הספק הזה לא תומך בחיפוש לפי מילות מפתח)
     @Override
     public List<ExternalJobData> fetchJobs(String keywords, String country, int maxResults) {
         try {
@@ -60,6 +50,7 @@ public class JobicyJobProvider implements ExternalJobProvider {
         }
     }
 
+    // ממיר משרה בודדת מהפורמט של Jobicy למודל הפנימי ExternalJobData
     private ExternalJobData mapResult(JsonNode result) {
         String applyUrl = textOrNull(result, "url");
         String id = result.has("id") ? result.get("id").asText(null) : null;
@@ -84,33 +75,20 @@ public class JobicyJobProvider implements ExternalJobProvider {
         );
     }
 
-    // Jobicy's "jobExcerpt" is a short marketing teaser (a few hundred characters - "About
-    // Company X, we're solving..."), never the posting's actual requirements/duties. The API
-    // separately returns "jobDescription", the full posting as HTML (often 5,000-10,000+
-    // characters, containing the real "Requirements"/"What you'll do" sections) - found via
-    // live testing to be the actual reason almost every external job was scoring the same flat
-    // ~55%: with only the teaser text available, the AI had nothing concrete to extract
-    // required skills/experience/education from, so every component except field relevance came
-    // back null and the score collapsed to field-relevance-alone. Preferring jobDescription
-    // (stripped to plain text) here gives the matching AI the same real signal a human reading
-    // the posting would have. Falls back to jobExcerpt only if jobDescription is missing/blank.
+    // מנקה את תיאור המשרה מ-HTML וחותך אותו לאורך סביר, ונופל חזרה לתקציר אם אין תיאור מלא
     private String resolveDescription(JsonNode result) {
         String html = textOrNull(result, "jobDescription");
         String plainText = html == null ? null : htmlToPlainText(html);
 
         if (plainText != null && !plainText.isBlank()) {
-            // The column is now an unbounded TEXT (match scoring needs the COMPLETE posting,
-            // not a truncated excerpt - see ExternalJob#description) - this cap is a defensive
-            // ceiling against a pathologically huge response, not a normal-case truncation. Real
-            // Jobicy postings observed in testing top out well under this (~10,540 raw HTML,
-            // a few thousand plain-text characters after stripping), so it should essentially
-            // never actually trigger.
+
             return plainText.length() > 20_000 ? plainText.substring(0, 20_000) : plainText;
         }
 
         return textOrNull(result, "jobExcerpt");
     }
 
+    // הופך HTML לטקסט רגיל בעזרת regex פשוט - לא רוצים תלות בספריית parsing רק בשביל זה
     private String htmlToPlainText(String html) {
         String withBreaks = html.replaceAll("(?is)<(br|/p|/div|/li|/h[1-6])\\s*/?>", "\n");
         String stripped = withBreaks.replaceAll("(?s)<[^>]+>", " ");
@@ -118,17 +96,7 @@ public class JobicyJobProvider implements ExternalJobProvider {
         return unescaped.replaceAll("[ \\t]+", " ").replaceAll("\\n\\s*\\n+", "\n").trim();
     }
 
-    // Jobicy tags every listing with its own category slugs (its "jobIndustry" array - e.g.
-    // "dev", "marketing", "customer-service", "finance-legal") - a real, provider-supplied
-    // category, not a keyword guess, so it's used directly instead of falling back to
-    // title/description inference. Matched by substring against Jobicy's own (small, controlled)
-    // slug vocabulary rather than an exact-string dictionary, since the exact slug spelling can
-    // vary slightly (e.g. "customer-service" vs "customer_service") - substring matching is safe
-    // here specifically because the input is a short controlled tag, not free-text job prose.
-    // Deliberately conservative: a tag with no confident, unambiguous mapping (Jobicy's generic
-    // "business", "management", "all-others", "wellness" tags cut across multiple of our
-    // industries) is left unmapped so the job falls through to title-based classification
-    // instead of being guessed into the wrong bucket.
+    // ממפה את תגיות התעשייה החופשיות של Jobicy לקטגוריות התעשייה הקבועות של האפליקציה
     private String resolveIndustry(JsonNode industryTags) {
         if (industryTags == null || !industryTags.isArray()) {
             return null;
@@ -179,6 +147,7 @@ public class JobicyJobProvider implements ExternalJobProvider {
         return null;
     }
 
+    // מרכיב מחרוזת שכר קריאה מטווח min/max יחד עם המטבע
     private String formatSalary(JsonNode result) {
         double min = result.path("salaryMin").asDouble(0);
         double max = result.path("salaryMax").asDouble(0);
@@ -195,6 +164,7 @@ public class JobicyJobProvider implements ExternalJobProvider {
         return currency == null ? amount : amount + " " + currency;
     }
 
+    // הופך מערך JSON (כמו סוגי משרה) למחרוזת אחת מופרדת בפסיקים
     private String joinArray(JsonNode arrayNode) {
         if (arrayNode == null || !arrayNode.isArray() || arrayNode.isEmpty()) {
             return null;

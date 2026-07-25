@@ -27,13 +27,6 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-// Regression coverage for the critical job mass-assignment/IDOR fix: POST /api/jobs/add used to
-// bind the Job JPA entity directly to @RequestBody. Since Job.id has a public setter, a client
-// could supply "id" for an EXISTING job, and Spring Data JPA's save() treats a non-null id as an
-// update (merge) rather than an insert - letting any authenticated company hijack another
-// company's job posting (and, via companyEmail, everything gated on job ownership downstream:
-// applicant lists, resumes, messaging). addJob now binds a dedicated JobCreateRequest DTO with no
-// id/companyEmail component at all, and always builds a brand-new Job() before saving.
 @ExtendWith(MockitoExtension.class)
 class JobControllerTest {
 
@@ -45,11 +38,6 @@ class JobControllerTest {
 
     private JobController jobController;
 
-    // Mirrors Spring's actual @RequestBody deserialization behavior - Spring's
-    // Jackson2ObjectMapperBuilder disables FAIL_ON_UNKNOWN_PROPERTIES by default, unlike a bare
-    // `new ObjectMapper()` - so this test reflects what the real endpoint does with an
-    // unrecognized "id"/"companyEmail" field in the request JSON, not a stricter or looser
-    // behavior than production.
     private final ObjectMapper objectMapper = new ObjectMapper()
             .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
 
@@ -67,8 +55,6 @@ class JobControllerTest {
         job.setCompanyEmail(companyEmail);
         return job;
     }
-
-    // ---- addJob (POST /api/jobs/add) ----
 
     @Test
     void addJob_createsNewJob_withFieldsFromRequestAndOwnerFromAuthentication() {
@@ -102,10 +88,7 @@ class JobControllerTest {
 
     @Test
     void addJob_ignoresClientSuppliedId_evenWhenPresentInRawJson_soExistingJobIsNeverOverwritten() throws Exception {
-        // Simulates the exact attack this fix closes: a client POSTs a JSON body with "id" set to
-        // an EXISTING job's id, hoping save() will merge into (and take ownership of) that row.
-        // JobCreateRequest has no "id" component, so Jackson silently drops the unrecognized field
-        // during deserialization - there is nothing left in the DTO for the controller to act on.
+
         Job existingJob = existingJobOwnedBy(42L, "victim-company@example.com");
         when(authentication.getName()).thenReturn("attacker@evil.com");
         when(jobRepository.save(any(Job.class))).thenAnswer(invocation -> invocation.getArgument(0));
@@ -128,14 +111,10 @@ class JobControllerTest {
         verify(jobRepository).save(captor.capture());
 
         Job saved = captor.getValue();
-        // No id was ever set on the entity handed to save() - Spring Data JPA can only insert a
-        // brand-new row here, never merge into (and thereby hijack) job id=42.
+
         assertThat(saved.getId()).isNull();
         assertThat(saved.getTitle()).isEqualTo("Hijacked Posting");
 
-        // addJob never looks up an existing job by id at all - the pre-existing victim job
-        // (constructed here only as the thing that must remain untouched) is never passed to any
-        // repository method.
         verify(jobRepository, never()).findById(any());
         assertThat(existingJob.getCompanyEmail()).isEqualTo("victim-company@example.com");
         assertThat(existingJob.getTitle()).isEqualTo("Original Title");
@@ -163,8 +142,6 @@ class JobControllerTest {
 
         assertThat(captor.getValue().getCompanyEmail()).isEqualTo("real-owner@company.com");
     }
-
-    // ---- updateJob (PUT /api/jobs/{id}) - unchanged by this fix, still covered ----
 
     @Test
     void updateJob_updatesExistingJob_whenCallerOwnsIt() {
@@ -209,8 +186,6 @@ class JobControllerTest {
         verify(jobRepository, never()).save(any(Job.class));
     }
 
-    // ---- getAllJobs (GET /api/jobs/all) - candidate/public listing must exclude CLOSED jobs ----
-
     @Test
     void getAllJobs_returnsOnlyActiveJobs_neverAllJobsRegardlessOfStatus() {
         Job activeJob = existingJobOwnedBy(1L, "owner@company.com");
@@ -221,8 +196,6 @@ class JobControllerTest {
         assertThat(result).containsExactly(activeJob);
         verify(jobRepository, never()).findAll();
     }
-
-    // ---- updateJobStatus (PATCH /api/jobs/{id}/status) ----
 
     @Test
     void updateJobStatus_closesJob_whenCallerOwnsIt() {
@@ -253,7 +226,6 @@ class JobControllerTest {
         ResponseEntity<Map<String, Object>> response = jobController.updateJobStatus(
                 jobId, new JobController.JobStatusUpdateRequest("active"), authentication);
 
-        // Lowercase input accepted too - the endpoint normalizes before JobStatus.valueOf.
         assertThat(response.getStatusCode().is2xxSuccessful()).isTrue();
         assertThat(existingJob.getStatus()).isEqualTo(JobStatus.ACTIVE);
     }

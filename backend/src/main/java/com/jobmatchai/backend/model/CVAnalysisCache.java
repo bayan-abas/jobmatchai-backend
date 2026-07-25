@@ -2,13 +2,6 @@ package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
 
-// A content-addressable cache of CV analysis results, keyed by the exact text content that was
-// analyzed rather than by which user uploaded it. Re-analyzing byte-identical CV content (e.g.
-// after deleting and re-uploading the same file) reuses the stored result instead of calling the
-// AI again, which is what makes repeat analyses of the same CV perfectly consistent - the model
-// itself is not guaranteed to reproduce the same output for the same input, so this sidesteps
-// that instead of relying on it. promptVersion is included in the uniqueness key so that
-// improving the analysis prompt never gets masked by silently serving pre-fix cached results.
 @Entity
 @Table(name = "cv_analysis_cache", uniqueConstraints = {
         @UniqueConstraint(columnNames = {"cv_text_hash", "language", "prompt_version"})

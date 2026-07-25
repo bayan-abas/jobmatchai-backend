@@ -31,19 +31,6 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-// End-to-end regression coverage for the ACTIVE/CLOSED job lifecycle, chaining JobController and
-// ApplicationController exactly the way a real request sequence would - not one method in
-// isolation (see JobControllerTest/ApplicationControllerTest for that), but the full scenario this
-// feature exists for: a candidate sees and applies to an active job, the company closes it, and
-// every downstream view (candidate listing, the candidate's own applications, a second
-// candidate's apply attempt, the company's applicant list) reacts correctly - without the job or
-// its applications ever being deleted.
-//
-// JobRepository/ApplicationRepository are backed by real in-memory maps/lists (mirroring
-// JobMatchServiceTest's identical "seed via a mock, read back via a real backing store" approach)
-// rather than a full Spring context - this codebase's controller tests are all plain Mockito unit
-// tests with no @SpringBootTest/MockMvc anywhere, so this keeps that same convention while still
-// exercising the real save/find interactions between the two controllers sharing one dataset.
 @ExtendWith(MockitoExtension.class)
 class JobLifecycleFlowTest {
 
@@ -87,9 +74,6 @@ class JobLifecycleFlowTest {
         ReflectionTestUtils.setField(applicationController, "userRepository", userRepository);
         ReflectionTestUtils.setField(applicationController, "notificationService", notificationService);
 
-        // JobRepository, backed by jobStore - save() assigns an id on first insert then upserts
-        // by id; findById/findAllById/findByStatus all read the same live map, so a status change
-        // made through one controller is immediately visible through the other, same as a real DB.
         when(jobRepository.save(any(Job.class))).thenAnswer(invocation -> {
             Job job = invocation.getArgument(0);
             if (job.getId() == null) {
@@ -117,7 +101,6 @@ class JobLifecycleFlowTest {
             return result;
         });
 
-        // ApplicationRepository, backed by applicationStore.
         when(applicationRepository.save(any(Application.class))).thenAnswer(invocation -> {
             Application application = invocation.getArgument(0);
             ReflectionTestUtils.setField(application, "id", nextApplicationId++);
@@ -147,7 +130,6 @@ class JobLifecycleFlowTest {
         Authentication companyAuth = mock(Authentication.class);
         when(companyAuth.getName()).thenReturn("company@example.com");
 
-        // 1. Company posts a job - starts ACTIVE by default, candidate sees it in the listing.
         JobCreateRequest createRequest = new JobCreateRequest(
                 "Backend Engineer", "Acme Corp", "Remote", "Full-time",
                 "$100k", "Build things", "5 years Java", "Java,Spring",
@@ -160,7 +142,6 @@ class JobLifecycleFlowTest {
         List<Job> activeListing = jobController.getAllJobs();
         assertThat(activeListing).extracting(Job::getId).containsExactly(job.getId());
 
-        // 2. Candidate applies.
         Authentication candidateAuth = mock(Authentication.class);
         when(candidateAuth.getName()).thenReturn("candidate@example.com");
 
@@ -169,31 +150,24 @@ class JobLifecycleFlowTest {
         Map<String, Object> applyResponse = applicationController.applyToJob(applyRequest, candidateAuth);
         assertThat(applyResponse.get("success")).isEqualTo(true);
 
-        // 3. Company closes the job.
         ResponseEntity<Map<String, Object>> closeResponse = jobController.updateJobStatus(
                 job.getId(), new JobController.JobStatusUpdateRequest("CLOSED"), companyAuth);
         assertThat(closeResponse.getStatusCode().is2xxSuccessful()).isTrue();
         assertThat(job.getStatus()).isEqualTo(JobStatus.CLOSED);
 
-        // 4. The job disappears from the candidate/public listing for anyone who didn't apply.
         List<Job> listingAfterClose = jobController.getAllJobs();
         assertThat(listingAfterClose).isEmpty();
 
-        // 5. The existing applicant still sees their application, now marked Closed.
         List<Application> candidateApplications = applicationController.getApplicationsByCandidate(candidateAuth);
         assertThat(candidateApplications).hasSize(1);
         assertThat(candidateApplications.get(0).getJobStatus()).isEqualTo("CLOSED");
 
-        // 6. A new application attempt (from a different candidate, or a resubmission) is
-        // rejected by the backend, independent of anything the frontend does or shows.
         Authentication otherCandidateAuth = mock(Authentication.class);
         when(otherCandidateAuth.getName()).thenReturn("someone-else@example.com");
         Map<String, Object> secondApplyResponse = applicationController.applyToJob(applyRequest, otherCandidateAuth);
         assertThat(secondApplyResponse.get("success")).isEqualTo(false);
         assertThat(secondApplyResponse.get("message")).isEqualTo("This job is no longer accepting applications.");
 
-        // 7. The company can still view every existing applicant - the job/application were
-        // never deleted, only the job's own status changed.
         ResponseEntity<?> applicantsResponse = jobController.getApplicationsForJob(job.getId(), companyAuth);
         assertThat(applicantsResponse.getStatusCode().is2xxSuccessful()).isTrue();
         @SuppressWarnings("unchecked")

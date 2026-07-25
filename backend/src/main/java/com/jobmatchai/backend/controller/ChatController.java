@@ -27,6 +27,7 @@ public class ChatController {
 
     public record ChatRequest(String message, List<ChatMessage> history, String language) {}
 
+    // מנהל שיחת צ'אט עם ה-AI: בונה קונטקסט אישי למשתמש ומחזיר תשובה לפי ההיסטוריה שנשלחה
     @PostMapping
     public ResponseEntity<?> chat(@RequestBody ChatRequest request, Authentication authentication) {
         String message = request.message() == null ? "" : request.message().trim();

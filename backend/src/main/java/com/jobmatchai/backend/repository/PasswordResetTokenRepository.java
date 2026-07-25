@@ -10,8 +10,6 @@ public interface PasswordResetTokenRepository extends JpaRepository<PasswordRese
     Optional<PasswordResetToken> findByToken(String token);
     void deleteByEmail(String email);
 
-    // Used-up or expired tokens have zero ongoing value - without this they'd otherwise sit
-    // in this table forever, since the only other thing that ever removes a row is the whole
-    // account being deleted.
+    // ניקוי תקופתי של טוקנים שכבר נוצלו או שפג תוקפם
     int deleteByUsedTrueOrExpiresAtBefore(LocalDateTime cutoff);
 }

@@ -2,13 +2,6 @@ package com.jobmatchai.backend.model;
 
 import jakarta.persistence.*;
 
-// Per-language cache of CandidateAiSummary's narrative text (professionalBackground, strengths,
-// weaknesses, overallSuitability). CandidateAiSummary itself holds the deterministic matchScore
-// plus facts (keySkills, yearsOfExperience) and the "canonical" narrative in whatever language
-// first generated it - this table holds a translated (or natively-generated) copy per requested
-// language, so a UI language switch never has to re-call the scoring AI (which could legitimately
-// return a different matchScore on a fresh call) just to get text in a different language. See
-// CandidateSummaryService#getCandidateSummary for the read/write logic.
 @Entity
 @Table(name = "candidate_ai_summary_narratives", uniqueConstraints = {
         @UniqueConstraint(columnNames = {"candidate_email", "job_id", "language"})
@@ -40,9 +33,6 @@ public class CandidateAiSummaryNarrative {
     @Column(name = "overall_suitability", columnDefinition = "TEXT")
     private String overallSuitability;
 
-    // Must match the parent CandidateAiSummary's cvFingerprint/jobFingerprint at read time for
-    // this row to be considered fresh - otherwise the underlying CV/job content has changed since
-    // this language was translated and it must be regenerated.
     @Column(name = "cv_fingerprint")
     private String cvFingerprint;
 

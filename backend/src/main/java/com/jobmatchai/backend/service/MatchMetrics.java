@@ -11,13 +11,6 @@ import org.springframework.stereotype.Component;
 
 import java.util.concurrent.TimeUnit;
 
-// One place every match-scoring metric is recorded, exposed at /actuator/metrics (and
-// /actuator/prometheus if that export is enabled) without any external monitoring service - real
-// production observability for queue depth, cache-hit rate, OpenAI call volume/latency, and DB
-// query latency, all requested explicitly: "Add monitoring for queue size, processing time,
-// cache-hit rate, OpenAI calls, database latency, failures, and cost." Cost itself isn't metered
-// directly (OpenAI doesn't return a per-call price), but openai.calls's count by model is exactly
-// the input a cost estimate is built from (multiply by that model's published per-call price).
 @Component
 public class MatchMetrics {
 
@@ -27,6 +20,7 @@ public class MatchMetrics {
     @Autowired
     private MatchScoreJobRepository matchScoreJobRepository;
 
+    // סופר כמה בקשות ציון קיבלו תשובה מהמטמון (לפי fingerprint) בלי לקרוא ל-AI מחדש
     public void recordCacheHit(String kind) {
         Counter.builder("matchscore.cache.result")
                 .tag("kind", kind)
@@ -36,6 +30,7 @@ public class MatchMetrics {
                 .increment();
     }
 
+    // סופר כמה בקשות ציון לא נמצאו במטמון וחייבו חישוב מחדש
     public void recordCacheMiss(String kind) {
         Counter.builder("matchscore.cache.result")
                 .tag("kind", kind)
@@ -45,6 +40,7 @@ public class MatchMetrics {
                 .increment();
     }
 
+    // סופר משרות שנפסלו לפני קריאה ל-AI כי אין מספיק מידע לחשב עליהן ציון
     public void recordInsufficientData() {
         Counter.builder("matchscore.insufficient_data")
                 .description("Jobs classified as too thin to score - deterministic gate, zero OpenAI spend")
@@ -52,6 +48,7 @@ public class MatchMetrics {
                 .increment();
     }
 
+    // סופר משרות שנפסלו לפני קריאה ל-AI כי המקצוע לא תואם בכלל לפי טבלת ההתאמות
     public void recordProfessionIncompatible() {
         Counter.builder("matchscore.profession_incompatible")
                 .description("Jobs rejected by the profession-taxonomy compatibility gate before any AI call - "
@@ -60,6 +57,7 @@ public class MatchMetrics {
                 .increment();
     }
 
+    // מודד זמן וכשל/הצלחה לכל קריאה בפועל ל-OpenAI
     public void recordOpenAiCall(String model, String outcome, long elapsedMs) {
         Timer.builder("openai.calls")
                 .tag("model", model)
@@ -69,6 +67,7 @@ public class MatchMetrics {
                 .record(elapsedMs, TimeUnit.MILLISECONDS);
     }
 
+    // מודד כמה זמן לוקחות קריאות DB של תהליך ההתאמה עצמו
     public void recordDbQuery(String operation, long elapsedMs) {
         Timer.builder("db.query")
                 .tag("operation", operation)
@@ -77,6 +76,7 @@ public class MatchMetrics {
                 .record(elapsedMs, TimeUnit.MILLISECONDS);
     }
 
+    // סופר כל job שנכנס לתור החישוב
     public void recordQueueJobEnqueued() {
         Counter.builder("matchscore.queue.enqueued")
                 .description("Jobs added to the persistent match-score queue")
@@ -84,6 +84,7 @@ public class MatchMetrics {
                 .increment();
     }
 
+    // מודד כמה זמן לקח ל-worker לעבד job אחד מהתור ובאיזו תוצאה (הצלחה/כישלון/וכו')
     public void recordQueueJobProcessed(String outcome, long elapsedMs) {
         Timer.builder("matchscore.queue.processed")
                 .tag("outcome", outcome)
@@ -92,10 +93,7 @@ public class MatchMetrics {
                 .record(elapsedMs, TimeUnit.MILLISECONDS);
     }
 
-    // Registered once at startup as a live gauge (re-queried on every scrape) rather than pushed
-    // on every enqueue/dequeue - "how many jobs are waiting right now" is exactly the kind of
-    // number that's cheap to compute on demand and easy to get subtly wrong trying to maintain
-    // incrementally.
+    // רושם gauge שמראה כמה שורות יש כרגע בכל סטטוס בתור (pending/in_progress/failed) - לניטור אורך התור בזמן אמת
     @jakarta.annotation.PostConstruct
     public void registerQueueDepthGauge() {
         meterRegistry.gauge("matchscore.queue.depth", java.util.List.of(io.micrometer.core.instrument.Tag.of("status", "pending")),

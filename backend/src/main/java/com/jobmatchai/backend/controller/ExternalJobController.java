@@ -31,14 +31,6 @@ public class ExternalJobController {
     @Autowired
     private ExternalJobService externalJobService;
 
-    // There's no admin role in this app, and importJobs fans out to paid third-party APIs
-    // (Jooble/JSearch/Jobicy) plus OpenAI embedding calls for every changed job - reachable by
-    // ANY authenticated candidate or company account otherwise (the scheduled cron in
-    // ExternalJobService already covers the intended, unattended use). Gated behind a
-    // separately-configured secret rather than a user role so it stays operable for manual
-    // triggering (e.g. by whoever operates this deployment) without trusting the app's own
-    // candidate/company auth for an operation that costs real money. Closed by default - an
-    // unset INTERNAL_API_KEY means this endpoint always rejects, not "open to everyone."
     @Value("${app.internal-api-key:}")
     private String internalApiKey;
 
@@ -47,14 +39,8 @@ public class ExternalJobController {
                 && internalApiKey.equals(providedKey);
     }
 
-    // One virtual thread per open SSE connection - cheap, and matches the concurrency style
-    // JobMatchService already uses for its own internal per-job AI call parallelism.
     private final ExecutorService streamingExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
-    // Hard backstop if a client goes away mid-stream without cleanly aborting (dropped mobile
-    // connection, etc.) - independent of, and much larger than, the per-AI-call timeout
-    // configured on the OpenAI RestClient (see OpenAIRestClientConfig), which bounds each job's
-    // own call, not the whole multi-job stream.
     private static final long SSE_TIMEOUT_MS = 180_000L;
 
     public record ImportRequest(String keywords, String country) {}
@@ -68,11 +54,13 @@ public class ExternalJobController {
         return "External Jobs API is working";
     }
 
+    // מחזיר את כל המשרות שנאספו ממקורות חיצוניים להצגה יחד עם המשרות הפנימיות
     @GetMapping("/all")
     public List<ExternalJob> getAllExternalJobs() {
         return externalJobService.getAllExternalJobs();
     }
 
+    // מחזיר משרה חיצונית בודדת יחד עם תקציר "about" שנוצר או נשלף מהקאש
     @GetMapping("/{id}")
     public Map<String, Object> getExternalJobById(
             @PathVariable long id, @RequestParam(defaultValue = "en") String language) {
@@ -82,12 +70,7 @@ public class ExternalJobController {
                 .map(job -> {
                     response.put("success", true);
                     response.put("job", job);
-                    // Lazily generated/cached (see getOrGenerateAboutSummary) - a structured
-                    // AI summary of the full description for the frontend's "About this job"
-                    // section, never used for match scoring (that always reads job.description
-                    // directly, in full). Best-effort: a summary failure must never take down
-                    // the job-details page itself, since the raw description is still present
-                    // in `job` as a fallback.
+
                     try {
                         response.put("aboutSummary", externalJobService.getOrGenerateAboutSummary(id, language));
                     } catch (Exception e) {
@@ -102,6 +85,7 @@ public class ExternalJobController {
                 });
     }
 
+    // מייבא משרות חדשות ממקור חיצוני; פעולה פנימית המוגנת במפתח API ולא פתוחה למשתמשי הקצה
     @PostMapping("/import")
     public ResponseEntity<Map<String, Object>> importJobs(
             @RequestBody(required = false) ImportRequest request,
@@ -135,12 +119,7 @@ public class ExternalJobController {
         }
     }
 
-    // Manual catch-up for existing external jobs missing requirements/skills or any language's
-    // about-summary (e.g. imported before ExternalJobService#prepareJobContent existed, or whose
-    // import-time prep hit OpenAI rate limits) - see ExternalJobService#backfillMissingContent
-    // for why this is safe to call any number of times (every field is skipped if already
-    // populated). Gated the same way as /import since it also fans out to OpenAI for however many
-    // jobs are still missing content.
+    // משלים תוכן חסר במשרות חיצוניות קיימות; פעולת תחזוקה פנימית מוגנת במפתח API
     @PostMapping("/backfill-content")
     public ResponseEntity<Map<String, Object>> backfillContent(
             @RequestHeader(value = "X-Internal-Api-Key", required = false) String providedKey) {
@@ -169,10 +148,7 @@ public class ExternalJobController {
         }
     }
 
-    // Manual, one-time (re-runnable) cleanup for external jobs that were already duplicated in
-    // production before importFromProviders' title+company dedup was extended to cover full
-    // history - see ExternalJobService#removeDuplicateExternalJobs for the exact matching/removal
-    // logic. No AI calls, pure DB cleanup, so this is fast and cheap to call.
+    // מזהה ומוחק משרות חיצוניות כפולות; פעולת תחזוקה פנימית מוגנת במפתח API
     @PostMapping("/remove-duplicates")
     public ResponseEntity<Map<String, Object>> removeDuplicates(
             @RequestHeader(value = "X-Internal-Api-Key", required = false) String providedKey) {
@@ -200,9 +176,7 @@ public class ExternalJobController {
         }
     }
 
-    // Manual, one-time (re-runnable) cleanup for external_jobs.skills rows already persisted with
-    // unsanitized tokens (see ExternalJobService#sanitizeSkillsList) - written before that filter
-    // existed. No AI calls, pure string processing, so this is fast and cheap to call.
+    // מנקה מחדש את רשימות הכישורים של משרות חיצוניות קיימות; פעולת תחזוקה פנימית מוגנת במפתח API
     @PostMapping("/resanitize-skills")
     public ResponseEntity<Map<String, Object>> resanitizeSkills(
             @RequestHeader(value = "X-Internal-Api-Key", required = false) String providedKey) {
@@ -229,6 +203,7 @@ public class ExternalJobController {
         }
     }
 
+    // מחשב ציוני התאמה בין המועמד המחובר לרשימת משרות חיצוניות
     @PostMapping("/match-scores")
     public ResponseEntity<?> getMatchScores(@RequestBody ExternalMatchScoreRequest request, Authentication authentication) {
         try {
@@ -249,14 +224,7 @@ public class ExternalJobController {
         }
     }
 
-    // Progressive counterpart of /match-scores: opens immediately, emits one "score" event per
-    // job as soon as its result is known (cache hit, pre-filter skip, or AI verdict), then a
-    // final "done" event. Consumed via an authenticated fetch() + manual SSE-frame parsing on
-    // the frontend, NOT the native EventSource API - EventSource cannot send the Authorization
-    // header this app's JWT auth requires (the same class of bug already found and fixed once
-    // this session for the "View CV" button, which hit the identical limitation with
-    // window.open()). POST (not GET) is what lets the job-id list travel in the body instead of
-    // a query string, and mirrors the existing synchronous endpoint's contract - no new DTO.
+    // מחזיר סטרים (SSE) של ציוני התאמה למשרות חיצוניות שמתעדכן בזמן אמת
     @PostMapping(path = "/match-scores/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter streamMatchScores(@RequestBody ExternalMatchScoreRequest request, Authentication authentication) {
         SseEmitter emitter = new SseEmitter(SSE_TIMEOUT_MS);
@@ -287,9 +255,7 @@ public class ExternalJobController {
     }
 
     private void sendEvent(SseEmitter emitter, Object lock, String name, Object data) {
-        // SseEmitter.send is documented as not safe for concurrent calls from multiple threads -
-        // every job's own async completion callback sends independently, so this lock is load-
-        // bearing, not defensive-for-show.
+
         synchronized (lock) {
             try {
                 emitter.send(SseEmitter.event().name(name).data(data, MediaType.APPLICATION_JSON));
@@ -299,6 +265,7 @@ public class ExternalJobController {
         }
     }
 
+    // מחזיר ניתוח התאמה מפורט בין המועמד למשרה חיצונית ספציפית
     @PostMapping("/match-detail")
     public ResponseEntity<?> getMatchDetail(@RequestBody ExternalMatchDetailRequest request, Authentication authentication) {
         try {

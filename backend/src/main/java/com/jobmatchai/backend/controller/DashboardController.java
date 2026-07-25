@@ -32,6 +32,7 @@ public class DashboardController {
     @Autowired
     private NotificationRepository notificationRepository;
 
+    // מרכז נתוני סטטיסטיקה כלליים ואישיים למסך הדשבורד (סה"כ משרות, בקשות, התראות שלא נקראו)
     @GetMapping("/stats")
     public ResponseEntity<Map<String, Object>> getDashboardStats(Authentication authentication) {
         Map<String, Object> stats = new HashMap<>();

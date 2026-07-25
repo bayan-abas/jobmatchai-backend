@@ -11,10 +11,6 @@ import java.util.zip.ZipOutputStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-// Exercises CVTextExtractorService#detectContentType against a REAL Tika instance (no mocking) -
-// this is the actual security property the CV-upload hardening relies on: magic-byte/container
-// detection from real content, not the filename. See CvFileValidator and CVController#uploadCV,
-// which reject an upload whenever this doesn't match the claimed extension.
 class CVTextExtractorServiceTest {
 
     private final CVTextExtractorService cvTextExtractorService = new CVTextExtractorService();
@@ -39,9 +35,7 @@ class CVTextExtractorServiceTest {
 
     @Test
     void detectContentType_executableRenamedAsPdf_isNeverDetectedAsPdfOrDocx() throws IOException {
-        // The "MZ" signature (plus the rest of a minimal DOS/PE header) is what Windows
-        // executables actually start with - exactly the "renamed .exe" attack the audit finding
-        // is about. Real content bytes, not a mocked detector result.
+
         byte[] exeBytes = new byte[64];
         exeBytes[0] = 'M';
         exeBytes[1] = 'Z';
@@ -64,10 +58,6 @@ class CVTextExtractorServiceTest {
         assertThat(detected).isNotEqualTo("application/pdf");
     }
 
-    // Hand-builds a minimal-but-genuine OOXML Word document as a zip, entirely in memory - the
-    // same structural markers ([Content_Types].xml declaring the wordprocessingml part) real
-    // Word writes, which is what Tika's container detection actually keys off, not the .docx
-    // extension.
     private static byte[] minimalDocxBytes() throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         try (ZipOutputStream zos = new ZipOutputStream(baos)) {

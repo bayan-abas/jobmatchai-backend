@@ -13,9 +13,7 @@ class MatchScoreCalculatorTest {
 
     @Test
     void allComponentsPresent_usesFullWeighting() {
-        // 25% field(80) + 25% skills(60) + 20% experience(70) + 15% education(90) +
-        // 10% certification(50) + 5% location(100)
-        // = 20 + 15 + 14 + 13.5 + 5 + 5 = 72.5 -> rounds to 73 (Math.round on 72.5 == 73)
+
         WeightedResult result = MatchScoreCalculator.compute(List.of(
                 new Component(ComponentKey.FIELD_RELEVANCE, 80),
                 new Component(ComponentKey.REQUIRED_SKILLS, 60),
@@ -30,10 +28,7 @@ class MatchScoreCalculatorTest {
 
     @Test
     void missingComponents_areExcludedAndWeightIsRedistributed() {
-        // Only field relevance (25%) and skills (25%) applicable, both scored 80 -> the missing
-        // components' weight is proportionally redistributed, so overall is simply the average
-        // of the two applicable components (80), not 80 * 0.5 = 40 as it would be if a null
-        // score were incorrectly treated as a literal 0.
+
         WeightedResult result = MatchScoreCalculator.compute(List.of(
                 new Component(ComponentKey.FIELD_RELEVANCE, 80),
                 new Component(ComponentKey.REQUIRED_SKILLS, 80),
@@ -64,16 +59,13 @@ class MatchScoreCalculatorTest {
 
     @Test
     void skillsScore_missingPreferredCostsHalfOfMissingMandatory() {
-        // 1 mandatory matched, 1 mandatory missing, 2 preferred (both present) -> only the
-        // mandatory gap matters here.
+
         Integer mandatoryGapOnly = MatchScoreCalculator.computeSkillsScore(1, 1, 2, 0);
-        // weightedTotal = 2 (mandatory) + 1 (2*0.5 preferred) = 3, matched = 1 + 1 = 2 -> 66.67 -> 67
+
         assertThat(mandatoryGapOnly).isEqualTo(67);
 
-        // Same candidate but the gap is in a PREFERRED skill instead of a mandatory one should
-        // score HIGHER - a smaller penalty for optional/preferred requirements.
         Integer preferredGapOnly = MatchScoreCalculator.computeSkillsScore(2, 0, 0, 1);
-        // weightedTotal = 2 + 0.5 = 2.5, matched = 2 -> 80
+
         assertThat(preferredGapOnly).isEqualTo(80);
 
         assertThat(preferredGapOnly).isGreaterThan(mandatoryGapOnly);
@@ -94,14 +86,12 @@ class MatchScoreCalculatorTest {
         assertThat(result.overallPercent()).isBetween(0, 100);
     }
 
-    // ---- rule-table functions: same classification always produces the same number ----
-
     @Test
     void fieldRelevance_sameLabelAlwaysProducesSameNumber() {
         assertThat(MatchScoreCalculator.scoreFieldRelevance("same_role")).isEqualTo(95);
         assertThat(MatchScoreCalculator.scoreFieldRelevance("same_specialization")).isEqualTo(80);
         assertThat(MatchScoreCalculator.scoreFieldRelevance("same_broad_field")).isEqualTo(55);
-        assertThat(MatchScoreCalculator.scoreFieldRelevance("SAME_ROLE")).isEqualTo(95); // case-insensitive
+        assertThat(MatchScoreCalculator.scoreFieldRelevance("SAME_ROLE")).isEqualTo(95);
         assertThat(MatchScoreCalculator.scoreFieldRelevance("general_vocational_role")).isEqualTo(25);
     }
 
@@ -114,54 +104,40 @@ class MatchScoreCalculatorTest {
 
     @Test
     void experienceScore_shortfallCostsFixedPenaltyPerRank() {
-        // entry_level (rank 1) vs required senior (rank 3): shortfall 2 * 40 = 80 -> 20.
+
         assertThat(MatchScoreCalculator.scoreExperience("entry_level", "senior", true)).isEqualTo(20);
-        // none (rank 0) vs required entry (rank 1): shortfall 1 * 40 = 40 -> 60.
+
         assertThat(MatchScoreCalculator.scoreExperience("none", "entry", true)).isEqualTo(60);
-        // none (rank 0) vs required senior (rank 3): shortfall 3 * 40 = 120 -> clamped to 0.
+
         assertThat(MatchScoreCalculator.scoreExperience("none", "senior", true)).isEqualTo(0);
     }
 
     @Test
     void experienceScore_discountsOneRankWhenNotCandidatesOwnSpecificRole() {
-        // sameSpecificRole=false (only same_broad_field): senior_level experience is credited as
-        // mid_level - genuinely related experience still counts, but not at full seniority value
-        // for a field that isn't the candidate's own specific role.
+
         assertThat(MatchScoreCalculator.scoreExperience("senior_level", "senior", false)).isEqualTo(60);
         assertThat(MatchScoreCalculator.scoreExperience("senior_level", "mid", false)).isEqualTo(100);
-        // entry_level discounts to "none": a shortfall of 1 rank against a required entry level.
+
         assertThat(MatchScoreCalculator.scoreExperience("entry_level", "entry", false)).isEqualTo(60);
     }
 
-    // ---- amount-vs-type distinction: a posting can name a specific experience sub-domain (e.g.
-    // "Clinical Research") beyond just general seniority - see JobMatchService.ParsedMatch's
-    // requiredExperienceType/candidateHasRequiredExperienceType and this method's own comment ----
-
     @Test
     void experienceScore_seniorCandidateMissingSpecificType_isBlendedNotZeroedNorIgnored() {
-        // The exact scenario from the product request: a senior General Practitioner (10 years,
-        // senior_level, same_role) applying to a role that requires "2+ years" (mid) PLUS a named
-        // Clinical Research sub-domain the candidate's history doesn't show. Amount alone would
-        // score 100 (candidateRank senior >= required mid) - blending halves that to 50, which is
-        // neither "full credit, type gap ignored" (the old behavior) nor "as if they had no
-        // professional experience at all" (a bare mismatch would score near 0).
+
         assertThat(MatchScoreCalculator.scoreExperience(
                 "senior_level", "mid", true, true, false)).isEqualTo(50);
     }
 
     @Test
     void experienceScore_specificTypePresent_isFullCreditJustLikeAmountOnly() {
-        // candidateHasSpecificType=true means the candidate's history DOES evidence that exact
-        // sub-domain - scores identically to the plain amount-only case, no blending.
+
         assertThat(MatchScoreCalculator.scoreExperience(
                 "senior_level", "mid", true, true, true)).isEqualTo(100);
     }
 
     @Test
     void experienceScore_noSpecificTypeRequired_matchesThreeArgOverloadExactly() {
-        // requiresSpecificType=false must behave identically to the original 3-arg overload
-        // (which callers with no experience-type signal at all still use) - never a silent
-        // behavior change for postings that only ever asked for general seniority.
+
         assertThat(MatchScoreCalculator.scoreExperience("mid_level", "senior", true, false, false))
                 .isEqualTo(MatchScoreCalculator.scoreExperience("mid_level", "senior", true));
         assertThat(MatchScoreCalculator.scoreExperience("senior_level", "entry", true, false, true))
@@ -170,9 +146,7 @@ class MatchScoreCalculatorTest {
 
     @Test
     void experienceScore_typeGapCompoundsWithAnAmountShortfall() {
-        // entry_level (rank 1) vs required senior (rank 3): amount score is 20 (see
-        // experienceScore_shortfallCostsFixedPenaltyPerRank above); a missing specific type on top
-        // of an amount shortfall blends that already-low score down further, never up.
+
         assertThat(MatchScoreCalculator.scoreExperience(
                 "entry_level", "senior", true, true, false)).isEqualTo(10);
     }
@@ -185,8 +159,8 @@ class MatchScoreCalculatorTest {
 
     @Test
     void educationScore_noEvidenceIsPenalizedMoreForRelevantDegreeThanAnyDegree() {
-        int anyDegreeGap = MatchScoreCalculator.scoreEducation("none", "any_degree");   // shortfall 1 * 45 = 55
-        int relevantDegreeGap = MatchScoreCalculator.scoreEducation("none", "relevant_degree"); // shortfall 2 * 45 -> 10
+        int anyDegreeGap = MatchScoreCalculator.scoreEducation("none", "any_degree");
+        int relevantDegreeGap = MatchScoreCalculator.scoreEducation("none", "relevant_degree");
         assertThat(anyDegreeGap).isEqualTo(55);
         assertThat(relevantDegreeGap).isEqualTo(10);
         assertThat(anyDegreeGap).isGreaterThan(relevantDegreeGap);
@@ -196,16 +170,13 @@ class MatchScoreCalculatorTest {
     void certificationScore_specificLicense_sameSpecificRole_requiresTheActualLicense() {
         assertThat(MatchScoreCalculator.scoreCertification("field_relevant", "licensed", "specific_license", true)).isEqualTo(100);
         assertThat(MatchScoreCalculator.scoreCertification("field_relevant", "in_progress", "specific_license", true)).isEqualTo(55);
-        // A strong general certification does NOT substitute for a missing specific license -
-        // only the license evidence is consulted for this requirement level.
+
         assertThat(MatchScoreCalculator.scoreCertification("field_relevant", "none", "specific_license", true)).isEqualTo(15);
     }
 
     @Test
     void certificationScore_specificLicense_differentSpecificRole_discountsAnUnverifiedLicense() {
-        // Found via live verification: a doctor's "licensed" flag doesn't prove they hold THIS
-        // job's specific license (e.g. nursing) when the job is only same_broad_field - it must
-        // score well below the same_specificRole=true case above, not the full 100.
+
         int sameRole = MatchScoreCalculator.scoreCertification("field_relevant", "licensed", "specific_license", true);
         int differentRole = MatchScoreCalculator.scoreCertification("field_relevant", "licensed", "specific_license", false);
         assertThat(differentRole).isEqualTo(40);

@@ -45,7 +45,6 @@ public class AuthController {
 
     private static final int MIN_PASSWORD_LENGTH = 6;
 
-    // At least MIN_PASSWORD_LENGTH characters, containing at least one letter and one digit.
     private static final Pattern PASSWORD_PATTERN =
             Pattern.compile("^(?=.*[A-Za-z])(?=.*\\d).{" + MIN_PASSWORD_LENGTH + ",}$");
 
@@ -85,7 +84,7 @@ public class AuthController {
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     public record LoginRequest(String email, String password, boolean rememberMe) {
-        // Kept for existing callers/tests that predate the rememberMe field.
+
         public LoginRequest(String email, String password) {
             this(email, password, false);
         }
@@ -97,6 +96,7 @@ public class AuthController {
 
     public record SendVerificationCodeRequest(String email) {}
 
+    // שולח קוד אימות בן 6 ספרות למייל, עם הגבלת קצב לפי IP ולפי כתובת מייל
     @PostMapping("/send-verification-code")
     public ResponseEntity<Map<String, Object>> sendVerificationCode(
             @RequestBody SendVerificationCodeRequest request,
@@ -131,16 +131,13 @@ public class AuthController {
         return ResponseEntity.ok(response);
     }
 
+    // רושם משתמש חדש אחרי בדיקת קוד האימות שנשלח למייל, כולל הגבלת קצב על ניסיונות אימות
     @PostMapping("/register")
     public ResponseEntity<Map<String, Object>> register(
             @Valid @RequestBody RegisterRequest request,
             HttpServletRequest httpRequest) {
         Map<String, Object> response = new HashMap<>();
 
-        // Only wrong verification-code guesses count against this limit (see the catch block
-        // below) - a taken email or an invalid role isn't an attack pattern worth throttling, and
-        // penalizing it would just lock out legitimate retries. The pre-check here only peeks
-        // (never consumes) so a run of successful registrations can't itself exhaust the budget.
         RateLimitRule verifyRule = rateLimitProperties.verifyCode();
         String ipKey = "verify-code:ip:" + clientIpResolver.resolve(httpRequest);
         String normalizedEmail = RateLimitSupport.normalizeEmail(request.email());
@@ -183,12 +180,11 @@ public class AuthController {
         }
     }
 
+    // מאמת אימייל וסיסמה מול ה-DB, מנעל התחברות אחרי יותר מדי כישלונות, ומחזיר JWT בהצלחה
     @PostMapping("/login")
     public ResponseEntity<Map<String, Object>> login(@RequestBody LoginRequest request, HttpServletRequest httpRequest) {
         Map<String, Object> response = new HashMap<>();
 
-        // Same keys ("login:ip:"/"login:email:") as UserController#loginUser - see the comment
-        // there on why the two routes to AuthService#login must share one lockout.
         RateLimitRule loginRule = rateLimitProperties.login();
         String ipKey = "login:ip:" + clientIpResolver.resolve(httpRequest);
         String normalizedEmail = RateLimitSupport.normalizeEmail(request.email());
@@ -235,6 +231,7 @@ public class AuthController {
         }
     }
 
+    // מחזיר את פרטי המשתמש המחובר לפי האימייל שחולץ מהטוקן (בלי הסיסמה)
     @GetMapping("/me")
     public ResponseEntity<?> me(Authentication authentication) {
         User user = userRepository.findByEmail(authentication.getName());
@@ -247,6 +244,7 @@ public class AuthController {
         return ResponseEntity.ok(user);
     }
 
+    // מתחיל תהליך שכחתי-סיסמה - יוצר טוקן איפוס וסולח מייל, אבל תמיד מחזיר תשובה זהה כדי לא לחשוף אילו מיילים קיימים
     @PostMapping("/forgot-password")
     public ResponseEntity<?> forgotPassword(@RequestBody ForgotPasswordRequest request, HttpServletRequest httpRequest) {
         Map<String, Object> response = new HashMap<>();
@@ -259,9 +257,7 @@ public class AuthController {
             RateLimitResult emailResult = normalizedEmail != null
                     ? rateLimiterService.tryConsume("forgot-password:email:" + normalizedEmail, rule)
                     : RateLimitResult.allow();
-            // Blocked purely by request volume per IP/email, independent of whether the account
-            // exists - so this 429 can't be used as an oracle the way a distinct "no such user"
-            // response would be.
+
             if (!ipResult.allowed() || !emailResult.allowed()) {
                 return RateLimitSupport.tooManyRequests(Math.max(ipResult.retryAfterSeconds(), emailResult.retryAfterSeconds()));
             }
@@ -281,12 +277,11 @@ public class AuthController {
         return ResponseEntity.ok(response);
     }
 
+    // מאמת את טוקן האיפוס ואת חוזק הסיסמה החדשה, ואם הכל תקין מעדכן את הסיסמה בפועל
     @PostMapping("/reset-password")
     public ResponseEntity<?> resetPassword(@RequestBody ResetPasswordRequest request, HttpServletRequest httpRequest) {
         Map<String, Object> response = new HashMap<>();
 
-        // No email field on this request (it's keyed by an opaque reset token), so only IP-based
-        // limiting applies here.
         if (rateLimitProperties.isEnabled()) {
             RateLimitRule rule = rateLimitProperties.resetPassword();
             RateLimitResult ipResult = rateLimiterService.tryConsume(
@@ -323,6 +318,7 @@ public class AuthController {
 
     public record ChangePasswordRequest(String currentPassword, String newPassword) {}
 
+    // מחליף סיסמה למשתמש מחובר אחרי בדיקת הסיסמה הנוכחית, ומבטל טוקנים ישנים כדי לנתק סשנים קודמים
     @PostMapping("/change-password")
     public ResponseEntity<?> changePassword(@RequestBody ChangePasswordRequest request, Authentication authentication) {
         Map<String, Object> response = new HashMap<>();
@@ -350,8 +346,7 @@ public class AuthController {
         user.setPassword(passwordEncoder.encode(request.newPassword()));
         userRepository.save(user);
 
-        // A token issued before this change (e.g. a hijacked session that prompted the change)
-        // must stop working immediately rather than staying valid until it naturally expires.
+        // טוקנים שהונפקו לפני השינוי (למשל סשן שנחטף) צריכים להיפסל מיד ולא לחכות לתפוגה הרגילה
         tokenRevocationService.revokeTokensIssuedBefore(user.getEmail(), Instant.now());
 
         notificationService.createNotification(

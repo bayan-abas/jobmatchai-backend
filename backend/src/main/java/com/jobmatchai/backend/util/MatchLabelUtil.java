@@ -1,12 +1,10 @@
 package com.jobmatchai.backend.util;
 
-// A candidate_ai_summary match label is a pure function of its match score - deriving it
-// here at read time (instead of persisting it) means it can never drift out of sync with
-// the score it describes.
 public final class MatchLabelUtil {
 
     private MatchLabelUtil() {}
 
+    // ממיר את הציון המספרי לתווית מילולית שמוצגת למשתמש (Excellent/Strong/Moderate/Weak/Poor)
     public static String fromScore(Integer score) {
         if (score == null) {
             return null;
@@ -19,17 +17,7 @@ public final class MatchLabelUtil {
         return "Poor Match";
     }
 
-    // A fixed-vocabulary hiring-decision category ("accept"/"consider"/"reject"), also a pure
-    // function of the same match score, derived at read time for the same reason fromScore is:
-    // it can never drift out of sync with the score it describes, and it can never disagree with
-    // itself between two places that both show it. This used to be computed independently in the
-    // frontend (a bare score-threshold if/else in a UI file, with no backend equivalent at all) -
-    // moved here so the frontend has exactly one authoritative source for this judgment, the same
-    // as every other piece of AI-derived match data, and only ever maps this fixed category to a
-    // localized label - it never decides the category itself. Thresholds intentionally match
-    // fromScore's own tiers (>=70 covers "Excellent"/"Strong Match", 50-69 is "Moderate Match",
-    // below 50 covers "Weak"/"Poor Match") so the recommendation and the label can never disagree
-    // about which side of a boundary a given score falls on.
+    // ממיר את הציון להמלצת החלטה (accept/consider/reject) לפי סף כללי, בלי קשר לתווית התצוגה
     public static String recommendationFromScore(Integer score) {
         if (score == null) {
             return null;
