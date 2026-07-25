@@ -216,6 +216,24 @@ public class MatchScoreQueueWorker {
                 return;
             }
 
+            // Re-checked HERE (right before persisting), not just against the fingerprint captured
+            // when this row was claimed - the AI call above can take several seconds, and a
+            // candidate can re-analyze their CV in that window. Without this, the save below would
+            // land with the OLD cvFingerprint baked in even though a newer CV now exists: the row
+            // would look "done" to this worker, but the next request's isStale check (comparing
+            // against the CURRENT CV) would still see it as stale and re-enqueue the exact same
+            // job, wasting the AI call just made. Mirrors the identical guard singleflightComputeJob
+            // already applies on the synchronous path - see that method's own comment.
+            CVAnalysis currentAnalysis = cvAnalysisRepository.findByUserEmail(row.getCandidateEmail()).orElse(null);
+            if (currentAnalysis == null || !cvFingerprint.equals(jobMatchService.fingerprintCv(currentAnalysis))) {
+                log.info("match-score-queue jobId={} candidate={} -> CV changed mid-computation, discarding stale result",
+                        row.getJobId(), row.getCandidateEmail());
+                matchScoreJobRepository.delete(row);
+                matchScoreQueueService.completeIfAwaited(row.getCandidateEmail(), row.getJobId(), row.getJobType(), null);
+                matchMetrics.recordQueueJobProcessed("discarded_stale_cv", elapsedMs(start));
+                return;
+            }
+
             JobMatchService.ParsedMatch parsed = jobMatchService.parseMatch(match);
             JobMatchScore score = jobMatchScoreRepository
                     .findByCandidateEmailAndJobId(row.getCandidateEmail(), row.getJobId())
