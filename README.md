@@ -1,66 +1,304 @@
-# jobmatchai-backend
-Spring Boot backend for JobMatchAI platform
+# JobMatchAI – Backend
 
-## Local OpenAI configuration
+JobMatchAI is an AI-powered recruitment platform designed to connect candidates with relevant job opportunities and help companies manage and evaluate applicants efficiently.
 
-When running from the terminal, VS Code `launch.json` environment variables are not used.
+This repository contains the **backend** of the JobMatchAI system.
 
-Create a local `.env` file in the repository root or in `backend/`:
+## Project Overview
 
-```properties
-OPENAI_API_KEY=sk-your-openai-api-key-here
-OPENAI_MODEL=gpt-4.1
+The backend is responsible for:
+
+* User authentication and authorization
+* Candidate and company account management
+* Job posting management
+* Job application management
+* CV upload and analysis
+* AI-based job matching
+* Candidate ranking
+* Match score calculation
+* Interview question generation
+* Notifications and system data management
+* Communication between the frontend, database, and AI services
+
+## Technologies
+
+The backend was developed using:
+
+* **Java**
+* **Spring Boot**
+* **Spring Security**
+* **JWT Authentication**
+* **BCrypt**
+* **Spring Data JPA**
+* **Maven**
+* **PostgreSQL**
+* **Supabase**
+* **OpenAI API**
+* **Docker**
+* **Render**
+
+## System Architecture
+
+The backend follows a layered architecture:
+
+```text
+Controller
+    ↓
+Service
+    ↓
+Repository
+    ↓
+Database
 ```
 
-Then start the backend from the `backend` directory:
+### Controller Layer
 
-```powershell
-.\mvnw.cmd spring-boot:run
+Handles HTTP requests from the frontend and exposes REST API endpoints.
+
+### Service Layer
+
+Contains the main business logic of the system, including AI processing, matching logic, validation, and application workflows.
+
+### Repository Layer
+
+Handles communication with the PostgreSQL database using Spring Data JPA.
+
+### Database
+
+The production database is hosted using **Supabase PostgreSQL**.
+
+## Authentication & Security
+
+The system uses **JWT-based authentication**.
+
+Users are divided into two main roles:
+
+* `CANDIDATE`
+* `COMPANY`
+
+Security mechanisms include:
+
+* JWT authentication
+* Role-based authorization
+* Password hashing using BCrypt
+* Protected API endpoints
+* Login attempt protection
+* Ownership validation
+* File upload validation
+* CORS configuration
+
+## Main Features
+
+### Candidate
+
+Candidates can:
+
+* Register and log in
+* Upload a CV
+* Analyze their CV using AI
+* View available jobs
+* Receive AI-generated match scores
+* View strengths and missing skills
+* Apply for jobs
+* Track submitted applications
+
+### Company
+
+Companies can:
+
+* Register and log in
+* Create job postings
+* Manage active and closed jobs
+* View applicants for each job
+* View candidate details
+* View AI-generated match scores
+* Rank candidates according to their suitability
+* Generate interview questions
+* Accept or reject applications
+
+## AI Matching
+
+JobMatchAI uses AI to analyze candidate CVs and compare them with job requirements.
+
+The matching process includes:
+
+```text
+Candidate CV
+     ↓
+CV Analysis
+     ↓
+Job Requirements
+     ↓
+AI Matching Process
+     ↓
+Match Score
+     ↓
+Strengths / Missing Skills / Recommendation
 ```
 
-You can also set the variable for the current PowerShell session instead:
+The system also uses caching mechanisms to reduce unnecessary repeated AI requests.
 
-```powershell
-$env:OPENAI_API_KEY="sk-your-openai-api-key-here"
-.\mvnw.cmd spring-boot:run
+## Job Status
+
+Jobs can have the following statuses:
+
+```text
+ACTIVE
+CLOSED
 ```
 
-## Deploying to Render + Firebase Hosting
+Active jobs are visible to candidates.
 
-This is the documented, primary deployment path — backend on Render (Docker), frontend on
-Firebase Hosting, database and CV storage on Supabase. See [`DEPLOYMENT.md`](DEPLOYMENT.md) for
-the full guide: required environment variables, Render/Firebase setup steps, and exactly which
-placeholders (Firebase project ID, Render backend URL, Supabase pooler connection string) still
-need your real values filled in.
+Closed jobs are no longer available for new applications, while candidates who already applied can still see the job status in their application history.
 
-## Alternative: self-hosted deployment (Docker Compose)
+## API Structure
 
-This backend has no hard dependency on any specific hosting provider - `docker-compose.yml` in
-the repo root builds and runs it from the included `Dockerfile` on any server with Docker
-installed, as an alternative to Render. The database stays on Supabase (or any Postgres you point
-it at); only the backend's compute needs a home. Pick one deployment path or the other, not both.
+Main API groups include:
 
-1. Copy `.env.example` to `.env` in the repo root and fill in real values:
-   - `SPRING_DATASOURCE_URL` / `SPRING_DATASOURCE_USERNAME` / `SPRING_DATASOURCE_PASSWORD` -
-     your Supabase (or other Postgres) connection string.
-   - `JWT_SECRET` - a long random string (`openssl rand -base64 48`), not the insecure default.
-   - `APP_CORS_ALLOWED_ORIGIN` - your deployed frontend's URL. Comma-separate multiple
-     origins (e.g. `https://app.yourdomain.com,http://localhost:5173`) if you need both a
-     production frontend and local dev to reach the same backend.
-   - `APP_FRONTEND_URL` - your deployed frontend's URL (used for links in emails, etc.).
-   - `OPENAI_API_KEY` and any of Stripe/mail/Jooble/RapidAPI keys you actually use.
-   - Leave `APP_UPLOAD_DIR` unset - `docker-compose.yml` already points it at a persistent
-     named volume (`cv-uploads`) so uploaded CVs survive container restarts/redeploys.
+```text
+/api/auth
+/api/users
+/api/jobs
+/api/applications
+/api/messages
+```
 
-2. Build and start the container:
+Additional endpoints are used for CV analysis, AI matching, candidate ranking, and other system functionality.
 
-   ```bash
-   docker compose up -d --build
-   ```
+## Running the Project Locally
 
-   The backend is now reachable at `http://<your-server>:8080`. Put a reverse proxy (e.g.
-   Caddy or nginx) with a TLS certificate in front of it for production HTTPS - this compose
-   file intentionally only handles the application container, not ingress/TLS.
+### 1. Clone the repository
 
-3. Point the frontend at it: set `VITE_API_BASE_URL` in the frontend's `.env` to your
-   backend's public URL, then rebuild/redeploy the frontend (`npm run build`).
+```bash
+git clone <BACKEND_REPOSITORY_URL>
+```
+
+### 2. Enter the project directory
+
+```bash
+cd jobmatchai-backend
+```
+
+### 3. Configure environment variables
+
+Use the provided:
+
+```text
+.env.example
+```
+
+as a reference for the required environment configuration.
+
+Do not commit real passwords, API keys, database credentials, or other secrets to Git.
+
+### 4. Build the project
+
+```bash
+mvn clean install
+```
+
+### 5. Run the backend
+
+```bash
+mvn spring-boot:run
+```
+
+By default, the backend runs locally on:
+
+```text
+http://localhost:8080
+```
+
+## Docker
+
+The repository also contains:
+
+```text
+docker-compose.yml
+```
+
+which can be used for container-based deployment.
+
+Additional deployment information is available in:
+
+```text
+DEPLOYMENT.md
+```
+
+## Production Deployment
+
+The production architecture includes:
+
+```text
+Frontend
+Firebase Hosting
+      ↓
+Backend
+Render
+      ↓
+Database
+Supabase PostgreSQL
+      ↓
+AI Services
+OpenAI API
+```
+
+## Frontend Repository
+
+The frontend is maintained in a separate GitHub repository:
+
+```text
+[<FRONTEND_REPOSITORY_URL>](https://github.com/bayan-abas/jobmatchai-frontend.git)
+```
+
+The frontend was developed using **React, TypeScript, and Vite**.
+
+## User Guide
+
+A complete User Guide explaining how to use the JobMatchAI system is included in this repository:
+
+```text
+JobMatchAI_User_Guide.docx
+```
+
+## Project Structure
+
+A simplified project structure:
+
+```text
+jobmatchai-backend/
+│
+├── backend/
+│   └── src/
+│       └── main/
+│           └── java/
+│               └── com/jobmatchai/backend/
+│                   ├── controller/
+│                   ├── service/
+│                   ├── repository/
+│                   ├── model/
+│                   └── security/
+│
+├── uploads/
+├── .github/
+├── .vscode/
+├── .env.example
+├── .gitignore
+├── README.md
+├── DEPLOYMENT.md
+├── docker-compose.yml
+└── JobMatchAI_User_Guide.docx
+```
+
+## Project Team
+
+**JobMatchAI**
+
+Developed as a final project in Information Systems.
+
+## Notes
+
+* The backend and frontend are maintained in separate repositories.
+* Both repositories are required in order to review the complete system.
+* Sensitive configuration values are not stored in Git.
+* The User Guide is included in the repository for installation and system usage instructions.
